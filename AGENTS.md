@@ -69,7 +69,7 @@ other cannot:
 
 | Peer | Question it answers |
 |---|---|
-| `tools/es.exe` + an Everything instance | what does a client actually put on the wire, and would it understand the reply |
+| Everything, as an ETP client of ours | what does a client actually put on the wire, and does it read the reply back |
 | `etp_server` on `127.0.0.1:21` | is this the reference's behaviour, or ours |
 
 `tools/etp_probe.c` sits alongside them: same rules as a client, scriptable, so
@@ -78,35 +78,52 @@ by itself it only proves the server agrees with our reading of a client — whic
 is why the two peers above exist.
 
 **Point the official client at this server.** Everything accepts `-instance`, so
-the ETP instance lives beside the default one instead of replacing it. This is
-the exact invocation that works:
+the ETP instance lives beside the default one instead of replacing it. Put the
+search on the command line: that is what makes the session *complete*, so the
+log shows both what the client asked for and that it read the block back without
+reconnecting. This is the exact invocation that works:
 
 ```powershell
 # 1. a snapshot to serve (any tree; /etc is small and already indexed by the suites)
 wsl -u root -e bash -lc 'cd /mnt/c/Users/linswin/AndroidStudioProjects/ShareToPC/esidx && ./esidx build /etc -o /tmp/etc.idx'
 
 # 2. the server, detached. -v 4 IS the debug level -- do not also set ESIDX_LOG,
-#    which -v 4 overwrites anyway (§2.3).
+#    which -v 4 overwrites anyway (2.3).
 wsl -u root -e bash -lc 'cd /mnt/c/Users/linswin/AndroidStudioProjects/ShareToPC/esidx && \
   setsid nohup ./esidx -v 4 serve /tmp/etc.idx -p 2121 --bind 127.0.0.1 \
     -u etpuser -w s3cret >/tmp/srv.err 2>&1 </dev/null &'
 
 # 3. the client. ONE -ArgumentList string, so the instance name stays quoted.
 Start-Process -FilePath 'C:\Program Files\Everything\Everything.exe' `
-  -ArgumentList '-instance "esidx" -connect etpuser:s3cret@127.0.0.1:2121' `
+  -ArgumentList '-instance "esidx" -connect etpuser:s3cret@127.0.0.1:2121 -search "ext:conf"' `
   -WindowStyle Minimized
 ```
 
 `-v 4` logs every `< command` and `> reply` (`etp.c:858`, `etp.c:214`), which is
 the only way to see what the official client actually sends. Everything confirms
-the connection in its window title: `127.0.0.1 - Everything (ETP esidx)`.
+the connection in its window title: `ext:conf - 127.0.0.1 - Everything (ETP
+esidx)`. Then just watch `/tmp/srv.err`; the session this produces is
 
-Then just watch `/tmp/srv.err`. This is how the `OPTS UTF8 ON` bug was found: the
-trace shows the client log in, send `OPTS UTF8 ON`, and then — because it never
-got a `200` — send nothing else at all. There is no error anywhere, on either
-side; it just goes quiet.
+```
+< USER etpuser            > 331 Password required.
+< PASS s3cret             > 230 Logged on.
+< OPTS UTF8 ON            > 200 UTF8 mode enabled.
+< SITE EVERYTHING SIZE_COLUMN 1          > 200 Size column set to (1).
+< SITE EVERYTHING DATE_MODIFIED_COLUMN 1 > 200 Date modified column set to (1).
+< SITE EVERYTHING PATH_COLUMN 1          > 200 Path column set to (1).
+< SITE EVERYTHING COUNT 21               > 200 Count set to (21).
+< SITE EVERYTHING SORT DATE_MODIFIED_DESCENDING > 200 Sort set to (...).
+< SITE EVERYTHING SEARCH ext:conf        > 200 Search set to (ext:conf).
+< SITE EVERYTHING QUERY   ->  query: 'ext:conf' -> N results | N of M candidates | ...
+```
 
-Three things about this setup that each cost an hour to find:
+This is how the `OPTS UTF8 ON` bug was found: the trace shows the client log in,
+send `OPTS UTF8 ON`, and then — because it never got a `200` — send nothing else
+at all. There is no error anywhere, on either side; it just goes quiet. That is
+the whole reason this peer exists: the probe only ever sent what it had been
+taught to send, and the taught list had no `OPTS` in it.
+
+Two things about the setup that each cost an hour to find:
 
 - **The server must outlive the WSL invocation.** A plain `&` dies with the
   calling `wsl`, and then Everything simply reports nothing. Use
@@ -116,36 +133,58 @@ Three things about this setup that each cost an hour to find:
   `-instance ETP Client`, silently takes the instance name as `ETP` and treats
   `Client` as the search text. The symptom is a *working* connection to the wrong
   instance, so it is easy to miss.
-- **`pkill -f "esidx -v 4 serve"` kills the shell running it**, because the
-  pattern matches that shell's own command line. Use `pkill -x esidx`.
 
-**`tools/es.exe` cannot drive it, and that is not our bug.** es.exe (voidtools'
-command line interface; a copy is checked in at `tools/es.exe`, and
-`es.zip`/`cli.c` come from `https://www.voidtools.com/es.zip`) has no way to reach
-an ETP *client* instance. `-instance <name>` either falls back to the default
-instance — silently returning the local index, which looks like it worked — or
-returns `Error 8`, because Everything registers the window as
-`EVERYTHING_TASKBAR_NOTIFICATION_(<name>)` with the parentheses already in the
-class, so passing the name with or without them both miss. Verified by pointing
-an identically named instance at the reference server on `:21`, which behaves the
-same way; and `-get-result-count` is how you tell the two apart, because the
-local index answers with a six-figure number while a real ETP session answers
-with the server's own count.
+And two that cost less but look like protocol failures:
 
-So the GUI instance is the peer that exercises the protocol, and it does so
-completely: it logs in, sends `OPTS UTF8 ON`, issues the column toggles, COUNT,
-SORT and QUERY, and reads the block back. Run the probe with that same command
-sequence to assert on what the GUI consumed:
+- `pkill -f "esidx -v 4 serve"` kills the shell running it, because the pattern
+  matches that shell's own command line. Use `pkill -x esidx`.
+- If nothing appears in `/tmp/srv.err` at all, the client instance did not start.
+  Check the process list; there is no message for this.
+
+**What this cannot tell you, and the probe is the answer.** The client reads the
+block in its own process and shows it in a window, so we can prove it asked and
+that it did not hang — not what it made of the contents. For "would a client
+understand this reply", run the probe with the sequence above verbatim:
 
 ```sh
-./etp-probe 2121 -   # the script is the trace the GUI produced, verbatim
+./etp-probe 2121 <script>   # the script is the trace Everything produced
 ```
 
+**`es.exe` is deliberately not here.** voidtools' command line interface looks
+like the natural driver for a named instance, and it was tried first. It is
+redundant: `-search` already completes the session, and the probe reads the block
+better. It also cannot drive an ETP instance at all, which cost an hour to
+establish and is worth recording so nobody retries it. Measured, and against the
+reference server on `:21` as well:
+
+| target instance | addressing | search |
+|---|---|---|
+| the default one (no `-instance`) | works | works |
+| a plain named instance, index loaded | works | works |
+| an **ETP** instance | works | **never returns** |
+
+From the `cli.c` that ships in `es.zip`: `cli.c:4269-4274` builds
+`EVERYTHING_TASKBAR_NOTIFICATION_(<name>)`, adding the parentheses itself, so
+`-instance <name>` is the correct spelling; addressing works because the version
+probe is an unconditional `EVERYTHING_WM_IPC` message; and the search goes out as
+`WM_COPYDATA` + `EVERYTHING_IPC_COPYDATAQUERY` (`cli.c:477-481`) with the answer
+due back as a *separate* message to es.exe's own window, which never arrives.
+`-timeout` does not bound that wait (`cli.c:4021-4045` polls
+`EVERYTHING_IPC_IS_DB_LOADED` only when `-timeout` is given, in a loop with no
+counter), and `-ipc1` / `-ipc2` answer from the *default* instance instead, so a
+six-figure count from an instance named here is a red flag, not a result.
+
+The trap worth remembering from that hour: **a fresh instance looks exactly like a
+broken one.** A plain `-instance <name>` whose database has not finished loading
+also hangs, with no flag and nothing to wait on. It resolved by itself once the
+index loaded. So never conclude anything from a hang until the plain instance
+searches.
+
 **Use the probe against `:21` too.** Running `etp-probe 21 <script>` is the only
-check that the probe's transcribed rules are satisfied by an implementation we
-did not write. It passes for every shape the suites cover. It also reproduces
-the one known deviation: a client cannot classify ` MLSD` in the reference's own
-`211-` FEAT reply and stops there, which is why no client sends FEAT (§5.1).
+check that the probe's rules are satisfied by an implementation we did not write.
+It passes for every shape the suites cover. It also reproduces the one known
+deviation: a client cannot classify ` MLSD` in the reference's own `211-` FEAT
+reply and stops there, which is why no client sends FEAT (§5.1).
 
 ### 1.5 Commit per batch
 
@@ -432,9 +471,12 @@ Established in this codebase; match the surrounding code.
 
 ### 6.2 Line endings
 
-LF, in every file including the shell scripts. Windows editors reintroduce CRLF
-and the symptom is `bash\r: No such file or directory`. If a script suddenly
-fails to run, check that first.
+LF in the shell scripts (`*.sh`) — that is the only place it is load-bearing.
+A Windows editor reintroduces CRLF and the symptom is `bash\r: No such file or
+directory`, i.e. the script cannot run at all. Nothing else cares: the C sources
+are compiled and the Markdown is read, so their line endings are whatever git
+already has, and checking them is noise. If a script suddenly fails to run, look
+here first.
 
 ---
 

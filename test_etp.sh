@@ -608,7 +608,7 @@ say "11. FTP verbs the client never sends, for other clients"
 # -connect u:p@host:port` puts `OPTS UTF8 ON` on the wire before any column
 # toggle, and the server used to answer 501 because it compared the whole argument
 # against the bare word "UTF8". The client then never issued the toggles or QUERY
-# at all, so tools/es.exe sat there with no IPC reply and no error anywhere -- a
+# at all, so the client sat there with no IPC reply and no error anywhere -- a
 # silent hang, which is why no suite caught it: nothing here drives the official
 # client, and the probe only ever sent what it had been taught to send.
 # Reply wording and the bare-argument rejection are the reference's, checked
