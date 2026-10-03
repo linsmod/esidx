@@ -96,8 +96,14 @@ int sort_from_etp_name(const char *name, uint16_t *out_key, int *out_asc)
 
 /* Sizes: kb/mb/gb are decimal (L133-146 says so explicitly), bare k/m/g/t are
  * the 1024-based forms Everything also accepts. */
-static int64_t parse_size_value(const char *s, int *ok)
+/* Sizes: kb/mb/gb are decimal (L133-146 says so explicitly), bare k/m/g/t are
+ * the 1024-based forms Everything also accepts.
+ *
+ * The span out-parameter exists so sizes and dates can share parse_range2(); a
+ * size is always a point, so it is always left at 0. */
+static int64_t parse_size_value(const char *s, int *ok, int64_t *span)
 {
+    if (span) *span = 0;
     *ok = 0;
     while (*s == ' ') s++;
     if (!*s) return 0;
@@ -131,7 +137,23 @@ static int64_t parse_size_value(const char *s, int *ok)
     return (int64_t)(v * (double)mult);
 }
 
-/* midnights of the current local day, offset by `back` days */
+/* Dates and durations (L148-189).
+ *
+ * Two shapes come back, and conflating them is a silent-wrong-answer bug:
+ *
+ *   a POINT   -- an instant: `dm:2024-03-05T10:30:00`, a raw epoch, a FILETIME
+ *   a PERIOD  -- a span:    `today`, `yesterday`, a bare year, `YYYY-MM`
+ *
+ * `dm:today` has to match everything modified since midnight, not only what was
+ * modified at exactly midnight. A point parser answers zero rows and looks like a
+ * correct empty result. `period` is set when the text names a span.
+ */
+typedef struct {
+    int64_t at;
+    int64_t span;    /* seconds, 0 for a point */
+    int     period;
+} tval_t;
+
 static int64_t day_start(int back)
 {
     time_t now = time(NULL);
@@ -142,74 +164,88 @@ static int64_t day_start(int back)
     return (int64_t)mktime(&tm) - (int64_t)back * 86400;
 }
 
-/* Dates and durations (L148-189). Returns 0 and sets *ok=0 when it cannot
- * interpret the text -- an unparseable date must not silently become "now". */
-static int64_t parse_time_value(const char *s, int *ok)
+/* midnight of the first day of the month `mo` months ago (negative = future) */
+static int64_t month_start(int back)
 {
-    *ok = 0;
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    tm.tm_hour = tm.tm_min = tm.tm_sec = 0;
+    tm.tm_mday = 1;
+    tm.tm_mon -= back;
+    tm.tm_isdst = -1;
+    return (int64_t)mktime(&tm);
+}
+
+static tval_t parse_time_value(const char *s)
+{
+    tval_t r = {0, 0, 0};
     while (*s == ' ') s++;
-    if (!*s) return 0;
+    if (!*s) return r;
 
-    if (!strcasecmp(s, "today"))    { *ok = 1; return day_start(0); }
-    if (!strcasecmp(s, "yesterday")){ *ok = 1; return day_start(1); }
-    if (!strcasecmp(s, "tomorrow")) { *ok = 1; return day_start(-1); }
-
-    static const struct { const char *n; int64_t back; } rel[] = {
-        { "veryshort", 60 }, { "veryshort", 60 },
-        { "short", 5 * 60 }, { "medium", 30 * 60 }, { "long", 60 * 60 },
-        { "verylong", 60 * 60 },
-    };
-    for (size_t i = 0; i < sizeof(rel) / sizeof(rel[0]); i++) {
-        if (!strcasecmp(s, rel[i].n)) {
-            /* durations are a length, not a date: hand the caller the epoch we
-             * subtract from "now" via a negative marker */
-            *ok = 1;
-            return -(int64_t)time(NULL) + rel[i].back;
-        }
+    /* ---- periods ---- */
+    if (!strcasecmp(s, "today"))     { r.at = day_start(0);  r.span = 86400; r.period = 1; return r; }
+    if (!strcasecmp(s, "yesterday")) { r.at = day_start(1);  r.span = 86400; r.period = 1; return r; }
+    if (!strcasecmp(s, "tomorrow"))  { r.at = day_start(-1); r.span = 86400; r.period = 1; return r; }
+    if (!strcasecmp(s, "mtd") || !strcasecmp(s, "thismonth")) {
+        r.at = month_start(0); r.span = 31 * 86400; r.period = 1; return r;
     }
-    if (!strcasecmp(s, "very-long")) { *ok = 1; return -(int64_t)time(NULL) + 3600; }
-    if (!strcasecmp(s, "veryshort")) { *ok = 1; return -(int64_t)time(NULL) + 60; }
+    if (!strcasecmp(s, "lastmonth")) {
+        r.at = month_start(1); r.span = 31 * 86400; r.period = 1; return r;
+    }
+    if (!strcasecmp(s, "ytd") || !strcasecmp(s, "thisyear")) {
+        time_t now = time(NULL);
+        struct tm tm;
+        localtime_r(&now, &tm);
+        tm.tm_hour = tm.tm_min = tm.tm_sec = 0;
+        tm.tm_mon = 0;
+        tm.tm_mday = 1;
+        tm.tm_isdst = -1;
+        r.at = (int64_t)mktime(&tm);
+        r.span = 366 * 86400;
+        r.period = 1;
+        return r;
+    }
 
-    /* <n><unit> relative to now: 7d, 3hours, 45mins */
+    /* <n><unit> relative to now: 7d, 3hours, 45mins. A point, not a period:
+     * `dm:>7d` is "newer than seven days ago", and the comparison supplies the
+     * other end. */
     {
         char *end = NULL;
         long n = strtol(s, &end, 10);
         if (end != s && *end) {
             int64_t unit = 0;
-            if      (!strncasecmp(end, "day", 3))   unit = 86400;
-            else if (!strncasecmp(end, "hour", 4))  unit = 3600;
-            else if (!strncasecmp(end, "min", 3))   unit = 60;
-            else if (!strncasecmp(end, "sec", 3))   unit = 1;
-            else if (!strncasecmp(end, "week", 4))  unit = 7 * 86400;
-            else if (!strncasecmp(end, "month", 5)) unit = 30 * 86400;
-            else if (!strncasecmp(end, "year", 4))  unit = 365 * 86400;
+            if      (!strncasecmp(end, "day", 3))    unit = 86400;
+            else if (!strncasecmp(end, "hour", 4))   unit = 3600;
+            else if (!strncasecmp(end, "week", 4))   unit = 7 * 86400;
+            else if (!strncasecmp(end, "month", 5))  unit = 30 * 86400;
+            else if (!strncasecmp(end, "year", 4))   unit = 365 * 86400;
+            else if (!strncasecmp(end, "min", 3))    unit = 60;
+            else if (!strncasecmp(end, "sec", 3))    unit = 1;
             else if (*end == 'd' && end[1] == '\0') unit = 86400;
             else if (*end == 'h' && end[1] == '\0') unit = 3600;
+            else if (*end == 'w' && end[1] == '\0') unit = 7 * 86400;
             else if (*end == 'm' && end[1] == '\0') unit = 60;
             else if (*end == 's' && end[1] == '\0') unit = 1;
-            else if (*end == 'w' && end[1] == '\0') unit = 7 * 86400;
-            if (unit) {
-                *ok = 1;
-                return (int64_t)time(NULL) - (int64_t)n * unit;
-            }
+            if (unit) { r.at = (int64_t)time(NULL) - (int64_t)n * unit; return r; }
         }
     }
 
     /* A raw FILETIME. L209 says ">99999999" distinguishes it from a year, but
      * that threshold also swallows any large epoch -- `dm:>99999999999` would
      * then become a date in 1601 and match everything. A FILETIME is 100 ns
-     * units, so the smallest plausible one is 1970 in those units; requiring that
-     * keeps both readings intact. */
+     * units, so the smallest plausible one is 1970 in those units. */
     if (strlen(s) > 9) {
         char *end = NULL;
         long long ft = strtoll(s, &end, 10);
         if (end != s && *end == '\0' && ft >= 116444736000000000LL) {
-            *ok = 1;
-            return (int64_t)((ft / 10000000LL) - 11644473600LL);
+            r.at = (int64_t)((ft / 10000000LL) - 11644473600LL);
+            return r;
         }
     }
 
-    /* YYYY[-MM[-DD[Thh[:mm[:ss]]]]] and YYYYMMDD */
+    /* YYYY[-MM[-DD[Thh[:mm[:ss]]]]] and YYYYMMDD; a bare year or YYYY/MM is a
+     * whole-year or whole-month period */
     {
         int y = 0, mo = 1, d = 1, h = 0, mi = 0, se = 0;
         int n = 0;
@@ -221,7 +257,7 @@ static int64_t parse_time_value(const char *s, int *ok)
             tm.tm_hour = h; tm.tm_min = mi; tm.tm_sec = se;
             tm.tm_isdst = -1;
             time_t t = mktime(&tm);
-            if (t != (time_t)-1) { *ok = 1; return (int64_t)t; }
+            if (t != (time_t)-1) { r.at = (int64_t)t; return r; }
         }
         n = 0;
         if (sscanf(s, "%d%2d%2d%2d%2d%2d%n", &y, &mo, &d, &h, &mi, &se, &n) >= 3 ||
@@ -231,39 +267,43 @@ static int64_t parse_time_value(const char *s, int *ok)
             tm.tm_year = y - 1900; tm.tm_mon = mo - 1; tm.tm_mday = d;
             tm.tm_isdst = -1;
             time_t t = mktime(&tm);
-            if (t != (time_t)-1) { *ok = 1; return (int64_t)t; }
+            if (t != (time_t)-1) { r.at = (int64_t)t; return r; }
         }
         n = 0;
-        /* a bare year, or YYYY/MM (L204-205) */
-        if (sscanf(s, "%d/%d%n", &y, &mo, &n) == 2 && n == (int)strlen(s)) {
+        if (sscanf(s, "%d/%d%n", &y, &mo, &n) == 2 && n == (int)strlen(s) &&
+            y >= 1000 && y <= 9999) {
             struct tm tm;
             memset(&tm, 0, sizeof(tm));
             tm.tm_year = y - 1900; tm.tm_mon = mo - 1; tm.tm_mday = 1;
             tm.tm_isdst = -1;
-            time_t t = mktime(&tm);
-            if (t != (time_t)-1) { *ok = 1; return (int64_t)t; }
+            r.at = (int64_t)mktime(&tm);
+            r.span = (mo == 2 && (y % 4 == 0 && (y % 100 || y % 400 == 0))) ? 29 * 86400
+                                                                            : 31 * 86400;
+            r.period = 1;
+            return r;
         }
-        /* A bare four-digit number is a year, not an epoch (L204). This matters:
-         * `dm:2022` means "modified during 2022", and reading it as the epoch
-         * second 2022 would silently return nothing. */
+        /* A bare four-digit number is a year, not an epoch (L204). Reading
+         * `dm:2022` as the epoch second 2022 would silently return nothing. */
         if (sscanf(s, "%d%n", &y, &n) == 1 && n == (int)strlen(s) &&
             y >= 1970 && y <= 9999) {
             struct tm tm;
             memset(&tm, 0, sizeof(tm));
             tm.tm_year = y - 1900; tm.tm_mon = 0; tm.tm_mday = 1;
             tm.tm_isdst = -1;
-            time_t t = mktime(&tm);
-            if (t != (time_t)-1) { *ok = 1; return (int64_t)t; }
+            r.at = (int64_t)mktime(&tm);
+            r.span = (y % 4 == 0 && (y % 100 || y % 400 == 0)) ? 366 * 86400 : 365 * 86400;
+            r.period = 1;
+            return r;
         }
     }
 
-    /* small integers are raw epochs, which is what the old CLI accepted */
+    /* small integers are raw epochs, which is what the CLI accepted before */
     {
         char *end = NULL;
         long long v = strtoll(s, &end, 10);
-        if (end != s && *end == '\0') { *ok = 1; return (int64_t)v; }
+        if (end != s && *end == '\0') { r.at = (int64_t)v; return r; }
     }
-    return 0;
+    return r;
 }
 
 /* A `start..end` range (L159), optionally also the `start-end` spelling (L160).
@@ -271,13 +311,16 @@ static int64_t parse_time_value(const char *s, int *ok)
  * The single dash is only honoured where it cannot be confused with something
  * else, and that decision is the caller's: for `size:` a dash can only be a range
  * separator, for a date it is nearly always part of `YYYY-MM-DD`. Reading
- * `dm:2000-01-01` as the range 2000..01-01 yields an empty interval and a
- * silently wrong answer, so the date parser refuses the dash form and users write
- * `dm:2021-07..2022-06`, which is what Everything's own examples do. */
-static void parse_range(const char *v, cmp_op_t cmp,
-                        int64_t *lo, int64_t *hi,
-                        int64_t (*pv)(const char *, int *), int *ok,
-                        int allow_dash)
+ * `dm:2000-01-01` as the range 2000..01-01 yields an empty interval and a silently
+ * wrong answer, so the date parser refuses the dash form and users write
+ * `dm:2021-07..2022-06`, which is what Everything's own examples do.
+ *
+ * A single date bound that names a PERIOD widens to that whole period, so
+ * `dm:today` means "since midnight", not "at midnight". */
+static void parse_range2(const char *v, cmp_op_t cmp,
+                         int64_t *lo, int64_t *hi,
+                         int64_t (*pv)(const char *, int *, int64_t *),
+                         int *ok, int allow_dash)
 {
     *ok = 1;
     char a[128], b[128];
@@ -290,19 +333,35 @@ static void parse_range(const char *v, cmp_op_t cmp,
         if (la >= sizeof(a)) la = sizeof(a) - 1;
         memcpy(a, v, la); a[la] = '\0';
         snprintf(b, sizeof(b), "%s", sep + (dots ? 2 : 1));
-        *lo = pv(a, ok); if (!*ok) { *lo = 0; *ok = 0; return; }
-        *hi = pv(b, ok); if (!*ok) { *hi = 0; *ok = 0; return; }
+        *lo = pv(a, ok, NULL); if (!*ok) { *lo = 0; *ok = 0; return; }
+        *hi = pv(b, ok, NULL); if (!*ok) { *hi = 0; *ok = 0; return; }
         return;
     }
+
+    /* widen a period, then apply the comparison against the widened form */
+    int64_t span = 0;
+    *lo = pv(v, ok, &span);
+    if (!*ok) { *lo = 0; *ok = 0; return; }
+
+    if (span > 0) {
+        switch (cmp) {
+        case CMP_LT: *hi = *lo - 1; *lo = INT64_MIN; break;
+        case CMP_LE: *hi = *lo;     *lo = INT64_MIN; break;
+        case CMP_GT: *lo = *lo + span; *hi = INT64_MAX; break;
+        case CMP_GE: *hi = *lo + span - 1; *lo = *lo; break;
+        case CMP_NE: *lo = INT64_MIN; *hi = INT64_MAX; break;
+        default:     *hi = *lo + span - 1; break;    /* CMP_EQ: the whole span */
+        }
+        return;
+    }
+
     switch (cmp) {
-    case CMP_LT: *hi = pv(v, ok) - 1; *lo = INT64_MIN; break;
-    case CMP_LE: *hi = pv(v, ok);     *lo = INT64_MIN; break;
-    case CMP_GT: *lo = pv(v, ok) + 1; *hi = INT64_MAX; break;
-    case CMP_GE: *lo = pv(v, ok);     *hi = INT64_MAX; break;
-    case CMP_NE: /* "not equal at this granularity" is not indexable; the whole
-                  * column is the answer, and the matcher pass drops the value */
-                *lo = INT64_MIN; *hi = INT64_MAX; break;
-    default:     *lo = *hi = pv(v, ok); break;
+    case CMP_LT: *hi = *lo - 1; *lo = INT64_MIN; break;
+    case CMP_LE: *hi = *lo;     *lo = INT64_MIN; break;
+    case CMP_GT: *lo = *lo + 1; *hi = INT64_MAX; break;
+    case CMP_GE: *lo = *lo;     *hi = INT64_MAX; break;
+    case CMP_NE: *lo = INT64_MIN; *hi = INT64_MAX; break;
+    default:     *hi = *lo; break;
     }
 }
 
@@ -332,6 +391,23 @@ static void normalise(const char *s, char *out, size_t outsz, unsigned mode)
         out[o++] = (char)c;
     }
     out[o] = '\0';
+}
+
+/* Materialise the entry's path with backslash separators -- the spelling the ETP
+ * PATH column carries and the only one the client has ever seen -- into the
+ * shared scratch buffer. Returns false if it could not be allocated.
+ *
+ * Text leaves retry against this when the POSIX spelling misses, because the
+ * client composes its `path:regex:` patterns out of the paths it was handed. A
+ * pattern written for `C:\Users\x` cannot match `/home/x`, and the client will
+ * keep sending the former. */
+static bool wire_form(const esidx_t *db, eid_t id, scratch_t *sc)
+{
+    if (!sc->buf) { sc->buf = malloc(65536); sc->cap = 65536; }
+    if (!sc->buf) return false;
+    path_of(db, id, sc->buf, sc->cap);
+    for (char *p = sc->buf; *p; p++) if (*p == '/') *p = '\\';
+    return true;
 }
 
 /* Whole-word test used by ww: and by prefix:/suffix: on a word boundary. */
@@ -382,6 +458,12 @@ static int text_match(const esidx_t *db, eid_t id, const ast_t *t,
             return 0;
         }
         int hit = re_match(re, subj);
+        /* The client builds its regexes from the paths it was given, and the
+         * paths it was given are the backslash-separated ones the ETP PATH column
+         * carries. Retry against that spelling, or every pattern the client sends
+         * silently misses on a POSIX host. The retry has to happen BEFORE the free
+         * -- using `re` afterwards is a use-after-free that -O2 hides. */
+        if (!hit) hit = wire_form(db, id, sc) ? re_match(re, sc->buf) : 0;
         re_free(re);
         return hit;
     }
@@ -394,17 +476,26 @@ static int text_match(const esidx_t *db, eid_t id, const ast_t *t,
         normalise(pat, pb, sizeof(pb), nm);
         normalise(subj, nb, sizeof(nb), nm);
         if (!pb[0]) return 1;                    /* the term reduced to nothing */
-        return strcasestr(nb, pb) != NULL;
+        if (strcasestr(nb, pb)) return 1;
+        if (wire_form(db, id, sc)) {
+            normalise(sc->buf, nb, sizeof(nb), nm);
+            return strcasestr(nb, pb) != NULL;
+        }
+        return 0;
     }
 
     if (wildcard_present(pat)) {
         /* A wildcard means "the whole filename" (everything-syntax.md L35), so
          * startwith:/endwith: cannot combine with one: there is no way to say
          * "starts with" and "matches the whole string" at once. */
-        return wildcard_match(pat, subj, !(m & MOD_CASE));
+        if (wildcard_match(pat, subj, !(m & MOD_CASE))) return 1;
+        if (wire_form(db, id, sc))
+            return wildcard_match(pat, sc->buf, !(m & MOD_CASE));
+        return 0;
     }
 
-    if (m & MOD_WHOLE) return strcmp(pat, subj) == 0;
+    if (m & MOD_WHOLE)
+        return strcmp(pat, subj) == 0;
 
     /* startwith:/endwith: anchor at the filename edge, no boundary required
      * (L84, L86) */
@@ -451,7 +542,10 @@ static int text_match(const esidx_t *db, eid_t id, const ast_t *t,
     }
 
     if (!*pat) return 1;
-    return strcasestr(subj, pat) != NULL;
+    if (strcasestr(subj, pat)) return 1;
+    /* the same fallback as the regex branch */
+    if (wire_form(db, id, sc)) return strcasestr(sc->buf, pat) != NULL;
+    return 0;
 }
 
 /* ------------------------------------------------------- extension macros */
@@ -724,16 +818,32 @@ static int m_macro_type(qctx_t *c, const ast_t *t, bitset_t *out)
     return 0;
 }
 
-/* one numeric range leaf, shared by size:, dm:, dc:, len:, depth: ... */
-static int m_range(qctx_t *c, const ast_t *t, bitset_t *out,
-                   const sidx_t *sidx, cmp_op_t cmp, const char *val)
+/* Adapter so dates and sizes share parse_range2(): it unwraps the tval_t and
+ * publishes the span. */
+static int64_t parse_time_adapter(const char *s, int *ok, int64_t *span)
 {
-    (void)t;
+    tval_t v = parse_time_value(s);
+    /* Distinguish "not a date at all" from "a date at the epoch": an
+     * unparseable bound must not silently become 1970 and match the whole tree. */
+    if (v.at == 0) { *ok = 0; if (span) *span = 0; return 0; }
+    *ok = 1;
+    if (span) *span = v.span;
+    return v.at;
+}
+
+/* One numeric range leaf over a sorted array, shared by size:, dm:, dc: ...
+ * `allow_dash` is false for dates, where a dash is part of YYYY-MM-DD. */
+static int range_on(qctx_t *c, const ast_t *t, bitset_t *out,
+                    const sidx_t *sidx, int is_time)
+{
     int64_t lo, hi;
     int ok = 0;
-    parse_range(val, cmp, &lo, &hi, parse_size_value, &ok, 1);
+    parse_range2(t->val, t->cmp, &lo, &hi,
+                 is_time ? parse_time_adapter : parse_size_value, &ok,
+                 is_time ? 0 : 1);
     if (!ok) {
-        LOGD("unparseable numeric value '%s'", val);
+        LOGD("unparseable %s value '%s'", is_time ? "date" : "numeric",
+             t->val ? t->val : "");
         bs_clear(out);
         return 0;
     }
@@ -745,37 +855,45 @@ static int m_range(qctx_t *c, const ast_t *t, bitset_t *out,
     return 0;
 }
 
+/* which plain column range_on_column() reads */
+enum { COL_CHILDREN, COL_DEPTH, COL_LEN };
+
+/* The same bounds, evaluated against a plain column instead of a sorted array:
+ * depth:, len:, child-count:. */
+static int range_on_column(qctx_t *c, const ast_t *t, bitset_t *out, int column)
+{
+    int64_t lo, hi;
+    int ok = 0;
+    parse_range2(t->val, t->cmp, &lo, &hi, parse_size_value, &ok, 1);
+    if (!ok) { bs_clear(out); return 0; }
+    const entry_table_t *et = &c->db->et;
+    for (uint32_t i = 0, nn = c->n; i < nn; i++) {
+        if (!bs_test(out, i)) continue;
+        int64_t v;
+        switch (column) {
+        case COL_DEPTH:   v = et->depth[i]; break;
+        case COL_LEN:     v = (int64_t)et->name[i].len; break;
+        default:          v = di_child_count(c->db, i); break;   /* COL_CHILDREN */
+        }
+        if (v >= lo && v <= hi) continue;
+        bs_clear_bit(out, i);
+    }
+    return 0;
+}
+
 static int m_size(qctx_t *c, const ast_t *t, bitset_t *out)
 {
-    return m_range(c, t, out, &c->db->by_size, t->cmp, t->val);
+    return range_on(c, t, out, &c->db->by_size, 0);
 }
 
 static int m_mtime(qctx_t *c, const ast_t *t, bitset_t *out)
 {
-    int64_t lo, hi;
-    int ok = 0;
-    parse_range(t->val, t->cmp, &lo, &hi, parse_time_value, &ok, 0);
-    if (!ok) { LOGD("unparseable date '%s'", t->val); bs_clear(out); return 0; }
-    bitset_t sel;
-    if (bs_alloc(c, &sel) != 0) return -1;
-    sidx_range_to_bitset(&c->db->by_mtime, lo, hi, &sel);
-    bs_and(out, &sel);
-    bs_free(&sel);
-    return 0;
+    return range_on(c, t, out, &c->db->by_mtime, 1);
 }
 
 static int m_ctime(qctx_t *c, const ast_t *t, bitset_t *out)
 {
-    int64_t lo, hi;
-    int ok = 0;
-    parse_range(t->val, t->cmp, &lo, &hi, parse_time_value, &ok, 0);
-    if (!ok) { bs_clear(out); return 0; }
-    bitset_t sel;
-    if (bs_alloc(c, &sel) != 0) return -1;
-    sidx_range_to_bitset(&c->db->by_ctime, lo, hi, &sel);
-    bs_and(out, &sel);
-    bs_free(&sel);
-    return 0;
+    return range_on(c, t, out, &c->db->by_ctime, 1);
 }
 
 /* depth: is a plain column scan today (design §2, L0 calls it inline O(1)); it is
@@ -783,18 +901,7 @@ static int m_ctime(qctx_t *c, const ast_t *t, bitset_t *out)
  * pass with no allocation, so it can seed the candidate set. */
 static int m_depth(qctx_t *c, const ast_t *t, bitset_t *out)
 {
-    int64_t lo, hi;
-    int ok = 0;
-    parse_range(t->val, t->cmp, &lo, &hi, parse_size_value, &ok, 1);
-    if (!ok) { bs_clear(out); return 0; }
-    const entry_table_t *et = &c->db->et;
-    for (uint32_t i = 0, nn = c->n; i < nn; i++) {
-        if (!bs_test(out, i)) continue;
-        int64_t d = et->depth[i];
-        if (d >= lo && d <= hi) continue;
-        bs_clear_bit(out, i);
-    }
-    return 0;
+    return range_on_column(c, t, out, COL_DEPTH);
 }
 
 /* attrib: on ext4 only H (leading dot) and D (from d_type) exist; everything
@@ -852,34 +959,12 @@ static int m_empty(qctx_t *c, const ast_t *t, bitset_t *out)
 
 static int m_child_count(qctx_t *c, const ast_t *t, bitset_t *out)
 {
-    int64_t lo, hi;
-    int ok = 0;
-    parse_range(t->val, t->cmp, &lo, &hi, parse_size_value, &ok, 1);
-    if (!ok) { bs_clear(out); return 0; }
-    for (uint32_t i = 0, nn = c->n; i < nn; i++) {
-        if (!bs_test(out, i)) continue;
-        int64_t v = di_child_count(c->db, i);
-        if (v >= lo && v <= hi) continue;
-        bs_clear_bit(out, i);
-    }
-    return 0;
+    return range_on_column(c, t, out, COL_CHILDREN);
 }
 
 static int m_len(qctx_t *c, const ast_t *t, bitset_t *out)
-
 {
-    int64_t lo, hi;
-    int ok = 0;
-    parse_range(t->val, t->cmp, &lo, &hi, parse_size_value, &ok, 1);
-    if (!ok) { bs_clear(out); return 0; }
-    const entry_table_t *et = &c->db->et;
-    for (uint32_t i = 0, nn = c->n; i < nn; i++) {
-        if (!bs_test(out, i)) continue;
-        int64_t v = (int64_t)et->name[i].len;
-        if (v >= lo && v <= hi) continue;
-        bs_clear_bit(out, i);
-    }
-    return 0;
+    return range_on_column(c, t, out, COL_LEN);
 }
 
 /* -------------------------------------------------------------- SCAN leaves */
@@ -1113,8 +1198,8 @@ static uint32_t est_leaf(qctx_t *c, const ast_t *t)
         int64_t lo, hi;
         int ok = 0;
         cmp_op_t cmp = t->cmp;
-        if (s == &c->db->by_size) parse_range(t->val, cmp, &lo, &hi, parse_size_value, &ok, 1);
-        else                     parse_range(t->val, cmp, &lo, &hi, parse_time_value, &ok, 0);
+        if (s == &c->db->by_size) parse_range2(t->val, cmp, &lo, &hi, parse_size_value, &ok, 1);
+        else                     parse_range2(t->val, cmp, &lo, &hi, parse_time_adapter, &ok, 0);
         if (!ok || !s->n) return UINT32_MAX;
         /* the same binary search the range query will do, so the estimate is
          * exact rather than sampled */

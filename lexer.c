@@ -185,7 +185,19 @@ int lex_tokenize(const char *s, tokstream_t *ts)
         if (c == '"') {
             p++;
             if (!quoted) {
-                /* a quoted run is a term in itself: close whatever came before */
+                /* A quote straight after `fn:` continues the value -- that is the
+                 * shape the client sends for a path with a space in it
+                 * (`SEARCH parent:"/home/a b" folder:`). Treating it as a new
+                 * term would split it into `parent:` AND the bare path, and the
+                 * bare path matches no name. */
+                if (after_colon && b.n) {
+                    quoted = 1;
+                    after_colon = 0;
+                    had_space = 0;
+                    continue;
+                }
+                /* otherwise a quoted run is a term in itself: close whatever came
+                 * before */
                 if (flush_term(ts, &b, had_space) != 0) { free(b.p); return -1; }
                 quoted = 1;
                 after_colon = 0;

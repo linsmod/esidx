@@ -1,25 +1,23 @@
-/* CLI harness for P0: build an index, then query it.
+/* CLI harness and ETP server entry point.
  *   esidx [-v] build <root> -o <dbfile>
  *   esidx [-v] query <dbfile> [expr ...]
+ *   esidx [-v] serve <dbfile> [-p port] [--bind addr] [-u user [-w pass]]
  *
- * expr (subset of Everything syntax, §1.3):
- *   parent:"<path>"     direct children of <path>
- *   folder:  file:      type filter
- *   ext:jpg;png         extension filter
- *   size:>1M  size:100..2M   dm:>7d
- *   sort:size:desc  count:20  offset:40
- *   <word>              substring match on name (case-insensitive)
+ * query takes the Everything search language, parsed by the real front end
+ * (syntax.h) -- see design §6.1. Leading or trailing `sort:`, `count:` and
+ * `offset:` are stripped as CLI sugar; everything else is the search string.
+ * Quote every expression in the shell: `size:>1k` unquoted is a redirection, not
+ * a query.
  *
- * NOTE: quote every expr in the shell. `size:>1k` unquoted is a redirection,
- * not a query. test.sh shows the correct form.
- *
- * Diagnostics: ESIDX_LOG=error|warn|info|debug, or -v / -v N / --verbose=N.
- * All of it goes to stderr; stdout carries only results.
+ * serve speaks ETP: FTP plus `SITE EVERYTHING` (design §1). Diagnostics:
+ * ESIDX_LOG=error|warn|info|debug, or -v / -v N / --verbose=N.
  */
 
 #include "esidx.h"
+#include "etp.h"
 #include "timer.h"
 
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +31,8 @@ static void usage(void)
         "usage:\n"
         "  esidx [-v N] build <root> -o <dbfile>\n"
         "  esidx [-v N] query <dbfile> [expr ...]\n"
+        "  esidx [-v N] serve <dbfile> [-p port] [--bind addr]\n"
+        "                             [-u user [-w pass]] [--no-download] [--once]\n"
         "\n"
         "logging: ESIDX_LOG=error|warn|info|debug  or  -v / -v N / --verbose=N\n");
 }
@@ -212,6 +212,46 @@ static int cmd_query(int argc, char **argv)
     return 0;
 }
 
+/* ------------------------------------------------------------------- serve */
+
+/* ETP server (design §1). Loads a snapshot once and answers the client's
+ * `EVERYTHING` sequence over a control connection; see etp.c for the protocol
+ * notes and the decisions taken from the reference implementation. */
+static int cmd_serve(int argc, char **argv)
+{
+    etp_opts_t o;
+    memset(&o, 0, sizeof(o));
+    o.bind_addr = "127.0.0.1";
+    o.port = 21;
+    o.allow_download = 1;
+
+    const char *dbfile = NULL;
+    for (int i = 0; i < argc; i++) {
+        const char *a = argv[i];
+        if (!strcmp(a, "-p") && i + 1 < argc) { o.port = atoi(argv[++i]); continue; }
+        if (!strcmp(a, "--bind") && i + 1 < argc) { o.bind_addr = argv[++i]; continue; }
+        if (!strcmp(a, "-u") && i + 1 < argc) { o.username = argv[++i]; continue; }
+        if (!strcmp(a, "-w") && i + 1 < argc) { o.password = argv[++i]; continue; }
+        if (!strcmp(a, "--no-download")) { o.allow_download = 0; continue; }
+        if (!strcmp(a, "--once")) { o.once = 1; continue; }
+        if (a[0] == '-') {
+            fprintf(stderr, "serve: unknown option %s\n", a);
+            return 1;
+        }
+        if (!dbfile) { dbfile = a; continue; }
+        fprintf(stderr, "serve: unexpected argument %s\n", a);
+        return 1;
+    }
+    if (!dbfile) {
+        fprintf(stderr,
+                "usage: esidx serve <snapshot> [-p port] [--bind addr]\n"
+                "                    [-u user [-w pass]] [--no-download] [--once]\n");
+        return 1;
+    }
+    o.dbfile = dbfile;
+    return etp_serve(&o) == 0 ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
     log_init(argc, argv);
@@ -221,6 +261,7 @@ int main(int argc, char **argv)
     if (argc < 2) { usage(); return 1; }
     if (!strcmp(argv[1], "build")) return cmd_build(argc - 2, argv + 2);
     if (!strcmp(argv[1], "query")) return cmd_query(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "serve")) return cmd_serve(argc - 2, argv + 2);
     usage();
     return 1;
 }

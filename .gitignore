@@ -1,6 +1,7 @@
 # build artifacts
 *.o
 /esidx
+/etp-probe
 
 # snapshots and scratch output
 *.idx
