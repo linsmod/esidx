@@ -815,23 +815,29 @@ answer anyway.
 10. **The scope of a term is `text_match()`'s decision, and it takes three rules,
     not one.** Measured on one directory, ref = voidtools' server on :21 and ours on
     the same tree — every number in the table is re-measurable with `./cmp_ref.sh`,
-    which is also the term list. Every row agrees; the 12 in the `path:esidx` row is
-    the reference's index holding 12 entries in that tree that WSL cannot see, and it
-    is the same 12 in every path-scoped count (6590 vs 6578 for the directory
-    itself), which is why `cmp_ref.sh` prints it once and marks those rows
-    `= delta`.
+    which is also the term list. The counts are from the run of 2026-10-04 and move
+    with every commit, because the tree is the repo; the rules are the point.
+
+    Every row agrees, and the 12 that the path-scoped rows carry are **not ours**:
+    `cmp_ref.sh` prints the entries the two indexes disagree on and stats each one,
+    and all 12 are `.git/objects/<xx>/tmp_obj_XXXXXX` — git's loose-object temp
+    names, renamed away long ago and still sitting in voidtools' NTFS index, which
+    lags deletion. None of them is on disk (`Get-ChildItem -Force -Recurse -Filter
+    tmp_obj_*` finds none), so our smaller number is the complete one. It is the
+    same 12 in every path-scoped count, which is why the script prints the delta
+    once and marks those rows `= delta`.
 
     | term | ref | ours | rule |
     |---|---|---|---|
     | `esidx`, `name:esidx`, `*esidx*`, `regex:esidx`, `ww:esidx` | 3 | 3 | no separator in the value: the **filename** |
-    | `path:esidx`, `esidx\main.c` | 280 / 1 | 268 / 1 | `path:`, or a separator in the value: the **path** |
-    | `esidx` + sep + `*` (either spelling) | 38 | 38 | `find -maxdepth 1` says 38: the direct children |
+    | `path:esidx`, `esidx\main.c` | 307 / 1 | 295 / 1 | `path:`, or a separator in the value: the **path** |
+    | `esidx` + sep + `*` (either spelling) | 39 | 39 | `find -maxdepth 1` says 39, the tree not counted: the direct children |
     | `sidx` + sep + `*` | 0 | 0 | a wildcard may not begin inside a component |
     | `*esidx/main.c`, `path:*/main.c`, `folder: esidx` + sep + `*` | 1 / 1 / 3 | same | |
-    | `path:*esidx*`, `path:*PC*`, `path:**esidx**` | 280 / 6590 / 280 | 268 / 6578 / 268 | `path:` + a leading star: **contains** |
+    | `path:*esidx*`, `path:*PC*`, `path:**esidx**` | 307 / 6617 / 307 | 295 / 6605 / 295 | `path:` + a leading star: **contains** |
     | `path:*esidx` | 2 | 2 | no trailing star: ends-with |
     | `path:*PC/esidx*` | 1 | 1 | a value with a separator is a fragment, and a fragment's trailing star cannot cross one |
-    | `path:esidx*`, `path:**esidx**` | 3 / 280 | 3 / 268 | no leading star: anchored at a component |
+    | `path:esidx*`, `path:**esidx**` | 3 / 307 | 3 / 295 | no leading star: anchored at a component |
 
     So: a leading star in an explicit `path:` value is what makes it a `contains`
     test, and that is the only place a single star crosses a separator. Everything

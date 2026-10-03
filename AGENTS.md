@@ -55,7 +55,7 @@ Each layer has its own suite, and they are separate files on purpose:
 | `test.sh` | the **index**, against `find(1)`; plus a **language** suite against a flat fixture | scan, storage or parsing is wrong |
 | `test_etp.sh` | the **wire**, against the ETP client's own parsing rules | a reply would not be understood by the client |
 | `round.sh` | nothing — it is the end-to-end demonstration and the source of the numbers in the docs | (prints timings; asserts nothing) |
-| `cmp_ref.sh` | nothing — it re-measures every expected value quoted against the reference server (§1.4) | (prints a table; `--strict` exits 1 on a row the index delta does not explain) |
+| `cmp_ref.sh` | nothing — it re-measures every expected value quoted against the reference server (§1.4) | (prints a table; when the two indexes differ by more than 0 it prints the entries that make up the difference and stats each one, so a delta is classified rather than assumed; `--strict` exits 1 on a row the delta does not explain) |
 
 Run the index suite before the protocol suite. A parse regression shows up as a
 protocol failure otherwise, and you will spend an hour in the wrong file.
