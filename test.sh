@@ -444,7 +444,8 @@ say "performance (visibility, not assertions)"
 DB="$TMP/perf.idx"
 "$BIN" build "$TEST_ROOT" -o "$DB" 2>&1 >/dev/null | sed 's/^/   /'
 printf '\n== the queries the ETP client actually issues\n'
-# These four shapes are what EtpClient.query + EtpBrowseViewModel put on the wire.
+# These four shapes are what an ETP client actually puts on the wire (the trace
+# the official client produced; AGENTS.md 1.4).
 # Printing them next to the phase timings is the point of the section: it is the
 # only place where the driver's effect is visible.
 ESIDX_LOG=info "$BIN" query "$DB" "ext:conf" "sort:size:desc" "count:5" \

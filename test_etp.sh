@@ -7,37 +7,49 @@
 #   TEST_ROOT=/usr ./test_etp.sh   also exercise a real index
 #
 # Independent of test.sh on purpose. test.sh pins the *index* against find(1);
-# this pins the *wire*, against the exact byte sequence the ETP client puts on
-# the socket. Both were derived from the same two references -- the
-# client's EtpClient.java and voidtools' etp_server.c 1.0.2.5 -- but they fail for
-# different reasons, so keeping them apart means a failure names its layer.
+# this pins the *wire*, against the exact byte sequence an ETP client puts on the
+# socket. They fail for different reasons, so keeping them apart means a failure
+# names its layer.
 #
-# The client side is tools/etp_probe.c, which is a transcription of the client's
+# The client side is tools/etp_probe.c, which is a transcription of an ETP client's
 # own parsing rules rather than a generic FTP client. "The probe understood the
-# reply" is therefore exactly "the ETP client would understand the reply",
-# including for the fragile cases: the reply terminator rule, the literal
-# `200-Query results` / `200 End.` markers, RESULT_COUNT being independent of every
-# column toggle, and per-item column lines having to precede their FILE/FOLDER line.
+# reply" is therefore exactly "a client would understand the reply", including for
+# the fragile cases: the reply terminator rule, the literal `200-Query results` /
+# `200 End.` markers, RESULT_COUNT being independent of every column toggle, and
+# per-item column lines having to precede their FILE/FOLDER line.
+#
+# Where the specification comes from, and in what order to believe it:
+#
+#   1  the official Everything client, observed directly. AGENTS.md 1.4 has the
+#      invocation; `-v 4` on the server logs every command it sends, so a rule
+#      that is wrong here is a rule that is wrong on the wire, not in a comment.
+#   2  voidtools' etp_server.c 1.0.2.5, cited by line. The wire-format baseline
+#      (design D1), and `etp-probe 21 <script>` runs these same shapes against a
+#      live instance of it, so the probe's rules are not just self-consistent.
+#   3  the client's published search syntax, docs/everything-syntax.md.
 #
 # Acceptance criteria, each traced to its source:
 #
-#   1  220 welcome, single line             EtpClient.readWelcome:74-86
-#   2  USER -> 230, or 331 then PASS        EtpClient.login:93-137
-#   3  BARE `EVERYTHING <sub> <param>`      EtpClient.sendEverything:144-151
-#   4  the subcommand sequence and order    EtpClient.query:230-270
+#   1  220 welcome, single line             observed on :21 and by the probe
+#   2  USER -> 230, or 331 then PASS        ditto
+#   3  `EVERYTHING <sub> <param>`, bare or after SITE
+#                                          the official client sends `SITE
+#                                          EVERYTHING`; another sends it bare.
+#                                          Both must work.
+#   4  the subcommand sequence and order    trace of the official client
 #   5  every subcommand but QUERY answers
-#      one line starting "200 "             EtpClient.readResponse:424-440
+#      one line starting "200 "             observed
 #   6  QUERY answers exactly `200-Query results`, ` RESULT_COUNT n`, one leading
 #      space per data line, ` FOLDER name` / ` FILE name`, `200 End.`
-#                                          EtpClient.readQueryResults:285-410
+#                                          observed against both servers
 #   7  RESULT_COUNT is the TOTAL match count, not the page size
-#                                          EtpClient.java:321
+#                                          observed; etp_server.c:5190
 #   8  dates as FILETIME; unknown folder size as 18446744073709551615
 #                                          etp_server.c:5229,5235
 #   9  a new OFFSET re-slices without re-running the search
 #                                          design §6.4, ref G3
 #  10  QUIT followed by an immediate close, reply never read
-#                                          EtpClient.close:460
+#                                          observed on :21
 
 set -u
 cd "$(dirname "$0")"
@@ -233,8 +245,9 @@ kill "$SRV_PID2" 2>/dev/null; SRV_PID2=""
 # ------------------------------------------- 2: the client's exact query sequence
 
 say "2. the ETP client's query sequence, verbatim (criteria 3, 4, 5, 6)"
-echo "   EtpClient.query() sends CASE PATH REGEX WHOLE_WORD, then all seven"
-echo "   *_COLUMN toggles, then SORT, OFFSET, COUNT, SEARCH, QUERY."
+echo "   the sequence below is the trace the official client produced: CASE PATH"
+echo "   REGEX WHOLE_WORD, then all seven *_COLUMN toggles, then SORT, OFFSET,"
+echo "   COUNT, SEARCH, QUERY."
 
 etp "search: full sequence, 3 .conf files" "$SRV_PORT" <<EOF
 send USER anonymous
@@ -265,7 +278,7 @@ expect "  RESULT_COUNT is the total match count" "$(pcount)" "3"
 expect "  three rows returned"                   "$(prows)" "3"
 expect "  name_ascending order -- the wire carries the bare name" \
     "$(pnames)" "b.conf c.conf one.conf "
-echo "     and the client joins it onto PATH itself (EtpClient.fullPath:522),"
+echo "     and the client joins it onto PATH itself,"
 echo "     which is why PATH must round-trip through the parent's own spelling"
 
 say "3. column lines precede their row, and are complete (criteria 6, 8)"
@@ -310,9 +323,9 @@ EOF
 
 expect "  four subdirectories"      "$(prows)" "4"
 # Everything sends 18446744073709551615 on the wire for a folder whose size it
-# does not index; that overflows the client's Long.parseLong, which it swallows,
-# so the client ends up showing no size at all. Both halves are asserted: the
-# wire bytes, and the value the client is left holding.
+# does not index; that overflows a client's signed 64-bit field, which it
+# swallows, so the client ends up showing no size at all. Both halves are
+# asserted: the wire bytes, and the value the client is left holding.
 expect "  the wire sends the unknown-size sentinel" \
     "$(lastblock | grep -c '^WIRE  SIZE 18446744073709551615$')" "4"
 expect "  the client is left with no size for a folder" "$(pfield 0 size)" "-1"
@@ -590,14 +603,14 @@ cq "a bare word as a substring"    "conf"                           "3"
 
 say "11. FTP verbs the client never sends, for other clients"
 
-# OPTS is the one verb the *official* Everything client sends that EtpClient.java
-# never does, and it is the first command after login. It arrived by running the
-# real client against this server: `Everything.exe -instance X -connect u:p@host:port`
-# puts `OPTS UTF8 ON` on the wire before any column toggle, and the server used to
-# answer 501 because it compared the whole argument against the bare word "UTF8".
-# The official client then never issued the toggles or QUERY at all, so es.exe sat
-# there with no IPC reply and no error anywhere -- a silent hang, which is why no
-# suite caught it: nothing here drives the official client.
+# OPTS is the first command after login for the official Everything client, and it
+# arrived by running that client against this server: `Everything.exe -instance X
+# -connect u:p@host:port` puts `OPTS UTF8 ON` on the wire before any column
+# toggle, and the server used to answer 501 because it compared the whole argument
+# against the bare word "UTF8". The client then never issued the toggles or QUERY
+# at all, so tools/es.exe sat there with no IPC reply and no error anywhere -- a
+# silent hang, which is why no suite caught it: nothing here drives the official
+# client, and the probe only ever sent what it had been taught to send.
 # Reply wording and the bare-argument rejection are the reference's, checked
 # against etp_server 1.0.2.5 listening on 127.0.0.1:21.
 etp "OPTS UTF8 ON/OFF, the official client's first command after login" "$SRV_PORT" <<'EOF'
@@ -619,15 +632,16 @@ expect "  an unrelated option is rejected" \
     "$(pwire | sed -n 5p | cut -c1-3)" "501"
 
 # FEAT deserves its own note. The server emits exactly the reference feature set
-# (etp_server.c:1728-1736), and the client's own readResponse() rule then
-# mis-parses it: " MLSD" is five characters with 'S' at index 3, so it matches
-# neither the final-line test (space at index 3) nor the continuation test
-# (hyphen at index 3) and the reader stops there (EtpClient.java:430-436).
+# (etp_server.c:1728-1736), and a client's own reply-reading rule then mis-parses
+# it: " MLSD" is five characters with 'S' at index 3, so it matches neither the
+# final-line test (space at index 3) nor the continuation test (hyphen at index 3)
+# and the reader stops there. That is the same rule the probe implements, which is
+# why the probe truncates the reference's reply at exactly the same line.
 #
-# That is why the client never sends FEAT -- it does not need to probe for an
+# A client therefore never sends FEAT -- it does not need to probe for an
 # extension it always uses. The server is not at fault and must not be "fixed"
 # around it; what is asserted here is that the truncation happens exactly where
-# the client's rule says it does, so a future reader is not surprised.
+# the rule says it does, so a future reader is not surprised.
 etp "FEAT: the client's parser truncates the reference feature list" "$SRV_PORT" <<'EOF'
 send USER anonymous
 send FEAT

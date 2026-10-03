@@ -9,15 +9,16 @@
  * index engine (D1). The wire behaviour is deliberately identical, because the
  * ETP client is the consumer and it was written against that server.
  *
- * Two facts about the consumer shape this file, both verified against
- * app/src/main/java/.../transfer/EtpClient.java:
+ * Two facts about the consumer shape this file, both observed on the wire by
+ * pointing a real client at this server (AGENTS.md 1.4):
  *
- *   - It sends the *bare* `EVERYTHING <sub> [param]` form, never `SITE
- *     EVERYTHING`. etp_server treats the two identically (etp_server.c:2070 and
+ *   - Clients spell the extension both ways: the official Everything client sends
+ *     `SITE EVERYTHING <sub> [param]`, others send the bare `EVERYTHING <sub>
+ *     [param]`. etp_server treats the two identically (etp_server.c:2070 and
  *     :2128 dispatch both to the same function), and so does this.
- *   - It never opens a data connection. No PASV/EPSV/EPRT/PORT, no LIST/MLSD,
+ *   - No client opens a data connection. No PASV/EPSV/EPRT/PORT, no LIST/MLSD,
  *     no RETR -- browsing is `parent:"<path>" folder:` through QUERY. The data
- *     channel below exists for other FTP clients (design §1.3), not for this one.
+ *     channel below exists for other FTP clients (design §1.3), not for these.
  */
 
 #include "esidx.h"

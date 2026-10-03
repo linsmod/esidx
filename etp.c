@@ -117,15 +117,15 @@ static void obuf_free(obuf_t *b) { free(b->p); b->p = NULL; b->n = b->cap = 0; }
 
 /* Unix seconds -> Windows FILETIME (100 ns units since 1601-01-01).
  * etp_server.c:5235 sends fd.date_modified straight through, and the client
- * divides by 10000 and subtracts the 1601 epoch (EtpClient.filetimeToMillis),
- * so the conversion has to be exact or every date shifts by decades. */
+ * divides by 10000 and subtracts the 1601 epoch, so the conversion has to be
+ * exact or every date shifts by decades. */
 static uint64_t to_filetime(int64_t unix_sec)
 {
     return ((uint64_t)unix_sec + 11644473600ULL) * 10000000ULL;
 }
 
 /* Our paths use '/'; the ETP wire is Windows-flavoured because the client joins
- * `path + "\\" + name` (EtpClient.fullPath:522). Emitting '\' keeps a path that
+ * `path + "\\" + name`, so emitting '\' keeps a path that
  * makes the round trip byte-identical, and query.c's normalise_path() accepts
  * either separator on the way back in. */
 static void wire_path(const char *in, char *out, size_t outsz)
@@ -421,7 +421,7 @@ static void copy_param(char *dst, size_t n, const char *src)
 }
 
 /* One dispatcher for all 32 subcommands. Every acknowledgement is a single line
- * beginning "200 " -- the client's readResponse() (:424-440) treats a space at
+ * beginning "200 " -- a client's reply reader treats a space at
  * index 3 as the final line and a hyphen as a continuation, and the reference
  * emits exactly one multi-line reply in the whole protocol (the query block). */
 static void everything_cmd(const esidx_t *db, client_t *c,
@@ -1166,7 +1166,7 @@ static void client_read(const etp_opts_t *o, const esidx_t *db, client_t *c)
         }
         if (n == 0) {
             /* The client closes the socket right after QUIT without reading the
-             * reply (EtpClient.close:460), so a clean EOF here is normal. */
+             * reply, so a clean EOF here is normal. */
             LOGD("client closed the connection");
             c->fd = -1;
             return;
@@ -1201,9 +1201,9 @@ static void client_init(client_t *c, int fd)
     c->data_fd = -1;
     c->peer_fd = -1;
     /* etp_server.c:1207 -- COUNT defaults to "unlimited", not zero. It matters:
-     * the client only sends COUNT when it is positive (EtpClient.java:260), so a
-     * default of 0 would make every query that omitted it return no rows at all,
-     * while the reference returns the whole match set. */
+     * a client only sends COUNT when it is positive, so a default of 0 would make
+     * every query that omitted it return no rows at all, while the reference
+     * returns the whole match set. */
     c->count = 0xffffffffu;
     snprintf(c->cwd, sizeof(c->cwd), "/");
 }

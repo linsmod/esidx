@@ -1,32 +1,38 @@
 /* etp_probe -- the ETP acceptance client.
  *
  * Built only by `make etp-probe`; not part of the server. Its job is to answer one
- * question: *would the ETP client understand this server?*
+ * question: *would an ETP client understand this server?*
  *
- * So it is a reimplementation of the client's own wire handling, not a generic FTP
- * client. Every parsing rule below is transcribed from
- * app/src/main/java/github/linsmod/sharetopc/transfer/EtpClient.java, with the
- * line number it comes from, and the acceptance suite drives it with the exact
- * command sequence that client emits (EtpClient.query:230-270).
+ * So it is a reimplementation of a client's own wire handling, not a generic FTP
+ * client. Every parsing rule below is a rule real clients apply, and the acceptance
+ * suite drives the probe with the command sequence the official Everything client
+ * actually emits (AGENTS.md 1.4 has how to capture it).
  *
- * If this probe parses a reply, the client parses it, because it applies the same
+ * The rules are pinned twice over, which is what makes "the probe understood the
+ * reply" worth anything:
+ *
+ *   - test_etp.sh asserts each one against a live instance of this server;
+ *   - `./etp-probe 21 <script>` runs the same shapes against voidtools' own server
+ *     on 127.0.0.1:21, so they are satisfied by an implementation we did not write.
+ *
+ * If this probe parses a reply, a client parses it, because it applies the same
  * rules -- including the fragile ones. In particular:
  *
- *   - the welcome is accepted only on a `220 ` prefix (:74-86);
- *   - a reply ends at `nnn` + space, and continues on `nnn` + hyphen (:424-440);
- *     anything shorter than four characters also terminates;
+ *   - the welcome is accepted only on a `220 ` prefix;
+ *   - a reply ends at `nnn` + space, and continues on `nnn` + hyphen; anything
+ *     shorter than four characters also terminates;
  *   - the query block is NOT read with that rule: it keys on the literal
  *     `200-Query results` to enter and the literal `200 End.` to leave, and
- *     every line is stripped of leading whitespace first (:285-410). A server
- *     that answered `200 End` or `200-Query results 42` in the wrong place would
- *     hang the real client, so the probe reports that as a protocol error rather
- *     than quietly coping;
- *   - RESULT_COUNT is parsed independently of every column toggle (:320-325) --
- *     it is the total match count, not the page size;
+ *     every line is stripped of leading whitespace first. A server that answered
+ *     `200 End` or `200-Query results 42` in the wrong place would hang a real
+ *     client, so the probe reports that as a protocol error rather than quietly
+ *     coping;
+ *   - RESULT_COUNT is parsed independently of every column toggle -- it is the
+ *     total match count, not the page size;
  *   - a per-item column line only counts if it arrived before that item's
- *     FILE/FOLDER line, because the client resets its accumulators there (:386-392).
+ *     FILE/FOLDER line, because the client resets its accumulators there.
  *
- * Anything the client would silently drop, the probe reports as DROPPED, so the
+ * Anything a client would silently drop, the probe reports as DROPPED, so the
  * suite can assert that a well-behaved server produces none.
  *
  * Usage:
@@ -122,8 +128,8 @@ static void send_line(const char *s)
     }
 }
 
-/* EtpClient.readResponse():424-440 -- collapse a single- or multi-line reply.
- * Final line is `nnn` + space at index 3; `nnn` + hyphen continues. */
+/* Collapse a single- or multi-line reply. Final line is `nnn` + space at index 3;
+ * `nnn` + hyphen continues. */
 static int read_reply(void)
 {
     char acc[MAX_LINE * 4];
@@ -145,13 +151,13 @@ static int read_reply(void)
     }
 }
 
-/* EtpClient.java:341 and friends parse every numeric field with Long.parseLong
- * inside a try/catch that swallows NumberFormatException. Everything sends
+/* Clients parse every numeric field into a signed 64-bit value inside a
+ * try/catch that swallows the overflow. Everything sends
  * 18446744073709551615 for a folder whose size it does not index
- * (etp_server.c:5229); that overflows a signed 64-bit parse, so the real client
- * leaves the accumulator at its initial value and shows no size at all. Mirror
- * that exactly rather than saturating -- the point of this probe is to reproduce
- * the client's behaviour, not a tidier one. */
+ * (etp_server.c:5229); that overflows, so the client leaves the accumulator at
+ * its initial value and shows no size at all. Mirror that exactly rather than
+ * saturating -- the point of this probe is to reproduce the client's behaviour,
+ * not a tidier one. */
 static long long parse_ll(const char *s, long long fallback)
 {
     errno = 0;
@@ -163,9 +169,9 @@ static long long parse_ll(const char *s, long long fallback)
 
 /* ------------------------------------------------- the query block, verbatim */
 
-/* EtpClient.readQueryResults():285-410, transcribed. `stripLeading()` on every
- * line, enter on the literal header, leave on the literal terminator, accumulate
- * per item, emit on FILE/FOLDER.
+/* The query block, transcribed. Leading whitespace is stripped on every line,
+ * enter on the literal header, leave on the literal terminator, accumulate per
+ * item, emit on FILE/FOLDER.
  *
  * Blocks are numbered and delimited so a script that reads two blocks on one
  * connection can still be asserted on -- which is how the result cache is tested.
@@ -177,7 +183,7 @@ static void read_query_block(void)
     long long result_count = -1;
     long long rows = 0;
 
-    /* per-item accumulators, all reset on FILE/FOLDER (:386-392) */
+    /* per-item accumulators, all reset on FILE/FOLDER (the client resets there) */
     char a_path[MAX_LINE] = "";
     long long a_size = -1, a_dm = -1, a_dc = -1, a_drc = -1;
     int a_attrib = -1;
@@ -258,7 +264,7 @@ static void read_query_block(void)
                 rows, is_dir ? "FOLDER" : "FILE", name,
                 a_path, a_size, a_dm, a_dc, a_drc, a_attrib);
             rows++;
-            /* reset the accumulators (:386-392) */
+            /* reset the accumulators (the client resets there) */
             a_path[0] = '\0';
             a_size = a_dm = a_dc = a_drc = -1;
             a_attrib = -1;
@@ -368,7 +374,7 @@ int main(int argc, char **argv)
     int one = 1;
     setsockopt(g_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
-    /* the welcome is read with the client's own rule (:74-86) */
+    /* the welcome is read with the client's own rule (the client's own rule) */
     if (!read_line()) { fprintf(stderr, "no welcome\n"); return 2; }
     out("WELCOME %s", g_line);
     if (strncmp(g_line, "220 ", 4) != 0)

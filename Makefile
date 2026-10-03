@@ -30,8 +30,9 @@ esidx: $(OBJS)
 test: esidx
 	./test.sh
 
-# protocol acceptance, driven over a real socket by a transcription of the
-# ETP client's own parsing rules (tools/etp_probe.c)
+# protocol acceptance, driven over a real socket by tools/etp_probe.c, which
+# applies a real client's parsing rules. tools/es.exe (voidtools) is checked in
+# next to it as the second peer -- see AGENTS.md 1.4.
 etp-probe: tools/etp_probe.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 

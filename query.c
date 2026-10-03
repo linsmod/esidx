@@ -692,7 +692,7 @@ static int eval_node(qctx_t *c, const ast_t *t, bitset_t *out);
 /* ------------------------------------------------------------- path helpers */
 
 /* Accept a path as the client sends it. The ETP wire is Windows-flavoured: the
- * ETP client joins `path + "\\" + name` (EtpClient.fullPath), so a path that
+ * ETP client joins `path + "\\" + name`, so a path that
  * came from us and went through the client comes back with mixed separators.
  * Normalising here is what keeps `parent:` a hash hit instead of a miss. */
 static void normalise_path(const char *in, char *out, size_t outsz)

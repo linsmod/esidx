@@ -61,11 +61,21 @@ protocol failure otherwise, and you will spend an hour in the wrong file.
 
 ### 1.4 The official client as a test peer
 
-`tools/etp_probe.c` is a transcription, so it can only prove the server agrees
-with *our reading* of `EtpClient.java`. The reference server on `127.0.0.1:21`
-and the official client are both available on this machine, and together they
-close the loop. Neither substitutes for the suites; each answers a question the
-other cannot.
+**The specification is the wire, and the wire is observable.** Nothing here is
+defined by reading somebody else's source: point a real ETP client at this
+server, and whatever it does is the contract. Two peers are available on this
+machine and neither substitutes for the suites; each answers a question the
+other cannot:
+
+| Peer | Question it answers |
+|---|---|
+| `tools/es.exe` + an Everything instance | what does a client actually put on the wire, and would it understand the reply |
+| `etp_server` on `127.0.0.1:21` | is this the reference's behaviour, or ours |
+
+`tools/etp_probe.c` sits alongside them: same rules as a client, scriptable, so
+`test_etp.sh` can assert 200-odd replies in a second. It is a transcription, so
+by itself it only proves the server agrees with our reading of a client — which
+is why the two peers above exist.
 
 **Point the official client at this server.** Everything accepts `-instance`, so
 the ETP instance lives beside the default one instead of replacing it. This is
@@ -109,11 +119,12 @@ Three things about this setup that each cost an hour to find:
 - **`pkill -f "esidx -v 4 serve"` kills the shell running it**, because the
   pattern matches that shell's own command line. Use `pkill -x esidx`.
 
-**`es.exe` cannot drive it, and that is not our bug.** es.exe (voidtools, separate
-download from `https://www.voidtools.com/es.zip`) has no way to reach an ETP
-*client* instance. `-instance <name>` either falls back to the default instance —
-silently returning the local index, which looks like it worked — or returns
-`Error 8`, because Everything registers the window as
+**`tools/es.exe` cannot drive it, and that is not our bug.** es.exe (voidtools'
+command line interface; a copy is checked in at `tools/es.exe`, and
+`es.zip`/`cli.c` come from `https://www.voidtools.com/es.zip`) has no way to reach
+an ETP *client* instance. `-instance <name>` either falls back to the default
+instance — silently returning the local index, which looks like it worked — or
+returns `Error 8`, because Everything registers the window as
 `EVERYTHING_TASKBAR_NOTIFICATION_(<name>)` with the parentheses already in the
 class, so passing the name with or without them both miss. Verified by pointing
 an identically named instance at the reference server on `:21`, which behaves the
@@ -133,9 +144,8 @@ sequence to assert on what the GUI consumed:
 **Use the probe against `:21` too.** Running `etp-probe 21 <script>` is the only
 check that the probe's transcribed rules are satisfied by an implementation we
 did not write. It passes for every shape the suites cover. It also reproduces
-the one known deviation: the client's `readResponse` cannot classify ` MLSD` in
-the reference's own `211-` FEAT reply and stops there, which is why the client
-never sends FEAT (§5.1).
+the one known deviation: a client cannot classify ` MLSD` in the reference's own
+`211-` FEAT reply and stops there, which is why no client sends FEAT (§5.1).
 
 ### 1.5 Commit per batch
 
@@ -241,19 +251,22 @@ cross-checking is for.
 
 ### 3.3 Protocol tests drive the real client's rules
 
-`tools/etp_probe.c` is not a generic FTP client. It is a transcription of
-`EtpClient.java`'s parsing, including the parts that are fragile:
+`tools/etp_probe.c` is not a generic FTP client. It applies a real client's parsing
+rules, including the parts that are fragile:
 
 - a reply ends at `nnn` + space and continues on `nnn` + hyphen; anything shorter
-  than four characters also terminates (`:430-436`);
+  than four characters also terminates;
 - the query block does **not** use that rule — it keys on the literal
-  `200-Query results` and `200 End.` (`:302`, `:314`);
-- `RESULT_COUNT` is parsed independently of every column toggle (`:320`);
-- a numeric field that overflows `Long.parseLong` leaves the accumulator at its
-  initial value, because the exception is swallowed (`:341`).
+  `200-Query results` and `200 End.`;
+- `RESULT_COUNT` is parsed independently of every column toggle;
+- a numeric field that overflows a signed 64-bit parse leaves the accumulator at
+  its initial value, because the exception is swallowed.
 
-If the probe understands a reply, the client does. When you change anything on the
-wire, transcribe the corresponding rule rather than writing a looser check.
+Each of those is pinned against a live server *and* re-checked against voidtools'
+own server on `:21`, so "the probe understood the reply" means a client would.
+When you change anything on the wire, transcribe the corresponding rule rather
+than writing a looser check — and if a rule is wrong, fix it against what a real
+client does (§1.4), not against what the probe happens to do.
 
 ### 3.4 Write the failing test first, and make it fail for the right reason
 
@@ -267,7 +280,7 @@ Record that in the commit message. Examples from this codebase:
 | `SIZE` returned 550 for files | only directories were in `di_lookup`, and only LIST was tested |
 | `COUNT` defaulted to 0 | the reference defaults to `0xffffffff` (`:1207`); no test omitted COUNT |
 | the 503 guard fired on an armed PASV | the guard was copied from a reference whose state variable means something slightly different |
-| `OPTS UTF8 ON` answered `501`, hanging the official client | `EtpClient.java` never sends `OPTS`, so the probe never sent it either — the verb was only on the wire when the real client was pointed at the server (§1.4). A rejection the client does not treat as fatal just stops it sending anything else, which looks like a hang with no error anywhere. |
+| `OPTS UTF8 ON` answered `501`, hanging the official client | the probe only ever sent what it had been taught to send, and that list had no `OPTS` — the verb was only on the wire when the real client was pointed at the server (§1.4). A rejection the client does not treat as fatal just stops it sending anything else, which looks like a hang with no error anywhere. |
 
 ### 3.5 A test that cannot fail is worse than no test
 
@@ -339,29 +352,32 @@ counter first, in its own commit.
 
 ### 5.1 The client is the specification
 
-The consumer is the ETP client, `EtpClient.java`. When a protocol or language
-question arises, the answer is in that file, and the citation goes in a comment.
-Its behaviours that are not obvious and that this server matches deliberately:
+The consumer is an ETP client, and the observable one is the way to ask it
+questions (§1.4). When a protocol or language question arises, run a real client
+against this server and look at what it does; the answer goes in a comment next
+to the code. Its behaviours that are not obvious and that this server matches
+deliberately:
 
-| Behaviour | Where | Consequence here |
+| Behaviour | How we know | Consequence here |
 |---|---|---|
-| sends **bare** `EVERYTHING <sub>`, never `SITE EVERYTHING` | `:144-151` | both spellings route to one dispatcher |
-| never opens a data connection | — | browsing is `parent:` + `folder:`, so `parent:` must be O(1) |
-| joins `path + "\" + name` | `:522-528` | the PATH column uses backslash separators; `normalise_path()` accepts either on the way in |
-| swallows `NumberFormatException` on SIZE | `:341` | the unknown-size sentinel makes it show no size, which is what we want |
-| `RESULT_COUNT` is the total, not the page | `:321` | the executor returns the full sorted set and the protocol layer slices |
-| `COUNT` is only sent when positive | `:260` | the default must be "unlimited", matching `etp_server.c:1207` |
-| closes the socket right after QUIT without reading | `:460` | a clean EOF is normal, not an error |
-| cannot parse the reference server's own FEAT reply | `:430-436` | do not "fix" the server around it; the client never sends FEAT |
+| spells the extension `SITE EVERYTHING`; others send it bare | trace from the official client | both spellings route to one dispatcher |
+| never opens a data connection | same trace | browsing is `parent:` + `folder:`, so `parent:` must be O(1) |
+| joins `path + "\" + name` | observed round trip: a path we emit comes back mixed-separator | the PATH column uses backslash separators; `normalise_path()` accepts either on the way in |
+| swallows an overflowing SIZE | the sentinel shows no size at all | the unknown-size sentinel is what we want |
+| `RESULT_COUNT` is the total, not the page | observed: a page of 3 out of 8 reported 8 | the executor returns the full sorted set and the protocol layer slices |
+| sends `OPTS UTF8 ON` first, and stops there unless it gets `200` | trace, after a `501` | see below |
+| `COUNT` is only sent when positive | trace | the default must be "unlimited", matching `etp_server.c:1207` |
+| closes the socket right after QUIT without reading | observed on `:21` | a clean EOF is normal, not an error |
+| cannot classify ` MLSD` in the reference's own `211-` FEAT reply | the probe truncates at the same line | do not "fix" the server around it; a client never sends FEAT |
 
 The official Everything client is a second, independent reader, and it disagrees
-with `EtpClient.java` in one place that matters: it sends `OPTS UTF8 ON` as the
-first command after login. A server that does not answer that `200` never gets
-the column toggles or the QUERY, and the failure looks like nothing at all. So
-`OPTS` is implemented to the reference's rules — `UTF8 ON`/`UTF8 OFF` accepted,
-the bare `OPTS UTF8` rejected — and pinned in `test_etp.sh` §11. Treat the two
-clients as two specifications and satisfy both: where they differ, the reference
-server's behaviour is the tie-breaker.
+with the one the probe was built from in one place that matters: it sends
+`OPTS UTF8 ON` as the first command after login. A server that does not answer
+that `200` never gets the column toggles or the QUERY, and the failure looks like
+nothing at all. So `OPTS` is implemented to the reference's rules — `UTF8 ON`/
+`UTF8 OFF` accepted, the bare `OPTS UTF8` rejected — and pinned in `test_etp.sh`
+§11. Treat the clients as two specifications and satisfy both: where they differ,
+the reference server's behaviour is the tie-breaker.
 
 ### 5.2 Match the reference byte for byte, then document the deviation
 
@@ -433,6 +449,7 @@ fails to run, check that first.
 | storage contract | `esidx.h` |
 | query surface | `syntax.h` |
 | protocol options | `etp.h` |
+| how to check the server against a real client | §1.4 |
 | what is left | `docs/design.md` §10 — it carries the current measurements |
 
 ## 8. Before committing

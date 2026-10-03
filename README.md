@@ -70,10 +70,12 @@ make test-all          # both, in that order
   `./test.sh -v` echoes every query; `TEST_ROOT=/usr ./test.sh` indexes a bigger
   tree (slower, ~5 s).
 - **`test_etp.sh`** pins the *wire*, driven by `tools/etp_probe.c` — a
-  transcription of the ETP client's own parsing rules, so "the probe
-  understood the reply" means "the client would understand the reply", fragile
-  cases included. Its ten acceptance criteria are listed at the top of the file,
-  each traced to the line of `EtpClient.java` or `etp_server.c` it comes from.
+  transcription of a real ETP client's parsing rules, so "the probe understood the
+  reply" means "a client would understand the reply", fragile cases included. Its
+  ten acceptance criteria are listed at the top of the file, each traced to the
+  observation or to the `etp_server.c` line it comes from. The same shapes also run
+  against voidtools' own server on `127.0.0.1:21` via `etp-probe 21`, so the rules
+  are not merely self-consistent.
 - **`round.sh`** is not a test; it is the demonstration that the three layers fit
   together on data nobody curated, and it is where the numbers below come from.
 
@@ -174,8 +176,8 @@ the performance comes from, the last two are where the interoperability risk was
   us spelled differently and no longer hash to the same directory. Separators are
   normalised on the way in, which is what makes `parent:` a hit rather than a miss.
 - **A directory's SIZE is the sentinel `18446744073709551615`**, not the real
-  4096. Everything does not index folder sizes by default; the client's
-  `Long.parseLong` overflows on the sentinel, swallows the exception, and shows
+  4096. Everything does not index folder sizes by default; a client parses that
+  into a signed 64-bit field, overflows, swallows the exception, and shows
   no size — which is what we want, since a 4096 in the size column of every
   directory means nothing.
 
