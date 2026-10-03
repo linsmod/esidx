@@ -1,0 +1,7 @@
+# build artifacts
+*.o
+/esidx
+
+# snapshots and scratch output
+*.idx
+*.db

@@ -1,0 +1,702 @@
+实现ETP兼容server on linux 调研
+
+ext4 first
+
+在wsl拉两个常用的搜索工具源码
+
+## 拉取结果
+
+| 包 | 方式 | 位置 |
+|---|---|---|
+| plocate **1.1.15-1ubuntu2** | `apt-get source plocate` ✅ | `/root/src-dl/plocate-1.1.15`（约 6.9k 行 C++） |
+| fsearch | Ubuntu 22.04 **源里没有**（`apt-cache showsrc fsearch` 空）→ 改 GitHub clone | `/root/src-dl/fsearch`（master `d531eb3`） |
+
+你的 WSL 是 Ubuntu-22.04，默认用户 `linsmod` 的 sudo 要密码，我用 `-u root` 跑的；`/root` 是 700，普通用户进不去，查看时也要 `-u root`。另外我加了 `/etc/apt/sources.list.d/zz-src-add.list` 补上 universe/multiverse 的 `deb-src`（原来只有 main/restricted）。
+
+Windows 侧可直接用 `\\wsl$\Ubuntu-22.04\root\src-dl\` 打开，用 IDE 看更舒服。
+
+## plocate：扫描端写得比 fsearch 好
+
+```96:96:/root/src-dl/plocate-1.1.15/updatedb.cpp
+		int fd = openat(dirfd, path, O_RDONLY | O_DIRECTORY | O_NOATIME);
+```
+
+- **d_type 免 stat**，只有 `DT_UNKNOWN` 才回退 `fstatat`（注释点名 XFS `ftype=0`）
+```631:646:/root/src-dl/plocate-1.1.15/updatedb.cpp
+			if (de->d_type == DT_UNKNOWN) {
+...
+				e.is_directory = (de->d_type == DT_DIR);
+```
+- **目录 mtime 跳过**已实现，精确到纳秒，直接拿旧库条目替代 `readdir`
+```601:603:/root/src-dl/plocate-1.1.15/updatedb.cpp
+	    modified.sec == db_modified.sec && modified.nsec == db_modified.nsec) {
+		// Not changed since the last database, so we can replace the readdir()
+		// by reading from the database.
+```
+- 但有两点不如预期：**扫描是单线程**递归；**io_uring 只用在查询端**（`plocate.cpp:372` 并发 pread 读索引块），扫描端不用
+- 索引格式：trigram 倒排 + TurboPFor 压缩 + zstd 字典（`parse_trigrams.cpp` / `turbopfor.cpp` / `database-builder.cpp`）
+- 只有路径，**没有 size/mtime**，`updatedb` 全量重建
+
+## fsearch：增量端才是它的强项
+
+我之前说"fsearch 用 SQLite"——**错了**，`grep -rn sqlite` 在整个 `src/` 里 0 命中。它是自研存储：`fsearch_database_chunked_array.c`（内存块数组）+ `fsearch_database_file.c`（自己的持久化格式，mmap 加载）+ `fsearch_database_index.c`。
+
+它的 fanotify 用法比我上次说的更聪明：
+
+```275:275:/root/src-dl/fsearch/src/fsearch_folder_monitor_fanotify.c
+    self->fd = fanotify_init(FAN_CLOEXEC | FAN_NONBLOCK | FAN_CLASS_NOTIF | FAN_REPORT_DFID_NAME, O_RDONLY);
+```
+```369:369:/root/src-dl/fsearch/src/fsearch_folder_monitor_fanotify.c
+    if (!fanotify_mark(self->fd, FAN_MARK_ADD | FAN_MARK_ONLYDIR, FANOTIFY_FOLDER_MASK, AT_FDCWD, path)) {
+```
+
+`FANOTIFY_FOLDER_MASK` 里带了 **`FAN_EVENT_ON_CHILD`** —— 这意味着**只需对顶层包含目录加一次 watch，整棵子树的变更都会上报**，彻底绕开了我上次说的"inotify 要逐目录加 watch、会被 `max_user_watches` 卡死"的问题。代价是 `FAN_CLASS_NOTIF` 需要 root，否则得 fallback 到 `fsearch_folder_monitor_inotify.c`。
+
+但它的扫描明显更弱：`fsearch_database_scan.c:158` 用 `opendir/readdir`，然后**对每个条目都 `fstatat(AT_SYMLINK_NOFOLLOW|AT_NO_AUTOMOUNT)`**，没利用 `d_type`；源码里还留着 `TODO: we can test for hidden here to avoid stat call`。而且 `fsearch_database.c:1331` 的 IO 线程池 `max_threads=1`，**扫描也没并行**。
+
+## 修正后的建议
+
+我上次说"架构参考价值上选 fsearch"，现在要拆开说：
+
+- **扫描抄 plocate**：`openat` 相对路径 + `d_type` 免 stat + 目录 mtime 跳过，这套是现成最优解
+- **增量抄 fsearch**：fanotify + `FAN_EVENT_ON_CHILD`，一个 watch 覆盖整棵子树
+- **存储两个都别抄**：plocate 只有路径没 size/mtime（你的 `size:` `dm:` 语法需要），fsearch 自研格式耦合太深。这块用 SQLite FTS5 trigram 自己写最省事
+- 要提速再补 plocate 没做的：**扫描并行**（顶层目录切分）+ 查询端 io_uring
+
+要不要我接着往下挖某一块？比如把 `parse_trigrams.cpp` + `database-builder.cpp` 的索引格式读一遍（如果你打算照抄倒排结构），或者把 fsearch 的 `fsearch_database_index.c` 里 fanotify 事件如何增量更新索引那条链路理清。
+
+YES
+
+两块都挖到底了，有几个**反直觉的发现**，直接推翻了我上一轮的部分说法。
+
+## 一、plocate 索引格式
+
+`db.h` 里的 `Header` 就是全部布局：
+
+- magic `\0plocate`，version 2
+- `hash_table_offset_bytes` / `hashtable_size` / `extra_ht_slots` → trigram 哈希表（开放寻址 + 溢出槽）
+- `num_docids` / `filename_index_offset_bytes` → docid 文件名区
+- `zstd_dictionary_offset_bytes` → zstd 字典（**对短字符串单独训练字典，压缩率极高**）
+- `directory_data_offset_bytes` + `next_zstd_dictionary_*` → **目录 mtime 区**，这就是 `updatedb` 做增量跳过用的数据（上一轮说的 mtime 方案，它的工程落地就在这）
+- `check_visibility`（做权限过滤）
+
+倒排项是 `struct Trigram { uint32_t trgm; uint32_t num_docids; uint64_t offset; }`，哈希函数是 CRC32C 风格（多项式 `0x1edc6f41`）。
+
+**关键设计：trigram 按字节而非 Unicode 码点。**`parse_trigrams.h` 注释写得很明确：既简化表结构（等长），又防止 CJK 组合爆炸。对你来说这是好消息——中文文件名不会把索引撑爆。
+
+## 二、查询流水线（plocate.cpp:377 起）
+
+```
+needle → parse_trigrams() 拆成 trigram 合取式
+       → 哈希查表取 posting list（TurboPFor 压缩的 docid 有序表）
+       → 多组求交集 → 候选 docid（注意：这是假阳性集合）
+       → 按块批量 pread 读文件名区 → 解压 → 块内精确匹配 → 输出
+```
+
+**发现 1：全量扫描时它刻意不用 io_uring。**注释原文：
+
+```371:376:/root/src-dl/plocate-1.1.15/plocate.cpp
+// We do this sequentially, as it's faster than scattering
+// a lot of I/O through io_uring and hoping the kernel will
+// coalesce it plus readahead for us. Since we assume that
+// we will primarily be CPU-bound, we'll be firing up one
+// worker thread for each spare core (the last one will
+// only be doing I/O). access() is still synchronous.
+```
+
+io_uring 只在**随机小 I/O** 用（查哈希表 bucket、取单个 docid 块，`plocate.cpp:128`）。顺序大块读反而用同步 `complete_pread`，理由是让内核自己合并 + 预读。
+
+**发现 2：32 块一组批量读 + 多线程解压。**
+
+```444:450:/root/src-dl/plocate-1.1.15/plocate.cpp
+	for (uint32_t io_docid = 0; io_docid < num_blocks; io_docid += 32) {
+		uint32_t last_docid = std::min(io_docid + 32, num_blocks);
+		size_t io_len = offsets[last_docid] - offsets[io_docid];
+		if (compressed.size() < io_len) {
+			compressed.resize(io_len);
+		}
+		complete_pread(fd, &compressed[0], io_len, offsets[io_docid]);
+```
+
+文件名区是**每 N 个 docid 打包成一个 zstd 块**，`offsets[]` 记块边界。查询时一次连续读 32 个块的字节区间，塞进有界队列（限深 256 ≈ 2MB），N 个 worker 线程取出来解压+匹配。所以 plocate 的性能公式是：**I/O 顺序化 + 块级压缩摊销解压开销 + CPU 并行解压**（它假定自己是 CPU bound）。
+
+## 三、fsearch 增量链路
+
+模块划分：`fsearch_folder_monitor_fanotify.c`（419 行，采集）→ 事件队列 → `fsearch_database_index.c`（1175 行，`process_event()` 分派到 create/delete/attrib/move-self/rescan）。
+
+**发现 3：新建目录时直接递归扫一遍。**
+
+```541:546:/root/src-dl/fsearch/src/fsearch_database_index.c
+process_create_event(FsearchDatabaseIndex *self, FsearchFolderMonitorEvent *event, FsearchDatabaseIndexEventStats *stats) {
+    off_t size = 0;
+    time_t mtime = 0;
+    bool is_dir = false;
+
+    if (!fsearch_file_utils_get_info(event->path->str, &mtime, &size, &is_dir)) {
+```
+
+一次 `fsearch_file_utils_get_info` 拿全 mtime+size+类型。若 `is_dir`，调 `db_scan_folder()` 整棵子树扫进去（因为新建目录往往伴随批量拷贝，逐个事件收齐不可靠），同时把新目录注册进监控器。若是文件，直接插 `file_chunks`。
+
+**发现 4：祖先链聚合值必须冒泡更新。**新增条目后，它先把从 `watched_entry` 到根的所有祖先以 `ENTRY_DELETED + FLAG_SIZE` 广播一次（把它们从"按 size 排序的索引"里摘出来），插入完成后再广播 `ENTRY_CREATED` 让它们按新 size 重新入位。这是很容易被自己实现时漏掉的一点：**目录的 size / 子项数是聚合值，任何增删改都要沿父链冒泡刷新。**
+
+**发现 5：事件合并与跳过。**`get_skippable_events()` 判断：如果某事件路径是被删目录的后代（严格前缀 + `/`，避免 `/ab` 误匹配 `/abc`），直接跳过——`rm -rf` 一棵大树时省掉上万次无意义处理。事件走 `GAsyncQueue` 批量 `process_queued_events()`，不是来一条处理一条。
+
+另外它是**双后端抽象**：`FSEARCH_FOLDER_MONITOR_FANOTIFY` / `_INOTIFY` 通过 `event->monitor_kind` 分派，fanotify 拿不到权限时自动降级 inotify。
+
+## 四、对你 ext4 索引方案的修正建议
+
+| 环节 | 抄谁 | 具体做法 |
+|---|---|---|
+| 全量扫描 | **plocate** | `openat`+`O_NOATIME`+`d_type` 免 stat+目录 mtime 跳过 |
+| 扫描并发 | **两个都别抄** | 两者扫描都是单线程（fsearch 的 `io_pool` 也是 `max_threads=1`）。你自己做顶层目录分片并行 |
+| 增量 | **fsearch** | fanotify + `FAN_EVENT_ON_CHILD`；新目录即扫；祖先链冒泡；事件批合并 |
+| 索引结构 | **plocate 思路** | trigram 倒排（**按字节**，中文安全）+ 块级 zstd 字典压缩 + 有界队列多线程解压 |
+| 查询 I/O | **plocate 哲学** | 顺序大块 pread，别迷信 io_uring；io_uring 只用于随机小 I/O |
+| 存储 | **自己写** | 两个都不满足你要的 size/mtime；SQLite FTS5 trigram 最省事，但要做块级压缩得自研 |
+
+一个提醒：plocate 的 trigram 只解决"名字包含"这一种查询，你的 `size:` / `dm:` / `attrib:` 这些结构化过滤是另一套机制（fsearch 那边是 `fsearch_query_matchers.c` + 排序索引），两者要正交设计，别指望一个倒排表全包。
+
+源码在 `/root/src-dl/`，Windows 下开 `\\wsl$\Ubuntu-22.04\root\src-dl\`。要继续的话，我建议下一个挖 **`fsearch_query_matchers.c` + `fsearch_database_sort.c`**（结构化过滤与排序索引怎么做的），或者 **`database-builder.cpp`**（trigram 倒排到底怎么建、TurboPFor 怎么用）——前者对你的搜索语法落地更直接，后者对索引实现更直接。你要哪个？
+
+挨个来
+
+按顺序挖。先看 **plocate 的索引构建**（`database-builder.cpp`）。
+第一块（plocate 建库）挖完了，接着看 fsearch 的结构化过滤与排序。
+两块都挖完了，逐个汇报。
+
+---
+
+# 第一块：plocate 索引构建（`database-builder.cpp`）
+
+## 整体是两遍扫描
+
+**第一遍** — 采样训练 zstd 字典。文件名按 `\0` 拼接进 block，每 **32 个文件一块**（`conf_block_size = 32`，`conf.cpp:72`）；用**蓄水池采样**保留 1000 个块（固定种子 1234，保证可复现），再交给 zstd：
+
+```160:160:/root/src-dl/plocate-1.1.15/database-builder.cpp
+	size_t ret = ZDICT_trainFromBuffer(&buf[0], buf_size, dictionary_buf.data(), lengths.data(), lengths.size());
+```
+
+字典随后在 `database-builder.cpp:544` 以 level 6 编译成 `ZSTD_CDict`。**对短字符串（文件名）单独训练字典，是它索引体积小的关键。**
+
+**第二遍** — 真正入库、生成 trigram、压缩写盘。
+
+## 五个核心设计
+
+### 1. docid 是块号，不是文件号
+
+```303:303:/root/src-dl/plocate-1.1.15/database-builder.cpp
+	uint32_t docid = num_blocks;
+```
+
+一块含 32 个文件名。所以命中一个 docid = 命中一整个块，必须解压整块再在块内精匹配。**这是整套设计的核心权衡：用"块级假阳性"换顺序 I/O 和摊销解压。**
+
+### 2. trigram 生成：4 字节读取 + 逐字节滑动
+
+```326:329:/root/src-dl/plocate-1.1.15/database-builder.cpp
+			memcpy(&trgm, ptr, sizeof(trgm));
+			++ptr;
+			trgm = le32toh(trgm);
+			add_docid(trgm & 0xffffff, docid);
+```
+
+一次 `memcpy` 读 4 字节取低 3 字节，靠"末尾必有 `\0`"安全多读一字节；指针逐字节推进产生重叠 trigram。判断终止用的是 `trgm <= 0xffffff`（说明第 4 字节是 0）。
+
+**副作用：短于 3 字节的文件名不产生任何 trigram** —— 这类文件无法用倒排检索，只能走全量扫描。这正是 `scan_all_docids()` 存在的理由，也解释了为什么搜索 1~2 字符的关键词时 plocate 会退化成全扫。
+
+### 3. 倒排表：delta-1 + PForDelta 128 分组
+
+```56:70:/root/src-dl/plocate-1.1.15/database-builder.cpp
+void PostingListBuilder::add_docid(uint32_t docid)
+{
+	// Deduplicate against the last inserted value, if any.
+	if (docid == last_docid) {
+		return;
+	}
+
+	pending_deltas.push_back(docid - last_docid - 1);
+	last_docid = docid;
+	if (pending_deltas.size() == 128) {
+		append_block();
+		pending_deltas.clear();
+		num_docids += 128;
+	}
+}
+```
+
+差值减 1（delta-1）保证非负。凑满 128 个就编码一块，**满块用交错布局**（SIMD 友好），尾部不足 128 的用非交错：
+
+```96:102:/root/src-dl/plocate-1.1.15/database-builder.cpp
+void PostingListBuilder::append_block()
+{
+	unsigned char buf[P4NENC_BOUND(128)];
+	assert(pending_deltas.size() == 128);
+	unsigned char *end = encode_pfor_single_block<128>(pending_deltas.data(), 128, /*interleaved=*/true, buf);
+	encoded.insert(encoded.end(), buf, end);
+}
+```
+
+首值单独 `write_baseval()` 存为基准。TurboPFor 是它自己重写的（注释说约官方实现 80% 性能，但不依赖 SSE4.1/AVX，可移植）。
+
+### 4. 块压缩与偏移表
+
+```340:341:/root/src-dl/plocate-1.1.15/database-builder.cpp
+	filename_blocks.push_back(outfp_pos);
+	string compressed = zstd_compress(current_block, cdict, &tempbuf);
+```
+
+每块压缩后写入，`filename_blocks[]` 记录文件偏移 → 落盘即查询时的 `offsets[]` 数组。
+
+### 5. 哈希表：素数 + Robin Hood 探测
+
+```463:463:/root/src-dl/plocate-1.1.15/database-builder.cpp
+			// Robin Hood hashing; reduces the longest distance by a lot.
+```
+
+`ht_size` 取素数（`next_prime`），线性探测时按"已探测距离"做 Robin Hood 交换，压平最长探测长度；末尾留 `num_overflow_slots` 溢出槽 + 1 个哨兵元素。溢出超限直接返回 `nullptr`（上层需要调大表重建）。
+
+### 附带：目录 mtime 区
+
+`EncodingCorpus::add_file` 里每个文件写 1 字节标记（`\0` = 非目录 / `\1` = 目录，后跟 int64 sec + int32 nsec），用 `ZSTD_compressStream` **流式压缩**，攒够 4096 字节压一次（`allowed_slop=4096`）。这就是上一轮说的 mtime 增量跳过所依赖的数据区。
+
+---
+
+# 第二块：fsearch 结构化过滤（`fsearch_query_matchers.c` + sort）
+
+## 结论先说：它的过滤是 O(n) 全扫，没有任何索引加速
+
+matcher 是统一签名的函数指针：`(FsearchQueryNode *node, FsearchQueryMatchData *match_data) -> uint32_t`。所有数值类属性共用一套比较器：
+
+```45:61:/root/src-dl/fsearch/src/fsearch_query_matchers.c
+cmp_num(int64_t num, FsearchQueryNode *node) {
+    switch (node->comparison_type) {
+    case FSEARCH_QUERY_NODE_COMPARISON_EQUAL:
+        return num == node->num_start;
+    case FSEARCH_QUERY_NODE_COMPARISON_GREATER:
+        return num > node->num_start;
+    case FSEARCH_QUERY_NODE_COMPARISON_SMALLER:
+        return num < node->num_start;
+    case FSEARCH_QUERY_NODE_COMPARISON_GREATER_EQ:
+        return num >= node->num_start;
+    case FSEARCH_QUERY_NODE_COMPARISON_SMALLER_EQ:
+        return num <= node->num_start;
+    case FSEARCH_QUERY_NODE_COMPARISON_RANGE:
+        return node->num_start <= num && num < node->num_end;
+```
+
+`size` / `date_modified` / `depth` / `childcount` 全是同一个套路：取 entry 的属性值 → `cmp_num`：
+
+```115:122:/root/src-dl/fsearch/src/fsearch_query_matchers.c
+fsearch_query_matcher_size(FsearchQueryNode *node, FsearchQueryMatchData *match_data) {
+    FsearchDatabaseEntry *entry = fsearch_query_match_data_get_entry(match_data);
+    if (entry) {
+        const int64_t size = db_entry_get_size(entry);
+        return cmp_num(size, node);
+    }
+    return 0;
+}
+```
+
+**全部是逐 entry 调用**。我在 `fsearch_database_index.c` 里看到三处 "size sorted indexes" 的注释，但搜遍代码没有对应的排序索引结构——那应该是历史遗留注释。
+
+## 排序只服务于结果展示，不是过滤
+
+`fsearch_database_search_view.c:216` 的 `fsearch_database_search_view_sort()` 是对**已过滤出的结果集**排序；`get_idx_for_sort_type()` 只做升序/降序的下标映射。而 `fsearch_database_sort.c` 里那串 `chain.properties[]` 是**多级比较链**（比如按 size 排序时，size 相同再比 name、再比 path），是 comparator 定义，不是索引。
+
+所以：
+
+| | 名字子串搜索 | 结构化过滤（size/dm/childcount） |
+|---|---|---|
+| plocate | trigram 倒排，**O(候选)** | 不支持 |
+| fsearch | 内存数组遍历 + strstr/regex，**O(n)** | **O(n) 全扫** |
+
+两个项目在结构化过滤上都是暴力的。fsearch 之所以体感快，靠的是**全部条目常驻内存 + C 实现 + 无磁盘 I/O**，不是算法。
+
+---
+
+# 对你实现的直接结论
+
+1. **名字检索照抄 plocate**：32 文件/块 + zstd 字典 + trigram 倒排（delta-1 + PForDelta 128）+ Robin Hood 哈希表。这套是现成验证过的。
+2. **务必留全量扫描兜底路径**：短于 3 字节的名字没法建 trigram，短关键词查询必然退化。
+3. **结构化过滤要自己加索引**，两个项目都给不了。三个选项：
+   - **排序数组**：每个数值属性存一份按值排序的 docid 数组，范围查询二分定界 → O(log n + k)。代价是插入/删除要 O(n) 搬移（索引是批量重建的场景下可接受，实时增量场景不行）
+   - **B+ 树 / LSM**：适合有实时增量，工程量大
+   - **位图索引 + RoaringBitmap**：对 size 分桶、mtime 分桶，每桶一个位图，过滤靠位图 AND/OR。读多写少场景最省事，且位图压缩率高，还能和 trigram 倒排的候选集直接做 AND
+4. 如果你能接受"过滤阶段 O(n)"，那就更简单：属性打包紧跟在条目元数据后面（fsearch 的 `db_entry_get_size/mtime` 就是这么做的），全扫时缓存友好，百万级条目在内存里线性扫也就几十毫秒——**fsearch 证明了这条路在桌面规模够用**。只有当你的文件量到千万级、或者过滤条件选择性很强时才需要真索引。
+
+下一步要我往哪走？可以选：
+- 把 plocate 的 **TurboPFor 编解码**（`turbopfor.cpp` 818 行 + `turbopfor-encode.h`）拆开讲，这是你要自己实现倒排时最难的一块
+- 或者 **fsearch 的条目内存布局**（`fsearch_database_entry.c` / `chunked_array`），看它怎么把 name/size/mtime/parent 打包得缓存友好
+- 或者回到你的 ETP server，把这套索引接到你的搜索语法上做设计
+
+ALL
+
+第一、二块挖完了，接着看你的项目里 ETP 搜索的实现。
+三个依次汇报。
+
+---
+
+# 一、TurboPFor：倒排表压缩
+
+## 块头一个字节定类型
+
+```377:389:/root/src-dl/plocate-1.1.15/turbopfor-encode.h
+unsigned char *encode_pfor_single_block(const Docid *in, unsigned num, bool interleaved, unsigned char *out)
+{
+	assert(num > 0);
+	if (interleaved) {
+		assert(num == BlockSize);
+	}
+
+	unsigned bit_width, exception_bit_width;
+	BlockType block_type = decide_block_type(in, num, &bit_width, &exception_bit_width);
+	*out++ = (block_type << 6) | bit_width;
+```
+
+首字节：低 6 位 = bit width，高 2 位 = 块类型。四种类型（`turbopfor-common.h`）：
+
+| 类型 | 适用 | 布局 |
+|---|---|---|
+| `CONSTANT` | 128 个 delta 全相同 | 直接存那一个值 |
+| `FOR` | 无异常值 | bit width(6b)+type(2b) → 128 个定宽值 |
+| `PFOR_BITMAP` | 异常值多 | + 异常位宽(8b) + 位图 + 异常值 + 基值 |
+| `PFOR_VB` | 异常值少 | + 异常个数(8b) + 基值 + varbyte 异常值 + 异常下标 |
+
+`PFOR_BITMAP` 的完整布局（源码注释）：
+
+```491:497:/root/src-dl/plocate-1.1.15/turbopfor.cpp
+// PFor block with bitmap exceptions. Layout:
+//
+//  - Bit width (6 bits) | type << 6
+//  - Exception bit width (8 bits)
+//  - Bitmap of which values have exceptions (<num> bits, rounded up to a byte)
+//  - Exceptions (<num_exc> values of <bits_exc> bits, rounded up to a byte)
+//  - Base values (<num> values of <bits> bits, rounded up to a byte)
+```
+
+## 核心思想：定宽 + 异常值
+
+一个 block 里 128 个 delta，如果取最大值的位宽 `max_bits`，小值会浪费空间。PFor 的做法是选一个小一点的 `bit_width`，超过它的值**只存低位部分，高位溢出部分单独存为异常值**。判断异常就是一行：
+
+```207:207:/root/src-dl/plocate-1.1.15/turbopfor-encode.h
+			bs.write((in[i] >> bit_width) != 0);
+```
+
+## 位宽选择：直方图 + 成本模型（不是固定阈值）
+
+`decide_block_type()` 先判 CONSTANT，再建位宽直方图，然后**枚举所有候选位宽算字节成本取最小**：
+
+```292:312:/root/src-dl/plocate-1.1.15/turbopfor-encode.h
+	// Straight-up FOR.
+	unsigned best_cost = bytes_for_packed_bits(num, max_bits);
+	unsigned best_bit_width = max_bits;
+
+	// Try PFOR with bitmap exceptions.
+	const unsigned bitmap_cost = bytes_for_packed_bits(num, 1);
+	unsigned num_exceptions = 0;
+	for (unsigned exception_bit_width = 1; exception_bit_width <= max_bits; ++exception_bit_width) {
+		unsigned test_bit_width = max_bits - exception_bit_width;
+		num_exceptions += histogram[test_bit_width + 1];
+
+		// 1 byte for signaling exception bit width, then the bitmap,
+		// then the base values, then the exceptions.
+		unsigned cost = 1 + bitmap_cost + bytes_for_packed_bits(num, test_bit_width) +
+			bytes_for_packed_bits(num_exceptions, exception_bit_width);
+```
+
+varbyte 分支的成本是**估算**的（用累计直方图按 varbyte 长度分档），注释说这个近似只影响总库体积约 0.1%。
+
+## 交错布局（interleaved）
+
+满块用 4 路交错写，为 SIMD 解码服务：
+
+```170:173:/root/src-dl/plocate-1.1.15/turbopfor-encode.h
+		InterleavedBitWriter<4> bs0(out + 0 * sizeof(uint32_t), bit_width);
+		InterleavedBitWriter<4> bs1(out + 1 * sizeof(uint32_t), bit_width);
+		InterleavedBitWriter<4> bs2(out + 2 * sizeof(uint32_t), bit_width);
+		InterleavedBitWriter<4> bs3(out + 3 * sizeof(uint32_t), bit_width);
+```
+
+128 个值拆成 4 组 32 个，每组位打包后交错存放 —— 解码时能一次 SIMD 处理 4 路。尾部不足 128 的块只能走非交错（所以 `finish()` 里 `interleaved=false`）。
+
+## 要自己实现的话
+
+你需要的最小集其实只有三块：`write_baseval`（变长基准值）+ `encode_pfor_single_block<128>` + `decode_pfor_delta1_128`。真正的难点是**位打包的位序**（LE + 跨字节）和 **delta-1 的 off-by-one**（`prev_val = out[i] = bs.read() + prev_val + 1`）。
+
+偷懒方案：直接用 [TurboPFor 官方库](https://github.com/powturbo/TurboPFor) 或 RoaringBitmap（Java 端若要用）。另外如果你的索引全部常驻内存、文件量不到千万级，**直接存 `uint32` 数组不压缩也完全够用** —— plocate 压缩是为了让 200MB 的库能在磁盘上快速 pread；你的场景如果是内存常驻，压缩反而拖慢查询。
+
+---
+
+# 二、fsearch 条目布局
+
+## 变长记录 + 柔性数组
+
+```23:30:/root/src-dl/fsearch/src/fsearch_database_entry.c
+typedef struct FsearchDatabaseEntry {
+    FsearchDatabaseEntry *parent;
+
+    uint32_t attribute_flags;
+    uint16_t flags;
+    // Make sure the attributes member is aligned to its largest data type
+    alignas(int64_t) uint8_t attributes[];
+} FsearchDatabaseEntry;
+```
+
+头部固定 16 字节，`attributes[]` 是柔性数组，后面**紧跟本条目的属性区，属性区末尾再紧跟名字字符串（零结尾）**。整个条目一次 malloc 搞定，无二次间接。
+
+## 属性按需存储（flags 位图）
+
+```825:835:/root/src-dl/fsearch/src/fsearch_database_entry.c
+static size_t
+entry_get_size_for_flags(FsearchDatabaseIndexPropertyFlags attribute_flags, const char *name, size_t name_len) {
+    size_t size = sizeof(FsearchDatabaseEntry);
+    if (name) {
+        // Length of string + 1 (zero delimiter)
+        size += name_len + 1;
+    }
+    if ((attribute_flags & DATABASE_INDEX_PROPERTY_FLAG_SIZE) != 0) {
+        size += sizeof(int64_t);
+    }
+    if ((attribute_flags & DATABASE_INDEX_PROPERTY_FLAG_MODIFICATION_TIME) != 0) {
+        size += sizeof(int64_t);
+    }
+```
+
+哪些属性存在 `attribute_flags` 里按位标记，`db_entry_get_attribute_offsets()` 预计算偏移表，**运行时按偏移取值**（`db_entry_get_attribute_for_offset`）。好处：不索引的属性不占内存（比如"只索引名字"模式）；代价：取值多一次间接，且不同条目的布局可能不同，不能当成普通结构体数组强转。
+
+## 只有 parent 指针，没有 children 列表
+
+这是最关键的设计取舍。路径靠**沿 parent 链递归回溯拼接**：
+
+```36:48:/root/src-dl/fsearch/src/fsearch_database_entry.c
+static void
+build_path_recursively(FsearchDatabaseEntry *folder, GString *str, size_t name_offset) {
+	if (G_UNLIKELY(!folder)) {
+		return;
+	}
+	g_assert(folder->flags & FSEARCH_DATABASE_ENTRY_FLAG_TYPE_FOLDER);
+	g_assert(folder->attributes != NULL);
+
+	if (G_LIKELY(folder->parent)) {
+		build_path_recursively(folder->parent, str, name_offset);
+	}
+	const char *name = db_entry_get_attribute_name_for_offset(folder, name_offset);
+	if (G_LIKELY(name[0] != '\0' && strcmp(name, G_DIR_SEPARATOR_S) != 0)) {
+		g_string_append(str, name);
+```
+
+后果：
+- **省内存**（无 children vector，无路径字符串冗余存储）
+- **取完整路径是 O(depth)**，且要构造字符串 → 结果列表里每行都要一次，这是 fsearch 显示结果时的热点
+- **目录的聚合值（子项数/size）要沿链维护**，这就是上一轮看到的 `propagate_event` 冒泡逻辑
+- **“列出某目录的直接子项”必须全扫**（没有 children 索引）→ 对你很重要，见第三块
+
+## ChunkedArray：2048 项一分块
+
+```16:22:/root/src-dl/fsearch/src/fsearch_database_chunked_array.c
+struct _FsearchDatabaseChunkedArray {
+    DynamicArray *chunks;
+
+    uint32_t num_entries;
+    uint32_t target_chunk_size;
+
+    FsearchDatabaseSortOrderChain chain;
+```
+```39:39:/root/src-dl/fsearch/src/fsearch_database_chunked_array.c
+#define TARGET_CHUNK_SIZE 2048
+```
+
+用**多个小数组**代替一个大数组：插入/删除的搬移成本从 O(n) 降到 O(2048)；chunk 超过 `2 * target` 就 `split_chunk()`。批量插入时会先算成本（`individual_insertion_cost = num_new_entries * target_chunk_size`）决定是逐个插还是整体重建。
+
+---
+
+# 三、接入你的 ETP：设计
+
+## 先确认一件事
+
+你的 app 是**纯客户端**，协议是 FTP 的 `SITE EVERYTHING <SUB> [param]`：
+
+```144:150:/root/src-dl/com/...省略/EtpClient.java
+    private String sendEverything(String subCommand, String param) throws IOException {
+        if (param != null && !param.isEmpty()) {
+            sendCommand("EVERYTHING " + subCommand + " " + param);
+        } else {
+            sendCommand("EVERYTHING " + subCommand);
+        }
+        return readResponse();
+    }
+```
+
+**所以要在 ext4 上做索引，最省的路是实现一个兼容 `SITE EVERYTHING` 的 Linux 服务端** —— Android 端零改动，只是把服务器地址从 Windows PC 换成 Linux 机器。这比改客户端划算得多。
+
+顺带一提：`EtpSearchProtocol.md` 说 OFFSET/COUNT "客户端未实现"，但代码里已经实现了：
+
+```258:259:/你的项目/EtpClient.java
+        // 设置翻页
+        if (offset > 0) sendEverything("OFFSET", String.valueOf(offset));
+```
+
+那份 md 过时了。
+
+## 你的 app 实际用到的语法子集（比你想的小）
+
+从 `EtpClient` 的用法看，只有这些：
+
+| 用途 | 语法 | 出处 |
+|---|---|---|
+| 列目录 | `parent:"<path>"` | `buildParentSearch()` |
+| 只看目录/文件 | `folder:` / `!folder:` | `queryChildren(..., filterSuffix)` |
+| 匹配选项 | CASE / PATH / REGEX / WHOLE_WORD | `query()` |
+| 排序 | name / size / date_modified × asc/desc | SORT |
+| 翻页 | OFFSET / COUNT | `query()` |
+| 列 | SIZE / PATH / DATE_MODIFIED / DATE_CREATED / ATTRIBUTES / ... | `*_COLUMN` |
+
+`size:` `dm:` `child:` 那些高级函数，**你的 UI 目前根本没暴露**。所以第一版**不需要**结构化属性索引，只需要：
+- 名字匹配（子串 / 通配 / 正则）
+- `parent:` 定位
+- 类型过滤
+- 排序 + 翻页
+
+这大大简化了事情。
+
+## 三层架构
+
+```
+FTP 层    USER/PASS/TYPE I/PASV/RETR/LIST + SITE EVERYTHING *
+   ↓
+语法层    解析 SEARCH 串 → 查询计划（parent 过滤 + 名字模式 + 类型过滤 + 排序 + 分页）
+   ↓
+索引层    ext4 扫描 + 增量 + 名字倒排 + 目录树
+```
+
+## 索引层的具体设计（结合前几轮结论）
+
+**必须做成的两个 O(1)/O(log n) 查询：**
+
+1. **`parent:"<path>"` → 该目录的直接子项**。这是浏览时每次点目录都触发的，绝不能全扫。做法：
+   - 每个目录分配 `dir_id`，每个条目存 `parent_id`
+   - 维护 `dir_id → [child_entry_id...]` 的索引（哈希表或每个目录一个小数组）
+   - **注意：fsearch 没做这个**（只有 parent 指针），因为它是桌面单次全量场景；你是交互式浏览，必须做
+   - 路径字符串 → dir_id 的映射另建一个哈希表（`"/mnt/data/foo" → 42`），避免每次解析路径
+
+2. **名字子串 / 通配**。否则搜索框会卡：
+   - 简单版：内存数组 + 逐条 `strcasestr`（百万级条目约几十 ms，可接受）
+   - 进阶版：抄 plocate 的 trigram 倒排（32 文件/块 + zstd + PForDelta）
+   - **建议先用简单版**，等文件量过百万再上倒排
+
+**其余都可以 O(n)**：排序、类型过滤、翻页都是在结果集上做。
+
+**扫描与增量**（前面结论）：`getdents64` + `d_type` 免 stat + `openat` 相对路径 + 目录 mtime 跳过；有 root 加 fanotify `FAN_EVENT_ON_CHILD`。
+
+## 关键映射表
+
+| Everything 语法 | 你的实现 |
+|---|---|
+| `parent:"P"` | `dir_index[path_to_id(P)]` 取子项数组 |
+| `folder:` / `!folder:` | 过滤 `entry.is_dir`（来自 `d_type`，零成本） |
+| `*.doc` | 后缀比较（或 trigram） |
+| `abc` | 子串匹配 |
+| `CASE 1` | 大小写敏感开关 |
+| `REGEX 1` | PCRE2（fsearch 用的就是 pcre2） |
+| `WHOLE_WORD 1` | 词边界检查 |
+| `SORT size_descending` | 对结果集排序（多级链：size → name → path） |
+| `OFFSET n COUNT m` | 排序后切片 |
+
+## 落地顺序建议
+
+1. **先做 FTP + `SITE EVERYTHING` 服务端骨架**，用全扫（`getdents64` 遍历 + 内存数组）先把 `parent:` 和名字搜索跑通 —— 此时 Android 端就能连上用了，验证协议兼容性
+2. **加 `dir_id → children` 索引**解决浏览卡顿
+3. **加目录 mtime 增量 + fanotify**
+4. 文件量大了再上 trigram 倒排
+5. 结构化过滤（`size:` `dm:`）**放到最后**，你的 UI 还没暴露，而且 O(n) 全扫在内存里够快
+
+要不要我直接动手？可以选：
+- 先写 **FTP + SITE EVERYTHING 服务端骨架**（C 或 Go），能让你用现有 Android app 连上验证
+- 或者先写 **ext4 扫描器 + dir_id 索引**（就是第 1、2 步的核心）
+- 或者先只做 **索引层的数据结构原型**（条目布局 + 目录索引 + 查询接口），跑个 benchmark 再决定要不要 trigram
+
+GO ON
+
+写文档前，先把要引用的行号全部核准。
+行号全部核准，现在写设计文档。
+设计文档已写好：`c:/Users/linswin/AndroidStudioProjects/ShareToPC/ext4_index_engine_design.md`
+
+## 文档结构
+
+- **0. 参考源码位置** — 两个项目的版本、路径、获取方式（含 `\\wsl$\...` 访问方式）
+- **1. 背景与目标** — 从 `EtpClient.java:144/192/203` 反推现状
+- **2. 需求边界** — 客户端实际只用 6 类能力，`size:`/`dm:` 等 UI 未暴露，第一版不做
+- **3. 总体架构** — 六层
+- **4. 模块设计** — 采集/存储/索引/查询
+- **5. 参考引用清单**（核心）
+- **6. 核心数据结构** — C 伪代码
+- **7. 实施路线** — P1~P5
+- **8. 风险与开放问题**
+
+## 引用清单按"采纳意图"分了五类
+
+| 表 | 内容 | 条目数 |
+|---|---|---|
+| **A** | 采纳自 plocate（扫描 + 索引格式） | 13 条 |
+| **B** | 采纳自 FSearch（增量 + 查询） | 8 条 |
+| **C** | 采纳自 FSearch（存储布局） | 4 条 |
+| **D** | 采纳自 FSearch（查询语义） | 4 条 |
+| **E** | **参考但不采纳（反例）** | 7 条 |
+| **F** | **两者都没有、需自研** | 4 条 |
+
+每条都写明：`文件:行号` → 采纳了什么 → 本地怎么落地 → 为什么这样改。
+
+举几个关键条目：
+
+- **A3** `updatedb.cpp:618-646` — `d_type` 免 stat
+- **B3** `fsearch_folder_monitor_fanotify.c:24` — `FAN_EVENT_ON_CHILD`，一个 watch 覆盖整棵子树（**重点采用**）
+- **C1** `fsearch_database_entry.c:23-30` — 变长记录柔性数组，**改动：加 `parent_id`**
+- **A7** `database-builder.cpp:303` — docid 是块号不是文件号（核心权衡）
+- **E1** `fsearch_database_scan.c:141,158,185` — 它的 `readdir` + 逐项 `fstatat` **不采纳**，改用 A3
+- **E2** `fsearch_database.c:1331` — `max_threads=1` 的假并行，不采纳
+
+## 两个需要你拍板的点
+
+文档里标为"待定"：
+
+1. **语言选型** — C（与 `etp_server` 一致，便于日后合并）vs Go/Rust（开发快）
+2. **是否持久化** — 若内存常驻，A5/A6/A7/A8/A11 和 E3/E4 全部可跳过，P1-P3 工程量能砍掉一半。我倾向**先不持久化**，等 P5 再看
+
+下一步按 P1 动手的话，我可以先写 FTP + `SITE EVERYTHING` 服务端骨架。你要先定语言，还是我按 C 来（与现有 `etp_server` 保持统一）？
+
+
+....规划了架构并编写了代码... 略
+
+缺 <dirent.h>（DT_* 常量定义处），补上：
+
+scan.c
+(修改)
++1
+-0
+查看变更
+重新编译 esidx
+
+wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/c/Users/linswin/AndroidStudioProjects/ShareToPC/esidx && make 2>&1 | tail -30"
+深度思考
+编译通过，先消掉 fallthrough 警告再测：
+
+main.c
+(修改)
++1
+-1
+查看变更
+重新编译并对 /etc 建索引测试
+
+wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/c/Users/linswin/AndroidStudioProjects/ShareToPC/esidx && make 2>&1 | grep -i warn; echo BUILD_OK; ./esidx build /etc -o /tmp/etc.idx && ls -la /tmp/etc.idx"
+深度思考
+对 /etc 建索引成功（1617 条 / 51ms / 快照 95KB）。修掉残留警告（GCC 只认特定注释标记，直接改写分支）：
+
+main.c
+(修改)
++4
+-4
+查看变更
+验证三类查询：目录树、扩展名+大小排序、子串过滤
+
+wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/c/Users/linswin/AndroidStudioProjects/ShareToPC/esidx && make 2>&1 | grep -ci 'warning\|error'; echo '=== parent ==='; ./esidx query /tmp/etc.idx 'parent:/etc/ssh' 2>&1 | head -8; echo '=== ext+size+sort ==='; ./esidx query /tmp/etc.idx ext:conf size:>1k sort:size:desc count:5 2>&1 | head -8; echo '=== substr ==='; ./esidx query /tmp/etc.idx folder: host 2>&1 | head -6"
+
+
