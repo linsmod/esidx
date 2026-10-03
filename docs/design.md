@@ -855,3 +855,32 @@ answer anyway.
     `strcasestr` over the path, 1.0 ms, because a star on both ends of a value
     means "occurs anywhere" and nothing else.
 
+12. **The indexed root is a row like any other, and one rule covers it.** Two shapes
+    off voidtools' server on :21, both captured with `etp-probe 21`:
+
+    ```
+    ROW 0    FOLDER C:        path=
+    ROW 854  FOLDER ShareToPC  path=C:\Users\linswin\AndroidStudioProjects
+    ```
+
+    Neither mentions a root, and one rule produces both — the name is the last
+    component of the entry's own path, PATH is everything before the last separator
+    in it. `dirname("C:")` has no separator, hence the empty PATH; cut the other
+    path and the parent falls out. So the two accessors are `basename(name_of())`
+    and `dirname(path_of())`, with **no branch on whether the entry has a parent**:
+    §4.2 keeps no full-path column, so `path_of()` rebuilds the path from the parent
+    chain, and the root's stored name is the absolute path it was indexed from
+    (`scan.c:169`) precisely because that is the only place the absolute prefix
+    exists — `path_of(root)` and `di_lookup(db, root)` in `update`/`compact` both
+    read it.
+
+    That is also where the bug was. The root's *stored* name had leaked into what
+    the wire and `name:` matching call "the name": it printed its own path as its
+    name, left PATH empty, and `name:<the parent directory>` matched 1 row here
+    against 0 on `:21`. Both suites passed for a long time because **every other
+    row's parent is in the index**, so the two spellings only ever differ on that
+    one row, and no term in `test.sh` or `cmp_ref.sh` read it. Found by dumping both
+    servers' whole result sets and diffing the paths, which is now `cmp_ref.sh`'s
+    `explain_delta` — it named the row and flagged it `ON DISK`, which is the only
+    reason it was noticed rather than guessed at.
+

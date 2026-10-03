@@ -279,7 +279,7 @@ static void send_query_results(const esidx_t *db, client_t *c, const qset_t *set
         if (c->col_date_recently_changed)
             obuf_printf(&b, " DATE_RECENTLY_CHANGED %llu\r\n",
                        (unsigned long long)to_filetime(db->et.mtime[id]));
-        obuf_printf(&b, " %s %s\r\n", is_dir ? "FOLDER" : "FILE", name_of(db, id));
+        obuf_printf(&b, " %s %s\r\n", is_dir ? "FOLDER" : "FILE", display_name_of(db, id));
 
         off++;
         show--;
@@ -711,7 +711,7 @@ static void do_list(const esidx_t *db, client_t *c, const char *arg, bool longfm
         struct stat sb;
         if (stat(path, &sb) == 0) {
             c_reply(c, "150 Opening data connection for %s.\r\n", path);
-            emit_listing(c, path, name_of(db, id), &sb, longfmt, machine);
+            emit_listing(c, path, display_name_of(db, id), &sb, longfmt, machine);
             c_reply(c, "226 Transfer complete.\r\n");
         } else {
             c_reply(c, "550 %s: cannot stat.\r\n", path);
@@ -726,14 +726,14 @@ static void do_list(const esidx_t *db, client_t *c, const char *arg, bool longfm
         eid_t k = db->di.child[id].items[i];
         struct stat sb;
         char full[16384];
-        snprintf(full, sizeof(full), "%s/%s", path, name_of(db, k));
+        snprintf(full, sizeof(full), "%s/%s", path, display_name_of(db, k));
         if (stat(full, &sb) != 0) {
             /* the index knows it but stat failed; synthesise from the columns */
             memset(&sb, 0, sizeof(sb));
             sb.st_size = (off_t)db->et.size[k];
             sb.st_mtime = (time_t)db->et.mtime[k];
         }
-        emit_listing(c, path, name_of(db, k), &sb, longfmt, machine);
+        emit_listing(c, path, display_name_of(db, k), &sb, longfmt, machine);
     }
     c_reply(c, "226 Transfer complete.\r\n");
     data_close(c);

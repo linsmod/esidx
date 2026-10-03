@@ -468,7 +468,7 @@ static int text_match(const esidx_t *db, eid_t id, const ast_t *t,
         path_of(db, id, sc->buf, sc->cap);
         subj = sc->buf;
     } else {
-        subj = name_of(db, id);
+        subj = display_name_of(db, id);
     }
 
     /* stem: drops the extension before matching */
@@ -1521,7 +1521,7 @@ static const char *sort_string(sort_ctx_t *sc, eid_t id)
     case SORT_SIZE:
         return "";
     default:
-        return name_of(db, id);
+        return display_name_of(db, id);
     }
 }
 
@@ -1557,7 +1557,7 @@ static int cmp_rec(const void *pa, const void *pb, void *arg)
         r = strcasecmp(a->s ? a->s : "", b->s ? b->s : "");
     }
     if (r == 0)
-        r = strcasecmp(name_of(sc->db, a->id), name_of(sc->db, b->id));
+        r = strcasecmp(display_name_of(sc->db, a->id), display_name_of(sc->db, b->id));
     if (r == 0) r = (a->id < b->id) ? -1 : (a->id > b->id);
     return sc->desc ? -r : r;
 }

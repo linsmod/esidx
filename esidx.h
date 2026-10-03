@@ -315,8 +315,13 @@ int        di_hash_erase(esidx_t *db, eid_t dir);
 void       path_of(const esidx_t *db, eid_t id, char *out, size_t outsz);
 uint16_t   ext_intern(esidx_t *db, const char *name);
 const char *name_of(const esidx_t *db, eid_t id);
+/* the name as the reference reports it: basename(name_of()). Differs for a
+ * parentless entry, whose stored name is the path it was indexed from. store.c */
+const char *display_name_of(const esidx_t *db, eid_t id);
 const char *ext_of_str(const esidx_t *db, eid_t id);
-/* parent directory path of `id`; empty string for the root itself */
+/* full path of the directory containing `id` -- dirname(path_of()), so it is defined
+ * for the root too (the directory above it), and empty only when the path has no
+ * separator in it at all */
 void       parent_path_of(const esidx_t *db, eid_t id, char *out, size_t outsz);
 /* Win32 attribute bits, as the ETP ATTRIBUTES column reports them */
 uint32_t   esidx_win_attributes(const esidx_t *db, eid_t id);

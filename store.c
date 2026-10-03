@@ -389,6 +389,29 @@ const char *name_of(const esidx_t *db, eid_t id)
     return sp_get(&db->names, db->et.name[id].off);
 }
 
+/* The name as Everything reports it: the last component of the entry's own path.
+ *
+ * A parentless entry is the one place the stored name is not already a bare name --
+ * scan.c:169 stores the root as the absolute path it was indexed from, because
+ * path_of() and di_lookup() both need that string and there is nowhere else to keep
+ * it. So this is `basename(name_of())`, which is what makes the root row read like
+ * every other row instead of printing its own path as its name.
+ *
+ * Measured against voidtools' server on :21, which prints both shapes this way and
+ * mentions no root in either: `FOLDER ShareToPC` with `PATH
+ * C:\Users\linswin\AndroidStudioProjects` for a folder inside the tree, `FOLDER C:`
+ * with an empty PATH for the drive root (a stored name with no separator in it).
+ *
+ * Deliberately not basename(path_of()): that is O(depth) with a buffer per row, and
+ * the `name:` matcher calls this once per candidate (query.c). One strrchr over a
+ * name that is a single component for everything else is the same answer for free. */
+const char *display_name_of(const esidx_t *db, eid_t id)
+{
+    const char *s = name_of(db, id);
+    const char *slash = strrchr(s, '/');
+    return slash ? slash + 1 : s;
+}
+
 const char *ext_of_str(const esidx_t *db, eid_t id)
 {
     if (id >= db->et.count) return "";
@@ -402,12 +425,22 @@ uint32_t di_child_count(const esidx_t *db, eid_t dir)
     return 0;
 }
 
+/* The full path of the directory containing this entry -- what the wire's PATH column
+ * carries, and what the client joins the name onto (AGENTS.md 5.1).
+ *
+ * Defined as dirname(path_of()) rather than path_of(parent), so it is one rule for
+ * every entry and has no branch on "is this the root": a parentless entry's own path
+ * already ends in its last component, and cutting at the last separator leaves the
+ * directory above it. path_of(parent) would need a fallback for exactly that one row,
+ * and the fallback is this. */
 void parent_path_of(const esidx_t *db, eid_t id, char *out, size_t outsz)
 {
     if (id >= db->et.count || !outsz) { if (outsz) out[0] = '\0'; return; }
-    eid_t p = db->et.parent[id];
-    if (p == EID_NONE || p >= db->et.count) { out[0] = '\0'; return; }
-    path_of(db, p, out, outsz);
+    path_of(db, id, out, outsz);
+    char *slash = strrchr(out, '/');
+    if (!slash) { out[0] = '\0'; return; }   /* a single-component path has no parent */
+    if (slash == out) out[1] = '\0';         /* directly under /: the parent is / */
+    else *slash = '\0';
 }
 
 /* Win32 attribute bits, for the ATTRIBUTES column and for sorting by them.

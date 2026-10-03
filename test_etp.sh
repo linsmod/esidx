@@ -105,6 +105,14 @@ N_TREE=$(find "$TREE" | wc -l)
 TREE_NAME=$(basename "$TREE")
 # the spelling the PATH column must use: the client joins `path + "\" + name`
 TREE_BS=${TREE//\//\\}
+# The indexed root's own parent. It is a directory that exists but is *not* in the
+# index, so it is what the root row's PATH column has to be -- and its name is a word
+# that occurs in the root's path and in no entry's name, which is what makes the two
+# assertions in 3b able to fail.
+PARENT_DIR=${TREE%/*}
+PARENT_NAME=$(basename "$PARENT_DIR")
+PARENT_BS=${PARENT_DIR//\//\\}
+
 echo "   fixture: $N_TREE entries under $TREE"
 
 # ------------------------------------------------------------------- build
@@ -302,6 +310,43 @@ fi
 
 expect "  PATH is the parent directory, backslash-separated" \
     "$(pfield 0 path)" "$TREE_BS"
+
+say "3b. the indexed root is a row like any other: basename, and a parent path"
+
+# voidtools' server is the specification, and it prints two shapes (etp-probe 21):
+#
+#   ROW 0    FOLDER C:        path=
+#   ROW 854  FOLDER ShareToPC  path=C:\Users\linswin\AndroidStudioProjects
+#
+# One rule produces both: the name is the last component of the entry's own path and
+# PATH is everything before the last separator in it. Neither shape mentions a root.
+# We stored the root's name as the absolute path it was indexed from -- which
+# path_of() and di_lookup() both need -- and printed that whole path as the name with
+# an empty PATH, so `name:` also matched the parts of the path *above* the root.
+# Nothing caught it: every other row's parent is in the index, so the two spellings
+# only ever differ on this one row, and no term in test.sh or cmp_ref.sh read it.
+
+etp "the root row: name is the basename, PATH is the directory above it" \
+    "$SRV_PORT" <<EOF
+send USER anonymous
+send EVERYTHING PATH_COLUMN 1
+send EVERYTHING COUNT 10
+send EVERYTHING SEARCH name:$TREE_NAME folder:
+sendraw EVERYTHING QUERY
+query
+EOF
+expect "  exactly one row, and it is the indexed root" "$(prows)" "1"
+expect "  its name is the basename, not the path"      "$(pnames)" "$TREE_NAME "
+expect "  its PATH is the directory containing it"     "$(pfield 0 path)" "$PARENT_BS"
+
+etp "a name: term naming the parent matches nothing" "$SRV_PORT" <<EOF
+send USER anonymous
+send EVERYTHING COUNT 10
+send EVERYTHING SEARCH name:$PARENT_NAME
+sendraw EVERYTHING QUERY
+query
+EOF
+expect "  no entry is named after the root's parent" "$(pcount)" "0"
 
 say "4. the browse sequence the client uses for a directory listing"
 

@@ -330,6 +330,7 @@ Record that in the commit message. Examples from this codebase:
 | `COUNT` defaulted to 0 | the reference defaults to `0xffffffff` (`:1207`); no test omitted COUNT |
 | the 503 guard fired on an armed PASV | the guard was copied from a reference whose state variable means something slightly different |
 | `OPTS UTF8 ON` answered `501`, hanging the official client | the probe only ever sent what it had been taught to send, and that list had no `OPTS` — the verb was only on the wire when the real client was pointed at the server (§1.4). A rejection the client does not treat as fatal just stops it sending anything else, which looks like a hang with no error anywhere. |
+| the indexed root printed its own path as its name, with an empty PATH column, and `name:` matched the directories *above* the root | every other row's parent is in the index, so the root was the only row where the two spellings could differ — and no term read it. Fixed by `display_name_of()` + `dirname(path_of())` (design §12.12); found by diffing both servers' full result sets, which `cmp_ref.sh` now does whenever the index delta is not 0. |
 
 ### 3.5 A test that cannot fail is worse than no test
 
@@ -437,7 +438,11 @@ reinvented. Cite the line in a comment (`etp_server.c:5189`) so a reader can che
 the claim.
 
 When a deviation is genuinely better, do both: make the change *and* record why in
-the same place a future reader will look.
+the same place a future reader will look. The one that is left:
+
+| Deviation | Why | Consequence |
+|---|---|---|
+| a top-level index root's PATH column is `/` | the reference's is `C:` — it indexes the drive root, we have no drive | POSIX's spelling of "the directory above `/etc`". A client joining `path + "\" + name` gets `\/etc`, which is the mixed-separator form §5.1 says it round-trips; an empty PATH instead would lose the leading `/` outright. Design §12.12 |
 
 ### 5.3 A parse error must yield no results, never everything
 
