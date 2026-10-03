@@ -30,9 +30,15 @@ static void usage(void)
     fprintf(stderr,
         "usage:\n"
         "  esidx [-v N] build <root> -o <dbfile>\n"
+        "  esidx [-v N] update <dbfile> [root] [--deep]\n"
         "  esidx [-v N] query <dbfile> [expr ...]\n"
         "  esidx [-v N] serve <dbfile> [-p port] [--bind addr]\n"
         "                             [-u user [-w pass]] [--no-download] [--once]\n"
+        "\n"
+        "update: bring an index back in line with the filesystem. Without --deep\n"
+        "        it stats one directory per subtree and notices name changes;\n"
+        "        with --deep it stats every entry and notices size/mtime changes.\n"
+        "        <root> defaults to the one the index was built from.\n"
         "\n"
         "logging: ESIDX_LOG=error|warn|info|debug  or  -v / -v N / --verbose=N\n");
 }
@@ -87,6 +93,66 @@ static int cmd_build(int argc, char **argv)
     }
     TSDONE("build: total", t0);
     fprintf(stderr, "saved -> %s\n", out);
+    esidx_free(&db);
+    return 0;
+}
+
+/* ------------------------------------------------------------------- update */
+
+/* The offline half of the incremental path (design §7). `esidx serve --refresh`
+ * runs the same walk in-process; this exists so an index built by cron and served
+ * read-only can still be brought forward, and so the suites can drive a refresh
+ * between two queries without a socket in the way. */
+static int cmd_update(int argc, char **argv)
+{
+    const char *dbfile = NULL, *root = NULL;
+    unsigned flags = 0;
+    for (int i = 0; i < argc; i++) {
+        const char *a = argv[i];
+        if (!strcmp(a, "--deep")) { flags |= EU_DEEP; continue; }
+        if (a[0] == '-') { fprintf(stderr, "update: unknown option %s\n", a); return 1; }
+        if (!dbfile) { dbfile = a; continue; }
+        if (!root)   { root = a; continue; }
+        fprintf(stderr, "update: unexpected argument %s\n", a);
+        return 1;
+    }
+    if (!dbfile) {
+        fprintf(stderr, "usage: esidx update <dbfile> [root] [--deep]\n");
+        return 1;
+    }
+
+    esidx_t db;
+    esidx_init(&db);
+    uint64_t t0 = ts_us();
+    if (esidx_load(&db, dbfile) != 0) {
+        fprintf(stderr, "load failed: %s\n", dbfile);
+        esidx_free(&db);
+        return 1;
+    }
+    uint32_t before = esidx_live_count(&db);
+
+    update_stats_t st;
+    if (esidx_update(&db, root, flags, &st) != 0) {
+        esidx_free(&db);
+        return 1;
+    }
+
+    uint32_t after = esidx_live_count(&db);
+    fprintf(stderr,
+            "updated %s: %u live entries (was %u, %+d), %u dirs (%u skipped, %u descended), "
+            "%u added, %u removed, %u refreshed in %.1f ms\n",
+            dbfile, after, before, (int)after - (int)before,
+            st.dirs_skipped + st.dirs_reconciled,
+            st.dirs_skipped, st.dirs_reconciled,
+            st.added, st.removed, st.refreshed, (double)st.us / 1000.0);
+    esidx_log_stats(&db, "update");
+
+    if (esidx_save(&db, dbfile) != 0) {
+        fprintf(stderr, "save failed: %s\n", dbfile);
+        esidx_free(&db);
+        return 1;
+    }
+    TSDONE2("update: total", t0, "(%u entries)", db.et.count);
     esidx_free(&db);
     return 0;
 }
@@ -259,9 +325,10 @@ int main(int argc, char **argv)
     LOGD("log level: %s", log_level_name(log_level()));
 
     if (argc < 2) { usage(); return 1; }
-    if (!strcmp(argv[1], "build")) return cmd_build(argc - 2, argv + 2);
-    if (!strcmp(argv[1], "query")) return cmd_query(argc - 2, argv + 2);
-    if (!strcmp(argv[1], "serve")) return cmd_serve(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "build"))  return cmd_build(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "update")) return cmd_update(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "query"))  return cmd_query(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "serve"))  return cmd_serve(argc - 2, argv + 2);
     usage();
     return 1;
 }

@@ -25,6 +25,9 @@ typedef uint32_t eid_t;
 #define EF_DIR      0x0001u
 #define EF_HIDDEN   0x0002u
 #define EF_READONLY 0x0004u
+/* Tombstone. A removed entry keeps its row and its id; only this bit and the
+ * `live` set say it is gone. Ids are never reused -- see design §11 D8. */
+#define EF_DEAD     0x0008u
 
 /* ----------------------------------------------------------- string pool */
 
@@ -52,6 +55,11 @@ typedef struct {
     int64_t  *size;
     int64_t  *mtime;
     int64_t  *ctime;
+    /* mtime in nanoseconds, and only for directories: the reconcile compares it
+     * against the filesystem to decide whether a subtree can be skipped (ref A2).
+     * Seconds would not do -- a directory can be created, emptied and refilled
+     * inside one second, and the answer would silently keep the old rows. */
+    int64_t  *stamp;
     uint16_t *ext_id;   /* interned into exts pool; 0 = none */
     strref_t *name;
 } entry_table_t;
@@ -83,6 +91,12 @@ typedef struct {
 
 int  bs_init(bitset_t *b, uint32_t nbits);
 void bs_free(bitset_t *b);
+/* Widen to at least `nbits`, keeping the bits already set. A new entry id can
+ * land past the end of a bitmap that finalize sized for the old entry count,
+ * and every set operation silently ignores an out-of-range index -- so an
+ * incremental add that skipped this would lose the row from `file:`/`ext:`
+ * without any error. */
+int  bs_reserve(bitset_t *b, uint32_t nbits);
 void bs_set(bitset_t *b, uint32_t i);
 bool bs_test(const bitset_t *b, uint32_t i);
 void bs_clear(bitset_t *b);
@@ -93,6 +107,7 @@ uint32_t bs_count(const bitset_t *b);
  * helper. */
 void bs_and(bitset_t *dst, const bitset_t *src);
 void bs_or(bitset_t *dst, const bitset_t *src);
+void bs_copy(bitset_t *dst, const bitset_t *src);
 void bs_andnot(bitset_t *dst, const bitset_t *src);
 void bs_not(bitset_t *b);
 void bs_set_all(bitset_t *b, uint32_t nbits);
@@ -105,6 +120,12 @@ typedef struct {
     int64_t v;
     eid_t   id;
 } sidx_ent_t;
+
+/* The high bit of `sidx_ent_t.id` marks a delta entry as a *retraction* of the
+ * value in `v`, not an assertion of one. It exists because the main array is
+ * append-and-sort: an id whose size or mtime changed still has its old row
+ * there, and a range query that covers the old value would report it. */
+#define SIDX_DEL 0x80000000u
 
 /* Main sorted array, ascending by v. Incremental changes go to `delta`
  * (unsorted) and are merged periodically -- decision D3. */
@@ -120,6 +141,14 @@ void sidx_build(sidx_t *s, const int64_t *vals, uint32_t n);
 void sidx_free(sidx_t *s);
 /* append [lo,hi] matching ids into bitset */
 uint32_t sidx_range_to_bitset(const sidx_t *s, int64_t lo, int64_t hi, bitset_t *out);
+/* D3's writer. update() asserts the new value; erase() retracts the old one.
+ * Both are O(1) and both leave the main array alone until sidx_merge(). */
+void sidx_update(sidx_t *s, int64_t v, eid_t id);
+void sidx_erase(sidx_t *s, int64_t v, eid_t id);
+/* Fold the delta into the main array (D3's 1% / 60 s rule). O(n + d log d):
+ * every id the delta mentions is dropped from its old row and re-added from the
+ * delta, so a merge never resurrects a retracted value. */
+int  sidx_merge(sidx_t *s);
 
 /* ------------------------------------------------------------- enum bitmap */
 
@@ -163,6 +192,22 @@ typedef struct {
     uint64_t depth_max;
 } scan_stats_t;
 
+/* What one esidx_update() actually did. The counters a caller has to be able to
+ * report, because "the index is up to date" is exactly the claim that is wrong
+ * when it is wrong: a pass that skipped every directory it looked at has proved
+ * nothing about the files inside them (design §7). */
+typedef struct {
+    uint32_t dirs_skipped;   /* stamp compared, unchanged, subtree not descended */
+    uint32_t dirs_reconciled;/* descended into: its children were listed */
+    uint32_t entries_seen;
+    uint32_t added;
+    uint32_t removed;
+    uint32_t refreshed;      /* entries whose columns were compared */
+    uint32_t stat_fail;      /* entries or directories that could not be read */
+    uint32_t compacted;
+    uint64_t us;
+} update_stats_t;
+
 typedef struct {
     strpool_t     names;
     strpool_t     exts;
@@ -173,6 +218,24 @@ typedef struct {
     sidx_t        by_ctime;
     ext_index_t   ext;      /* ext: bitmap set, built in finalize */
     type_index_t  type;     /* file:/folder: bitmaps, built in finalize */
+    /* One bit per entry id: clear for a tombstone (EF_DEAD), set for every live
+     * row. Every query seeds its candidate set from here, which is what keeps a
+     * removed entry out of every matcher without each matcher having to know
+     * that removals exist. */
+    bitset_t      live;
+    /* Bumped by every mutation. The protocol layer's result cache compares it
+     * (design §6.4), so a refresh between two identical QUERYs cannot serve the
+     * previous id set -- which after a compaction would be a set of unrelated
+     * rows rather than a stale subset. */
+    uint64_t      epoch;
+    /* When the last mutation happened, for D3's "merge once the delta has been
+     * idle" rule. Monotonic microseconds; 0 means the index has never been
+     * touched since it was built, i.e. there is nothing to merge. */
+    uint64_t      last_change_us;
+    /* finalize has run, so the derived indexes exist and esidx_add() has to keep
+     * them in step. A full scan appends with no derived indexes present and lets
+     * finalize build them; a reconcile appends into a live index. */
+    bool          built;
     eid_t         root_eid; /* the scanned root; parent:"" and root: anchor here */
     scan_stats_t  scan;
 } esidx_t;
@@ -180,12 +243,42 @@ typedef struct {
 void esidx_init(esidx_t *db);
 void esidx_free(esidx_t *db);
 
-/* append one entry; returns its eid */
-eid_t esidx_add(esidx_t *db, eid_t parent, const char *name, uint16_t depth,
-                uint16_t flags, int64_t size, int64_t mtime, int64_t ctime);
+/* One entry as the collector hands it over. A struct rather than nine positional
+ * arguments because three of them are adjacent int64_t seconds/nanoseconds: a
+ * swapped pair compiles, runs, and quietly makes every reconcile rescan. */
+typedef struct {
+    const char *name;
+    uint16_t    flags;
+    uint16_t    depth;
+    int64_t     size;
+    int64_t     mtime;
+    int64_t     ctime;
+    int64_t     stamp;     /* mtime in ns; only read for directories */
+} entry_in_t;
+
+/* append one entry; returns its eid. When db->built is set (a reconcile) the
+ * derived indexes are updated for the new id, otherwise finalize builds them. */
+eid_t esidx_add(esidx_t *db, eid_t parent, const entry_in_t *in);
+
+/* refresh an existing entry's columns in place. Only the columns that actually
+ * changed reach a sorted array, so a deep pass over a quiet tree writes nothing
+ * to any delta. Not for a type change: flags are baked into the type and ext
+ * bitmaps, so a file that became a directory has to be removed and re-added. */
+int esidx_touch(esidx_t *db, eid_t id, const entry_in_t *in);
+
+/* remove an entry and everything under it. Tombstones, not reuse -- see §11 D8. */
+int esidx_remove(esidx_t *db, eid_t id);
+
+uint32_t esidx_live_count(const esidx_t *db);
 
 /* scan */
 int  esidx_scan(esidx_t *db, const char *root);
+/* Bring a built index back in line with the filesystem (design §7). */
+#define EU_DEEP 0x1u   /* stat every entry, not just directories whose stamp moved */
+int  esidx_update(esidx_t *db, const char *root, unsigned flags, update_stats_t *st);
+/* Rebuild from scratch to reclaim tombstoned ids. Automatic once they dominate,
+ * because a reconcile that rewrites a hot directory costs one id per child. */
+int  esidx_compact(esidx_t *db);
 void esidx_finalize(esidx_t *db);   /* build dir paths hash + sorted indexes */
 
 /* child count of a directory entry (design §5.5 aggregate, derived not stored) */
@@ -204,11 +297,21 @@ uint32_t ext_index_select(const ext_index_t *xi, const uint16_t *ids, uint32_t n
                           bitset_t *out);
 /* selectivity estimate for one ext id, or UINT32_MAX when unknown */
 uint32_t ext_index_count(const ext_index_t *xi, uint16_t ext_id);
+/* incremental maintenance (design §7) */
+int      ext_index_add(ext_index_t *xi, const esidx_t *db, uint16_t ext_id, eid_t id);
+int      ext_index_del(ext_index_t *xi, uint16_t ext_id, eid_t id);
 
 /* ---------------------------------------------------------------- helpers */
 
 /* exposed to the query and protocol layers */
 eid_t      di_lookup(const esidx_t *db, const char *path);
+eid_t      di_lookup_name(const esidx_t *db, eid_t dir, const char *name);
+int        di_remove_child(dir_index_t *di, eid_t dir, eid_t child);
+/* Insert/erase a directory's path. Erasing marks the slot rather than backing
+ * the probe chain up, because a linear-probe table with a hole in it cannot
+ * distinguish "absent" from "present, further along". */
+int        di_hash_insert(esidx_t *db, eid_t dir);
+int        di_hash_erase(esidx_t *db, eid_t dir);
 void       path_of(const esidx_t *db, eid_t id, char *out, size_t outsz);
 uint16_t   ext_intern(esidx_t *db, const char *name);
 const char *name_of(const esidx_t *db, eid_t id);

@@ -398,6 +398,245 @@ else
     bad "build past the depth cap" "see $TMP/err"
 fi
 
+# ------------------------------------------------------------- incremental
+#
+# design §7. Every expected number here comes from find(1) on the fixture, not
+# from running esidx -- the same rule as the rest of the suite, and the only one
+# that can tell "the refresh works" from "the refresh is self-consistent".
+#
+# The fixture is separate from $TREE because these tests mutate it; the counts
+# the sections above pin would not survive that, and a test that breaks its
+# neighbours is worse than no test.
+
+say "incremental refresh (design §7)"
+
+INC="$TMP/inc"
+mkdir -p "$INC/a/b" "$INC/c"
+printf 'x%.0s' $(seq 1 100)  >"$INC/one.txt"
+printf 'y%.0s' $(seq 1 200)  >"$INC/two.conf"
+printf 'z%.0s' $(seq 1 300)  >"$INC/a/three.txt"
+printf 'w%.0s' $(seq 1 400)  >"$INC/a/b/four.log"
+# a fixed old date, so that "did the refresh notice the mtime change" is a
+# question with a literal answer rather than one about the current second
+touch -d '2020-01-01 12:00' "$INC/two.conf"
+
+INC_DB="$TMP/inc.idx"
+build "$INC" "$INC_DB" >/dev/null
+
+# every entry the index holds must equal every entry on disk
+inc_find() { find "$INC" | wc -l; }
+
+# Total, and the dir/file split. The split is what pins the type bitmaps: a
+# removed row that is still counted as a file, or an added directory that never
+# reaches the folders bitmap, leaves the totals alone and shows up here. Both
+# numbers come from find(1).
+inc_sync() {
+    q ""
+    expect "index matches find(1) after: $1" "$(n "$LAST")" "$(inc_find)"
+    q "folder:"; D=$(n "$LAST")
+    q "file:";   F=$(n "$LAST")
+    expect "dir/file split matches find after: $1" "$D/$F" \
+        "$(find "$INC" -type d | wc -l)/$(find "$INC" -type f | wc -l)"
+}
+
+DB="$INC_DB"
+
+# 1. nothing changed. The pass must cost one stat per directory and stop.
+u() { "$BIN" update "$INC_DB" "$@" >/dev/null 2>>"$DIAG"; }
+if u; then ok "update with no changes succeeds"; else bad "update with no changes"; fi
+q ""
+expect "no-op refresh keeps every entry" "$(n "$LAST")" "$(inc_find)"
+q "dm:2020-01-01..2020-01-02"
+expect "the fixed-date file is found by dm:" "$(n "$LAST")" "1"
+
+# 2. a new name in a directory whose stamp moved
+printf 'n%.0s' $(seq 1 50) >"$INC/new.txt"
+u
+q "parent:$INC file:"
+expect "a created file is indexed" "$(n "$LAST")" \
+    "$(find "$INC" -mindepth 1 -maxdepth 1 -type f | wc -l)"
+inc_sync "create"
+
+# 3. a deletion
+rm "$INC/one.txt"
+u
+q "one.txt"
+expect "a deleted file is gone from a text search" "$(n "$LAST")" "0"
+q "ext:txt"
+expect "a deleted file is gone from its extension bitmap" "$(n "$LAST")" \
+    "$(find "$INC" -type f -name '*.txt' | wc -l)"
+inc_sync "delete"
+
+# 4. a rename: on disk that is a delete plus a create, and the reconcile has to
+#    agree with find about which
+mv "$INC/two.conf" "$INC/renamed.dat"
+u
+q "renamed.dat"
+expect "the new name is indexed" "$(n "$LAST")" "1"
+q "two.conf"
+expect "the old name is not" "$(n "$LAST")" "0"
+q "ext:dat"
+expect "the extension followed the rename" "$(n "$LAST")" "1"
+inc_sync "rename"
+
+# 5. a file replaced by a directory of the same name. The flags are baked into
+#    the type and ext bitmaps, so this is the case that catches a touch() which
+#    only refreshes the numeric columns.
+rm "$INC/a/three.txt"
+mkdir -p "$INC/a/three.txt"
+printf 'i' >"$INC/a/three.txt/inner.txt"
+u
+q "parent:$INC/a/three.txt"
+expect "file -> directory is walked as a directory (B5)" "$(n "$LAST")" "1"
+q "parent:$INC/a folder:"
+expect "and the type bitmap agrees with find" "$(n "$LAST")" \
+    "$(find "$INC/a" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+q "parent:$INC/a file:"
+expect "with no file left under a/" "$(n "$LAST")" \
+    "$(find "$INC/a" -mindepth 1 -maxdepth 1 -type f | wc -l)"
+inc_sync "file -> dir"
+
+# 6. a directory replaced by a file
+rm -rf "$INC/c"
+printf 'c' >"$INC/c"
+u
+q "parent:$INC folder:"
+expect "dir -> file leaves one folder" "$(n "$LAST")" \
+    "$(find "$INC" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+q "parent:$INC file:"
+expect "and one more file" "$(n "$LAST")" \
+    "$(find "$INC" -mindepth 1 -maxdepth 1 -type f | wc -l)"
+inc_sync "dir -> file"
+
+# 7. a new subtree, then removing one wholesale
+mkdir -p "$INC/deep/x/y"
+printf 'q' >"$INC/deep/x/y/z.txt"
+u
+q "parent:$INC/deep/x/y"
+expect "a new subtree is walked (B5)" "$(n "$LAST")" "1"
+inc_sync "new subtree"
+
+rm -rf "$INC/deep"
+u
+q "z.txt"
+expect "rm -rf leaves nothing behind" "$(n "$LAST")" "0"
+q "parent:$INC/deep"
+expect "and the removed subtree's row is gone" "$(n "$LAST")" "0"
+inc_sync "rm -rf"
+
+# 8. two hard links to one inode, so both rows have the same size and the same
+#    extension. Matching a stored row to a directory entry by inode would collapse
+#    them into one; by name it cannot.
+ln "$INC/new.txt" "$INC/hard.txt"
+u
+q "size:50 file:"
+expect "a hard-linked pair is two rows" "$(n "$LAST")" \
+    "$(find "$INC" -type f -size 50c | wc -l)"
+q "ext:txt"
+expect "and both are in the extension bitmap" "$(n "$LAST")" \
+    "$(find "$INC" -type f -name '*.txt' | wc -l)"
+inc_sync "hard link"
+
+# 9. attribute changes. This is the case the cheap pass provably cannot see, and
+#    the test says so rather than leaving it as a caveat in a comment: a file's
+#    content changes its own mtime, not its parent's.
+printf 'x%.0s' $(seq 1 5000) >"$INC/new.txt"
+u
+q "size:>1000 file:"
+expect "the cheap pass does NOT see a size change" "$(n "$LAST")" "0"
+u --deep
+q "size:>1000 file:"
+expect "the deep pass does" "$(n "$LAST")" \
+    "$(find "$INC" -type f -size +1000c | wc -l)"
+inc_sync "size change (deep)"
+
+# 10. and the same for mtime, which is what dm: is answered from. The count
+#     before the change is the control: it has to be exactly what the deep pass
+#     later reproduces from find(1).
+q "dm:today file:"
+TODAY_BEFORE=$(n "$LAST")
+touch "$INC/renamed.dat"
+u
+q "dm:today file:"
+expect "the cheap pass does NOT see an mtime change" "$(n "$LAST")" "$TODAY_BEFORE"
+u --deep
+q "dm:today file:"
+expect "the deep pass does" "$(n "$LAST")" \
+    "$(find "$INC" -type f -newermt 'today 00:00' | wc -l)"
+inc_sync "mtime change (deep)"
+
+# 11. child-count: is derived from the children vector, so a removal has to take
+#     the row out of it or this reports the pre-refresh number forever. The
+#     expectation is counted from find(1), because a directory's link count is
+#     not its child count.
+q "child-count:>0 folder:"
+expect "child-count: reflects the removals" "$(n "$LAST")" \
+    "$(find "$INC" -type d -exec sh -c 'ls -A "$1" | head -1' _ {} \; | wc -l)"
+q "parent:$INC/a folder:"
+expect "a/ holds exactly its two remaining children" "$(n "$LAST")" "2"
+
+# 12. a refresh against a tree that is not this index must refuse rather than
+#     delete every row it cannot find
+if "$BIN" update "$INC_DB" "$TREE" >/dev/null 2>"$TMP/err"; then
+    bad "update refuses a root that is not this index"
+else
+    grep -q 'is not this index' "$TMP/err" \
+        && ok "update refuses a root that is not this index" \
+        || bad "update refuses a root that is not this index" "$(cat "$TMP/err")"
+fi
+inc_sync "after the refused update"
+
+# 13. the answers survive the snapshot round trip, tombstones and all
+cp "$INC_DB" "$TMP/inc-copy.idx"
+if u; then ok "a second refresh is still a no-op"; else bad "second refresh"; fi
+q ""
+cp "$INC_DB" "$TMP/inc-copy.idx"
+DB="$TMP/inc-copy.idx"
+q ""
+expect "the reloaded snapshot holds the same rows" "$(n "$LAST")" "$(inc_find)"
+q "ext:txt"
+expect "and the same extension bitmap" "$(n "$LAST")" \
+    "$(find "$INC" -type f -name '*.txt' | wc -l)"
+DB="$INC_DB"
+
+# 14. an unbuilt index is not refreshable
+if "$BIN" update "$TMP/junk.idx" >/dev/null 2>&1; then
+    bad "update rejects a non-snapshot"
+else
+    ok "update rejects a non-snapshot"
+fi
+
+# 15. many directories at the same depth. The reconcile keeps one claim table per
+#     depth and reuses the slots, so a directory whose table is not fully reset
+#     makes its own children look new -- a duplicate row each, and no removal at
+#     all. The fixture above is small enough that the slots never collide, which
+#     is exactly why this needed a tree rather than another assertion.
+say "incremental refresh: wide tree (claim-table reuse)"
+WIDE="$TMP/wide"
+for i in $(seq 1 40); do
+    mkdir -p "$WIDE/d$i"
+    for j in 1 2 3; do printf 'w' >"$WIDE/d$i/f$j.txt"; done
+done
+WIDE_DB="$TMP/wide.idx"
+build "$WIDE" "$WIDE_DB" >/dev/null
+DB="$WIDE_DB"
+if "$BIN" update "$WIDE_DB" --deep >/dev/null 2>"$TMP/err"; then
+    q ""
+    expect "a deep pass duplicates nothing" "$(n "$LAST")" "$(find "$WIDE" | wc -l)"
+    q "parent:$WIDE/d7"
+    expect "and every directory still has its three children" "$(n "$LAST")" "3"
+    q "ext:txt"
+    expect "with the extension bitmap intact" "$(n "$LAST")" "120"
+else
+    bad "deep pass over a wide tree" "see $TMP/err"
+fi
+
+# the language suite's fixture, refreshed after every one of the above, still has
+# to answer the same as it did before
+DB="$TREE_DB"
+q "ext:conf"
+expect "the original fixture is untouched by the incremental work" "$(n "$LAST")" "3"
+
 # --------------------------------------------------------------- logging
 
 say "instrumentation"

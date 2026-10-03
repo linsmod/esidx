@@ -44,11 +44,13 @@ static int et_grow(entry_table_t *et, uint32_t ncap)
     int64_t  *s = realloc(et->size,   ncap * sizeof(int64_t));
     int64_t  *m = realloc(et->mtime,  ncap * sizeof(int64_t));
     int64_t  *c = realloc(et->ctime,  ncap * sizeof(int64_t));
+    int64_t  *k = realloc(et->stamp,  ncap * sizeof(int64_t));
     uint16_t *e = realloc(et->ext_id, ncap * sizeof(uint16_t));
     strref_t *r = realloc(et->name,   ncap * sizeof(strref_t));
-    if (!p || !d || !f || !s || !m || !c || !e || !r) return -1;
+    if (!p || !d || !f || !s || !m || !c || !k || !e || !r) return -1;
     et->parent = p; et->depth = d; et->flags = f; et->size = s;
-    et->mtime = m;  et->ctime = c; et->ext_id = e; et->name = r;
+    et->mtime = m;  et->ctime = c; et->stamp = k;
+    et->ext_id = e; et->name = r;
     et->cap = ncap;
     return 0;
 }
@@ -82,29 +84,161 @@ static uint16_t ext_of(esidx_t *db, const char *name)
     return ext_intern(db, buf);
 }
 
-eid_t esidx_add(esidx_t *db, eid_t parent, const char *name, uint16_t depth,
-                uint16_t flags, int64_t size, int64_t mtime, int64_t ctime)
+/* ------------------------------------------------------------------ mutation */
+
+/* The epoch answers one question: "can a query return something different now?".
+ * Bumping it on every pass would make a scheduled refresh throw away the protocol
+ * layer's cached result set every few seconds even when the filesystem did not
+ * move, which is the difference between a refresh being invisible and it being a
+ * performance bug. One place, so the three callers cannot disagree about what a
+ * mutation is. */
+static void bump_epoch(esidx_t *db)
+{
+    db->epoch++;
+    db->last_change_us = ts_us();
+}
+
+/* Make a freshly appended id visible to everything derived from the columns.
+ * finalize builds these from scratch for a batch build; a reconcile appends into
+ * an index that already has them, and this is the one place that knows the
+ * difference. */
+static int link_new(esidx_t *db, eid_t id)
+{
+    const entry_table_t *et = &db->et;
+    uint32_t n = et->count;
+
+    /* A new id is past everything finalize sized for, and every set operation
+     * silently drops an out-of-range index -- so without this the row would be
+     * invisible to `file:`, `folder:` and `ext:` and visible to a text scan. */
+    if (bs_reserve(&db->live, n) != 0) return -1;
+    if (bs_reserve(&db->type.all, n) != 0) return -1;
+    if (bs_reserve(&db->type.dirs, n) != 0) return -1;
+    if (bs_reserve(&db->type.files, n) != 0) return -1;
+
+    bs_set(&db->live, id);
+    bs_set(&db->type.all, id);
+    if (et->flags[id] & EF_DIR) bs_set(&db->type.dirs, id);
+    else                       bs_set(&db->type.files, id);
+
+    uint16_t e = et->ext_id[id];
+    if (e && ext_index_add(&db->ext, db, e, id) != 0) return -1;
+
+    /* A new directory needs a path in the hash, or `parent:` on it misses. */
+    if ((et->flags[id] & EF_DIR) && di_hash_insert(db, id) != 0) return -1;
+    return 0;
+}
+
+eid_t esidx_add(esidx_t *db, eid_t parent, const entry_in_t *in)
 {
     entry_table_t *et = &db->et;
     if (et->count == et->cap) {
         if (et_grow(et, et->cap ? et->cap * 2 : 1024) != 0) return EID_NONE;
     }
     eid_t id = et->count++;
-    size_t nlen = strlen(name);
+    size_t nlen = strlen(in->name);
 
-    et->name[id].off  = sp_intern(&db->names, name, nlen);
+    et->name[id].off  = sp_intern(&db->names, in->name, nlen);
     et->name[id].len  = (uint32_t)nlen;
     et->parent[id]    = parent;
-    et->depth[id]     = depth;
-    et->flags[id]     = flags;
-    et->size[id]      = size;
-    et->mtime[id]     = mtime;
-    et->ctime[id]     = ctime;
-    et->ext_id[id]    = (flags & EF_DIR) ? 0 : ext_of(db, name);
+    et->depth[id]     = in->depth;
+    et->flags[id]     = in->flags;
+    et->size[id]      = in->size;
+    et->mtime[id]     = in->mtime;
+    et->ctime[id]     = in->ctime;
+    et->stamp[id]     = in->stamp;
+    et->ext_id[id]    = (in->flags & EF_DIR) ? 0 : ext_of(db, in->name);
 
     if (parent == EID_NONE) db->root_eid = id;
-    if (parent != EID_NONE) di_add_child(&db->di, parent, id);
+    else if (di_add_child(&db->di, parent, id) != 0) return EID_NONE;
+
+    if (db->built) {
+        if (link_new(db, id) != 0) { LOGE("cannot index new entry %s", in->name); return EID_NONE; }
+        bump_epoch(db);
+    }
     return id;
+}
+
+int esidx_touch(esidx_t *db, eid_t id, const entry_in_t *in)
+{
+    entry_table_t *et = &db->et;
+    if (id >= et->count || (et->flags[id] & EF_DEAD)) return -1;
+
+    /* Each column reaches its sorted array only when it actually moved. A deep
+     * pass compares every entry on the tree, and pushing all three unconditionally
+     * would put the whole index into the delta on every pass -- the merge in D3
+     * exists precisely to keep that buffer small. */
+    bool changed = false;
+    if (et->size[id] != in->size) {
+        et->size[id] = in->size;
+        sidx_update(&db->by_size, in->size, id);
+        changed = true;
+    }
+    if (et->mtime[id] != in->mtime) {
+        et->mtime[id] = in->mtime;
+        sidx_update(&db->by_mtime, in->mtime, id);
+        changed = true;
+    }
+    if (et->ctime[id] != in->ctime) {
+        et->ctime[id] = in->ctime;
+        sidx_update(&db->by_ctime, in->ctime, id);
+        changed = true;
+    }
+    /* The stamp is not a queried column -- it is what the *next* reconcile
+     * compares -- so a directory whose stamp moved and whose size/mtime did not
+     * does not move the epoch, and a refresh that finds nothing leaves the
+     * protocol layer's result cache alone. */
+    et->stamp[id] = in->stamp;
+    if (changed) bump_epoch(db);
+    return 0;
+}
+
+/* Tombstone one entry. The caller has already dealt with the children. */
+static void kill_one(esidx_t *db, eid_t id)
+{
+    entry_table_t *et = &db->et;
+
+    /* Retract the value each sorted array still holds for this id, then publish
+     * the new one (EID_NONE) so a range query covering either value drops it. */
+    sidx_erase(&db->by_size, et->size[id], id);
+    sidx_erase(&db->by_mtime, et->mtime[id], id);
+    sidx_erase(&db->by_ctime, et->ctime[id], id);
+
+    uint16_t e = et->ext_id[id];
+    if (e) ext_index_del(&db->ext, e, id);
+
+    bs_clear_bit(&db->live, id);
+    bs_clear_bit(&db->type.all, id);
+    bs_clear_bit(&db->type.dirs, id);
+    bs_clear_bit(&db->type.files, id);
+
+    if (et->flags[id] & EF_DIR) di_hash_erase(db, id);
+    eid_t p = et->parent[id];
+    if (p != EID_NONE) di_remove_child(&db->di, p, id);
+
+    et->flags[id] |= EF_DEAD;
+    bump_epoch(db);
+}
+
+int esidx_remove(esidx_t *db, eid_t id)
+{
+    entry_table_t *et = &db->et;
+    if (id >= et->count || (et->flags[id] & EF_DEAD)) return 0;
+
+    /* Children first, so the tree is never left with a live row whose parent is
+     * a tombstone -- that combination is what path_of() would walk into. */
+    while (id < db->di.child_cap && db->di.child[id].n) {
+        childvec_t *cv = &db->di.child[id];
+        eid_t kid = cv->items[cv->n - 1];
+        cv->n--;
+        esidx_remove(db, kid);
+    }
+    kill_one(db, id);
+    return 0;
+}
+
+uint32_t esidx_live_count(const esidx_t *db)
+{
+    return bs_count(&db->live);
 }
 
 /* ---------------------------------------------------------- directory tree */
@@ -139,16 +273,114 @@ int di_add_child(dir_index_t *di, eid_t dir, eid_t child)
     return 0;
 }
 
+/* Swap-remove rather than preserve order: nothing depends on the order, and a
+ * removal from a directory holding thousands of entries must not be O(n) memmove
+ * on top of the O(n) search. */
+int di_remove_child(dir_index_t *di, eid_t dir, eid_t child)
+{
+    if (dir >= di->child_cap) return -1;
+    childvec_t *cv = &di->child[dir];
+    for (uint32_t i = 0; i < cv->n; i++) {
+        if (cv->items[i] != child) continue;
+        cv->items[i] = cv->items[cv->n - 1];
+        cv->n--;
+        return 0;
+    }
+    return -1;
+}
+
+/* One child's name, without materialising a path. The reconcile matches a
+ * getdents entry against the stored children of the same directory on every
+ * single entry, and path_of() there would be O(depth) per lookup. */
+eid_t di_lookup_name(const esidx_t *db, eid_t dir, const char *name)
+{
+    if (dir >= db->di.child_cap) return EID_NONE;
+    const childvec_t *cv = &db->di.child[dir];
+    for (uint32_t i = 0; i < cv->n; i++) {
+        eid_t id = cv->items[i];
+        if (strcmp(name_of(db, id), name) == 0) return id;
+    }
+    return EID_NONE;
+}
+
+/* HT_TOMB marks a slot whose directory is gone. It cannot be 0 (an empty slot)
+ * because a linear probe has to walk *through* a removed entry to reach the
+ * entries behind it -- treating it as empty would make every lookup for a
+ * directory that hashed after the removed one miss. */
+#define HT_TOMB 0xFFFFFFFFu
+
 eid_t di_lookup(const esidx_t *db, const char *path)
 {
     const dir_index_t *di = &db->di;
     if (!di->ht_off) return EID_NONE;
     uint32_t i = hash_str(path) & di->ht_mask;
     while (di->ht_off[i] != 0) {
-        if (strcmp(sp_get(&db->names, di->ht_off[i]), path) == 0) return di->ht_val[i];
+        if (di->ht_off[i] != HT_TOMB &&
+            strcmp(sp_get(&db->names, di->ht_off[i]), path) == 0)
+            return di->ht_val[i];
         i = (i + 1) & di->ht_mask;
     }
     return EID_NONE;
+}
+
+static void di_hash_rehash(esidx_t *db, uint32_t ncap);
+
+int di_hash_insert(esidx_t *db, eid_t dir)
+{
+    dir_index_t *di = &db->di;
+    if (!di->ht_off) return -1;
+    /* Leave room: the table is built for the entry count finalize saw, and a
+     * reconcile adds directories to it. At the old sizing a busy tree would run
+     * the probe length up to where a full table turns every lookup into a scan. */
+    if ((di->ht_count + 1) * 4 >= (di->ht_mask + 1) * 3) {
+        di_hash_rehash(db, (di->ht_mask + 1) * 2);
+        if (!di->ht_off) return -1;
+    }
+
+    char buf[65536];
+    path_of(db, dir, buf, sizeof(buf));
+    uint32_t off = sp_intern(&db->names, buf, strlen(buf));
+
+    uint32_t i = hash_str(sp_get(&db->names, off)) & di->ht_mask;
+    uint32_t reuse = UINT32_MAX;
+    while (di->ht_off[i] != 0) {
+        if (di->ht_off[i] == HT_TOMB) {
+            if (reuse == UINT32_MAX) reuse = i;
+        } else if (strcmp(sp_get(&db->names, di->ht_off[i]), buf) == 0) {
+            di->ht_val[i] = dir;      /* same path, new id */
+            return 0;
+        }
+        i = (i + 1) & di->ht_mask;
+    }
+    if (reuse != UINT32_MAX) i = reuse;
+    else di->ht_count++;
+    di->ht_off[i] = off;
+    di->ht_val[i] = dir;
+    return 0;
+}
+
+int di_hash_erase(esidx_t *db, eid_t dir)
+{
+    dir_index_t *di = &db->di;
+    if (!di->ht_off) return -1;
+    /* Rebuild the path to find the probe start. It has to happen before the
+     * caller sets EF_DEAD, because path_of() walks live parents -- an erase per
+     * removed directory is a price worth paying to avoid a third parallel array
+     * in the table. */
+    char buf[65536];
+    path_of(db, dir, buf, sizeof(buf));
+    uint32_t i = hash_str(buf) & di->ht_mask;
+    while (di->ht_off[i] != 0) {
+        if (di->ht_off[i] != HT_TOMB &&
+            di->ht_val[i] == dir &&
+            strcmp(sp_get(&db->names, di->ht_off[i]), buf) == 0) {
+            di->ht_off[i] = HT_TOMB;
+            di->ht_count--;
+            return 0;
+        }
+        i = (i + 1) & di->ht_mask;
+    }
+    return -1;
 }
 
 const char *name_of(const esidx_t *db, eid_t id)
@@ -239,6 +471,104 @@ void sidx_build(sidx_t *s, const int64_t *vals, uint32_t n)
     qsort(s->a, n, sizeof(sidx_ent_t), cmp_sidx);
 }
 
+/* D3's O(1) writer. `del` marks the entry as a retraction of `v` rather than an
+ * assertion of it -- see SIDX_DEL. */
+static void sidx_push(sidx_t *s, int64_t v, eid_t id, bool del)
+{
+    if (s->dn == s->dcap) {
+        uint32_t ncap = s->dcap ? s->dcap * 2 : 256;
+        sidx_ent_t *nb = realloc(s->delta, ncap * sizeof(sidx_ent_t));
+        if (!nb) { LOGE("sidx: cannot grow the delta buffer"); return; }
+        s->delta = nb;
+        s->dcap = ncap;
+    }
+    s->delta[s->dn].v = v;
+    s->delta[s->dn].id = del ? (id | SIDX_DEL) : id;
+    s->dn++;
+}
+
+void sidx_update(sidx_t *s, int64_t v, eid_t id) { sidx_push(s, v, id, false); }
+void sidx_erase(sidx_t *s, int64_t v, eid_t id)  { sidx_push(s, v, id, true); }
+
+/* D3's merge rule: past 1% of the main array the delta stops being a rounding
+ * error in every range query, so fold it in. O(n + d log d) rather than a
+ * rebuild, because a rebuild re-sorts the whole array on every pass and the
+ * delta exists precisely to avoid that.
+ *
+ * The subtlety is that an id can appear in the delta several times before the
+ * merge, so it is not enough to append every SET entry: id 7 updated twice has
+ * two assertions, and keeping both would leave the intermediate value in the
+ * array where a range query covering it would still match. Only the *last* action
+ * per id survives, so the delta is grouped by id first. */
+typedef struct {
+    eid_t    id;
+    int64_t  v;
+    uint32_t pos;
+} dsort_t;
+
+static int cmp_dsort(const void *a, const void *b)
+{
+    const dsort_t *x = a, *y = b;
+    if (x->id != y->id) return x->id < y->id ? -1 : 1;
+    return x->pos < y->pos ? -1 : (x->pos > y->pos);
+}
+
+int sidx_merge(sidx_t *s)
+{
+    if (!s->dn) return 0;
+
+    dsort_t *d = malloc((size_t)s->dn * sizeof(dsort_t));
+    bitset_t touched;
+    if (!d) return -1;
+    if (bs_init(&touched, s->n ? s->n : 1) != 0) { free(d); return -1; }
+    for (uint32_t i = 0; i < s->dn; i++) {
+        d[i].id = s->delta[i].id & ~SIDX_DEL;
+        d[i].v = s->delta[i].v;
+        d[i].pos = i;
+    }
+    qsort(d, s->dn, sizeof(dsort_t), cmp_dsort);
+
+    uint32_t nnew = s->n;
+    for (uint32_t i = 0; i < s->dn; ) {
+        uint32_t j = i + 1;
+        while (j < s->dn && d[j].id == d[i].id) j++;
+        const dsort_t *last = &d[j - 1];
+        bool drop = (last->id < s->n);
+        bool keep = !(s->delta[last->pos].id & SIDX_DEL);
+        if (drop) { bs_set(&touched, last->id); nnew--; }
+        if (keep) nnew++;
+        i = j;
+    }
+
+    sidx_ent_t *na = malloc((nnew ? nnew : 1) * sizeof(sidx_ent_t));
+    if (!na) { free(d); bs_free(&touched); return -1; }
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < s->n; i++)
+        if (!bs_test(&touched, s->a[i].id)) na[k++] = s->a[i];
+    for (uint32_t i = 0; i < s->dn; ) {
+        uint32_t j = i + 1;
+        while (j < s->dn && d[j].id == d[i].id) j++;
+        const dsort_t *last = &d[j - 1];
+        if (!(s->delta[last->pos].id & SIDX_DEL)) {
+            na[k].v = last->v;
+            na[k].id = last->id;
+            k++;
+        }
+        i = j;
+    }
+    free(d);
+    bs_free(&touched);
+    qsort(na, k, sizeof(sidx_ent_t), cmp_sidx);
+
+    free(s->a);
+    free(s->delta);
+    s->a = na;
+    s->n = s->cap = k;
+    s->delta = NULL;
+    s->dn = s->dcap = 0;
+    return 0;
+}
+
 void sidx_free(sidx_t *s)
 {
     free(s->a); free(s->delta);
@@ -258,9 +588,20 @@ uint32_t sidx_range_to_bitset(const sidx_t *s, int64_t lo, int64_t hi, bitset_t 
         bs_set(out, s->a[i].id);
         cnt++;
     }
-    /* delta (decision D3): linear scan, unsorted */
+    /* The delta is walked in append order, which is chronological, so a
+     * retraction always comes after the assertion it undoes. A retraction clears
+     * unconditionally rather than only inside [lo,hi]: it retracts *that value*
+     * for that id, and the main array set the bit because that value was in the
+     * range -- which says nothing about whether the id's current value is. */
     for (uint32_t i = 0; i < s->dn; i++) {
-        if (s->delta[i].v >= lo && s->delta[i].v <= hi) { bs_set(out, s->delta[i].id); cnt++; }
+        eid_t id = s->delta[i].id;
+        if (id & SIDX_DEL) {
+            id &= ~SIDX_DEL;
+            if (bs_test(out, id)) { bs_clear_bit(out, id); cnt--; }
+        } else if (s->delta[i].v >= lo && s->delta[i].v <= hi) {
+            if (!bs_test(out, id)) cnt++;
+            bs_set(out, id);
+        }
     }
     return cnt;
 }
@@ -286,7 +627,7 @@ int ext_index_build(ext_index_t *xi, const esidx_t *db)
 
     for (uint32_t i = 0; i < et->count; i++) {
         uint16_t e = et->ext_id[i];
-        if (!e) continue;
+        if (!e || (et->flags[i] & EF_DEAD)) continue;
         uint32_t h = (e * 2654435761u) & mask;
         while (tab[h] && ids[tab[h] - 1] != e) h = (h + 1) & mask;
         if (tab[h]) continue;
@@ -301,7 +642,7 @@ int ext_index_build(ext_index_t *xi, const esidx_t *db)
         return -1;
     }
     for (uint32_t s = 0; s < n; s++) {
-        if (bs_init(&sets[s], et->count) != 0) {
+        if (bs_init(&sets[s], et->count + 1) != 0) {
             for (uint32_t k = 0; k < s; k++) bs_free(&sets[k]);
             free(sets); free(counts); free(tab); free(ids);
             return -1;
@@ -309,7 +650,7 @@ int ext_index_build(ext_index_t *xi, const esidx_t *db)
     }
     for (uint32_t i = 0; i < et->count; i++) {
         uint16_t e = et->ext_id[i];
-        if (!e) continue;
+        if (!e || (et->flags[i] & EF_DEAD)) continue;
         uint32_t h = (e * 2654435761u) & mask;
         while (ids[tab[h] - 1] != e) h = (h + 1) & mask;
         bs_set(&sets[tab[h] - 1], i);
@@ -363,6 +704,59 @@ uint32_t ext_index_select(const ext_index_t *xi, const uint16_t *ids, uint32_t n
     return cnt;
 }
 
+/* Add one entry to the set for `ext_id`, creating the slot if the extension is
+ * new to this index. Mirrors ext_index_build()'s slot map -- the map, not a
+ * parallel structure, is what keeps a lookup O(1). */
+int ext_index_add(ext_index_t *xi, const esidx_t *db, uint16_t ext_id, eid_t id)
+{
+    if (!xi->tab || !ext_id) return 0;
+    int slot = ext_slot(xi, ext_id);
+    if (slot < 0) {
+        /* a new extension: the table was sized for the entry count finalize saw */
+        if ((xi->n + 1) * 4 >= (xi->tab_mask + 1) * 3) {
+            uint32_t ncap = (xi->tab_mask + 1) * 2;
+            uint32_t *nt = calloc(ncap, sizeof(uint32_t));
+            if (!nt) return -1;
+            free(xi->tab);
+            xi->tab = nt;
+            xi->tab_mask = ncap - 1;
+            for (uint32_t s = 0; s < xi->n; s++) {
+                uint32_t h = (xi->ids[s] * 2654435761u) & xi->tab_mask;
+                while (xi->tab[h]) h = (h + 1) & xi->tab_mask;
+                xi->tab[h] = s + 1;
+            }
+        }
+        uint32_t *nids = realloc(xi->ids, (xi->n + 1) * sizeof(uint32_t));
+        uint32_t *ncounts = realloc(xi->counts, (xi->n + 1) * sizeof(uint32_t));
+        bitset_t *nsets = realloc(xi->sets, (xi->n + 1) * sizeof(bitset_t));
+        if (!nids || !ncounts || !nsets) return -1;
+        xi->ids = nids; xi->counts = ncounts; xi->sets = nsets;
+        if (bs_init(&xi->sets[xi->n], db->et.count + 1) != 0) return -1;
+        xi->ids[xi->n] = ext_id;
+        xi->counts[xi->n] = 0;
+        xi->n++;
+        uint32_t h = (ext_id * 2654435761u) & xi->tab_mask;
+        while (xi->tab[h]) h = (h + 1) & xi->tab_mask;
+        xi->tab[h] = xi->n;
+        slot = (int)xi->n - 1;
+    }
+    if (bs_reserve(&xi->sets[slot], db->et.count) != 0) return -1;
+    if (!bs_test(&xi->sets[slot], id)) xi->counts[slot]++;
+    bs_set(&xi->sets[slot], id);
+    return 0;
+}
+
+int ext_index_del(ext_index_t *xi, uint16_t ext_id, eid_t id)
+{
+    int slot = ext_slot(xi, ext_id);
+    if (slot < 0) return 0;
+    if (bs_test(&xi->sets[slot], id)) {
+        bs_clear_bit(&xi->sets[slot], id);
+        xi->counts[slot]--;
+    }
+    return 0;
+}
+
 uint32_t ext_index_count(const ext_index_t *xi, uint16_t ext_id)
 {
     int s = ext_slot(xi, ext_id);
@@ -385,7 +779,7 @@ void esidx_free(esidx_t *db)
 {
     free(db->names.buf); free(db->exts.buf);
     free(db->et.parent); free(db->et.depth); free(db->et.flags);
-    free(db->et.size); free(db->et.mtime); free(db->et.ctime);
+    free(db->et.size); free(db->et.mtime); free(db->et.ctime); free(db->et.stamp);
     free(db->et.ext_id); free(db->et.name);
     for (uint32_t i = 0; i < db->di.child_cap; i++) free(db->di.child[i].items);
     free(db->di.child);
@@ -393,7 +787,27 @@ void esidx_free(esidx_t *db)
     sidx_free(&db->by_size); sidx_free(&db->by_mtime); sidx_free(&db->by_ctime);
     ext_index_free(&db->ext);
     bs_free(&db->type.all); bs_free(&db->type.dirs); bs_free(&db->type.files);
+    bs_free(&db->live);
     memset(db, 0, sizeof(*db));
+}
+
+/* (Re)allocate the dir path hash. Used by finalize for the batch build and by
+ * di_hash_insert when a reconcile pushes the directory count past what the table
+ * was sized for. */
+static void di_hash_rehash(esidx_t *db, uint32_t ncap)
+{
+    uint32_t *off = calloc(ncap, sizeof(uint32_t));
+    eid_t   *val = calloc(ncap, sizeof(eid_t));
+    if (!off || !val) {
+        LOGE("cannot allocate dir path hash (%u slots)", ncap);
+        free(off); free(val);
+        return;   /* the old table stays; a reconcile only degrades to a slower lookup */
+    }
+    free(db->di.ht_off); free(db->di.ht_val);
+    db->di.ht_off = off;
+    db->di.ht_val = val;
+    db->di.ht_mask = ncap - 1;
+    db->di.ht_count = 0;
 }
 
 static void di_hash_build(esidx_t *db)
@@ -401,24 +815,17 @@ static void di_hash_build(esidx_t *db)
     /* size table to ~2x entry count (dirs only) */
     uint32_t ndirs = 0;
     for (uint32_t i = 0; i < db->et.count; i++)
-        if (db->et.flags[i] & EF_DIR) ndirs++;
+        if ((db->et.flags[i] & EF_DIR) && !(db->et.flags[i] & EF_DEAD)) ndirs++;
 
     uint32_t ncap = 1024;
     while (ncap < ndirs * 4) ncap *= 2;
-    free(db->di.ht_off); free(db->di.ht_val);
-    db->di.ht_off = calloc(ncap, sizeof(uint32_t));
-    db->di.ht_val = calloc(ncap, sizeof(eid_t));
-    db->di.ht_mask = ncap - 1;
-    db->di.ht_count = 0;
-    if (!db->di.ht_off || !db->di.ht_val) {
-        LOGE("cannot allocate dir path hash (%u slots)", ncap);
-        return;
-    }
+    di_hash_rehash(db, ncap);
+    if (!db->di.ht_off) return;
 
     uint32_t max_probe = 0;
     char *buf = malloc(65536);
     for (uint32_t i = 0; i < db->et.count; i++) {
-        if (!(db->et.flags[i] & EF_DIR)) continue;
+        if (!(db->et.flags[i] & EF_DIR) || (db->et.flags[i] & EF_DEAD)) continue;
         path_of(db, i, buf, 65536);
         uint32_t off = sp_intern(&db->names, buf, strlen(buf));
         uint32_t h = hash_str(sp_get(&db->names, off)) & db->di.ht_mask;
@@ -442,10 +849,11 @@ static void type_index_build(type_index_t *ti, esidx_t *db)
     bs_free(&ti->all); bs_free(&ti->dirs); bs_free(&ti->files);
     uint32_t n = db->et.count;
     if (!n) return;
-    bs_init(&ti->all, n);
-    bs_init(&ti->dirs, n);
-    bs_init(&ti->files, n);
+    bs_init(&ti->all, n + 1);
+    bs_init(&ti->dirs, n + 1);
+    bs_init(&ti->files, n + 1);
     for (uint32_t i = 0; i < n; i++) {
+        if (db->et.flags[i] & EF_DEAD) continue;
         bs_set(&ti->all, i);
         if (db->et.flags[i] & EF_DIR) bs_set(&ti->dirs, i);
         else                        bs_set(&ti->files, i);
@@ -453,9 +861,27 @@ static void type_index_build(type_index_t *ti, esidx_t *db)
     LOGD("type bitmaps: %u dirs, %u files", bs_count(&ti->dirs), bs_count(&ti->files));
 }
 
+/* The live set is derived from the tombstone flag, which is what lets a snapshot
+ * stay a plain dump of the columns: loading one rebuilds this exactly as a fresh
+ * build does, and no reconciliation state has to be persisted. */
+static void live_build(esidx_t *db)
+{
+    bs_free(&db->live);
+    uint32_t n = db->et.count;
+    if (bs_init(&db->live, n + 1) != 0) { LOGE("cannot allocate the live set"); return; }
+    uint32_t live = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (db->et.flags[i] & EF_DEAD) continue;
+        bs_set(&db->live, i);
+        live++;
+    }
+    LOGD("live set: %u of %u ids", live, n);
+}
+
 void esidx_finalize(esidx_t *db)
 {
     uint64_t t0 = ts_us();
+    live_build(db);
     di_hash_build(db);
     TSDONE2("finalize: dir path hash", t0, "(dirs=%u table=%u slots)",
             db->di.ht_count, db->di.ht_mask + 1);
@@ -481,15 +907,25 @@ void esidx_finalize(esidx_t *db)
     t0 = ts_us();
     type_index_build(&db->type, db);
     TSDONE("finalize: type bitmaps", t0);
+
+    /* From here on esidx_add() has to keep every one of the above in step. */
+    db->built = true;
 }
 
 void esidx_log_stats(const esidx_t *db, const char *phase)
 {
     if (!log_enabled(LOG_INFO)) return;
     const entry_table_t *et = &db->et;
-    uint64_t cols = (uint64_t)et->cap * (sizeof(eid_t) + 1 + 2 + 8 * 3 + 2 + sizeof(strref_t));
+    uint64_t cols = (uint64_t)et->cap * (sizeof(eid_t) + 1 + 2 + 8 * 4 + 2 + sizeof(strref_t));
     LOGI("%s: entries=%u names_pool=%zu bytes ext_pool=%zu bytes columns~%llu bytes",
          phase, et->count, db->names.len, db->exts.len, (unsigned long long)cols);
+    if (db->built) {
+        uint32_t live = bs_count(&db->live);
+        LOGI("%s: live=%u tombstones=%u (%.1f%%) epoch=%llu",
+             phase, live, et->count - live,
+             et->count ? 100.0 * (double)(et->count - live) / (double)et->count : 0.0,
+             (unsigned long long)db->epoch);
+    }
     const scan_stats_t *st = esidx_scan_stats(db);
     if (st->entries)
         LOGI("%s: scan dirs=%llu entries=%llu files=%llu dirs_found=%llu depth_max=%llu stat_ok=%llu stat_fail=%llu open_fail=%llu getdents=%llu calls/%llu bytes",
@@ -506,7 +942,11 @@ void esidx_log_stats(const esidx_t *db, const char *phase)
 /* --------------------------------------------------------------- snapshot */
 
 #define ESIDX_MAGIC   "ESIDX1"
-#define ESIDX_VERSION 1
+/* v2 adds the directory `stamp` column, which the reconcile compares against the
+ * filesystem (ref A2). A v1 snapshot has no stamps, so every update would treat
+ * every directory as changed -- correct, but it silently degrades the feature to
+ * a full rescan, which is not something a version check should let through. */
+#define ESIDX_VERSION 2
 
 static int w64(FILE *f, uint64_t v) { return fwrite(&v, 8, 1, f) == 1 ? 0 : -1; }
 static int w32(FILE *f, uint32_t v) { return fwrite(&v, 4, 1, f) == 1 ? 0 : -1; }
@@ -531,6 +971,7 @@ int esidx_save(const esidx_t *db, const char *path)
     wr(f, et->size,   et->count * sizeof(int64_t));
     wr(f, et->mtime,  et->count * sizeof(int64_t));
     wr(f, et->ctime,  et->count * sizeof(int64_t));
+    wr(f, et->stamp,  et->count * sizeof(int64_t));
     wr(f, et->ext_id, et->count * sizeof(uint16_t));
 
     for (uint32_t i = 0; i < et->count; i++) w32(f, et->name[i].off);
@@ -562,9 +1003,13 @@ int esidx_load(esidx_t *db, const char *path)
         fclose(f); return -1;
     }
     uint32_t ver;
-    if (r32(f, &ver) != 0 || ver != ESIDX_VERSION) {
-        LOGE("%s: unsupported version %u (expected %u)", path, ver, ESIDX_VERSION);
-        fclose(f); return -1;
+    if (r32(f, &ver) != 0) { fclose(f); return -1; }
+    if (ver != ESIDX_VERSION) {
+        LOGE("%s: snapshot version %u, this build writes %u -- rebuild it"
+             " (version 1 has no directory stamps, so every refresh would rescan)",
+             path, ver, ESIDX_VERSION);
+        fclose(f);
+        return -1;
     }
 
     uint64_t nlen, elen;
@@ -584,9 +1029,10 @@ int esidx_load(esidx_t *db, const char *path)
     et->size   = rd(f, et->count * sizeof(int64_t));
     et->mtime  = rd(f, et->count * sizeof(int64_t));
     et->ctime  = rd(f, et->count * sizeof(int64_t));
+    et->stamp  = rd(f, et->count * sizeof(int64_t));
     et->ext_id = rd(f, et->count * sizeof(uint16_t));
     if (!et->parent || !et->depth || !et->flags || !et->size ||
-        !et->mtime || !et->ctime || !et->ext_id) { fclose(f); return -1; }
+        !et->mtime || !et->ctime || !et->stamp || !et->ext_id) { fclose(f); return -1; }
 
     et->name = malloc(et->count * sizeof(strref_t) + 1);
     for (uint32_t i = 0; i < et->count; i++) r32(f, &et->name[i].off);
@@ -599,6 +1045,7 @@ int esidx_load(esidx_t *db, const char *path)
     uint64_t t1 = ts_us();
     db->root_eid = EID_NONE;
     for (uint32_t i = 0; i < et->count; i++) {
+        if (et->flags[i] & EF_DEAD) continue;   /* a tombstone is nobody's child */
         if (et->parent[i] == EID_NONE) db->root_eid = i;
         else di_add_child(&db->di, et->parent[i], i);
     }

@@ -23,6 +23,24 @@ void bs_free(bitset_t *b)
     b->nbits = 0;
 }
 
+/* Widen to at least `nbits`. Grown geometrically rather than to the exact
+ * request: a reconcile of one hot directory appends every child at once, and
+ * growing to `count+1` each time would make that O(k^2) in copied words. */
+int bs_reserve(bitset_t *b, uint32_t nbits)
+{
+    if (nbits <= b->nbits) return 0;
+    uint32_t want = b->nbits ? b->nbits * 2 : nbits;
+    if (want < nbits) want = nbits;
+    uint32_t nw = (want + 63) / 64;
+    uint32_t ow = (b->nbits + 63) / 64;
+    uint64_t *nw_w = realloc(b->w, (size_t)nw * sizeof(uint64_t));
+    if (!nw_w) return -1;
+    memset(nw_w + ow, 0, (size_t)(nw - ow) * sizeof(uint64_t));
+    b->w = nw_w;
+    b->nbits = want;
+    return 0;
+}
+
 void bs_set(bitset_t *b, uint32_t i)
 {
     if (i < b->nbits) b->w[i >> 6] |= (uint64_t)1 << (i & 63);
@@ -65,9 +83,26 @@ void bs_and(bitset_t *dst, const bitset_t *src)
     for (uint32_t i = nw; i < (dst->nbits + 63) / 64; i++) dst->w[i] = 0;
 }
 
-void bs_or(bitset_t *dst, const bitset_t *src)
+/* Every set operation is bounded by min(dst, src). The index bitmaps are grown
+ * geometrically by bs_reserve() and so can be wider than the scratch set the
+ * executor allocated for the current entry count; bounding by the source alone
+ * would read past the end of the destination. */
+
+/* Overwrite dst with src. bs_and() intersects, which is the wrong verb for
+ * seeding a fresh set from another one -- an empty set AND anything is empty. */
+void bs_copy(bitset_t *dst, const bitset_t *src)
 {
     uint32_t nw = (src->nbits + 63) / 64;
+    uint32_t dw = (dst->nbits + 63) / 64;
+    if (nw > dw) nw = dw;
+    memcpy(dst->w, src->w, (size_t)nw * sizeof(uint64_t));
+    for (uint32_t i = nw; i < dw; i++) dst->w[i] = 0;
+}
+
+void bs_or(bitset_t *dst, const bitset_t *src)
+{
+    uint32_t nw = (dst->nbits + 63) / 64;
+    if (src->nbits < dst->nbits) nw = (src->nbits + 63) / 64;
     for (uint32_t i = 0; i < nw; i++) dst->w[i] |= src->w[i];
 }
 

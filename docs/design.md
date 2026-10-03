@@ -395,11 +395,40 @@ rather than silently dropping subtrees.
 
 **Concurrency** (D6): adaptive to the medium, not yet implemented.
 
-**Incremental.** Directory-mtime skip [A2] as the privilege-free baseline;
-fanotify with `FAN_EVENT_ON_CHILD` [B1][B2][B3] when running as root, falling
-back to inotify [B8]. New directories are recursively scanned on create [B5];
-events are drained in batches [B7]; events under a deleted directory are
-skipped [B4].
+**Incremental.** Two passes over one walk, because a directory's mtime is a
+statement about its *own* entries and nothing else:
+
+| Pass | Stats | Correct for | `/usr`, idle | `/usr`, worst case |
+|---|---|---|---|---|
+| **names** | one per directory whose parent changed, plus every new file | anything that changes a name | **0.1 ms** (15 dirs) | 110 ms |
+| **deep** | every entry | also size, mtime and ctime | 4.23 s (8 590 dirs) | 4.23 s |
+
+Directory-mtime skip [A2] is the names pass: a directory whose mtime is unchanged
+is not descended into. The deep pass exists because we store size, mtime and ctime
+and plocate does not — those live on the *file*, so editing a file an hour ago
+moves nothing its parent can see, and `dm:today` over that file has to be right.
+Neither pass subsumes the other, and a build that ran only the cheap one would
+answer every name query correctly and every date query wrongly.
+
+Identity within a directory is the **name**, not the inode. Inode matching looks
+cheaper and is wrong twice over: ext4 recycles inodes, so a deleted file and its
+replacement merge into one row, and two hard links in one directory share an
+inode and collapse into one row. Matching names costs a `strcmp` per entry against
+children already in the index and makes both cases fall out correctly.
+
+fanotify [B1][B2][B3] replaces both passes with events when running as root, with
+the names pass kept as the repair path for whatever happened while the daemon was
+down; inotify [B8] is the unprivileged fallback. Events under a deleted directory
+are skipped [B4], a directory create triggers a recursive scan [B5], and events are
+drained in batches [B7]. Not started: until it exists, the periodic pass is the
+mechanism, and it is measurable (§10).
+
+**Mutation.** A removed entry keeps its row and its id and gains `EF_DEAD`; a
+`live` bitset is the single authority on what exists, and every query seeds its
+candidate set from it. Numeric changes go to the D3 delta with the old value
+retracted, `ext:`/`file:`/`folder:` bitmaps and the children vectors are maintained
+in place, and the dir-path hash erases with a tombstone rather than a backward
+shift. See §11 D8 for why ids are not reused.
 
 ---
 
@@ -530,17 +559,17 @@ Each row: source → what was taken → how it lands here → why it changed.
 | 4.2 | `path_of()` parent-chain rebuild | `store.c` | done; path materialisation pending §4.2 |
 | 5.1 | `dir_id → children`, `path → eid` hash | `store.c` | done |
 | 5.2 | trigram index, sorted/reversed name arrays | — | not started (P4); the in-memory scan is measured below and is the reason |
-| 5.3 | sorted array + delta buffer | `store.c` | structure done; the delta path has no writer until P2 |
+| 5.3 | sorted array + delta buffer | `store.c` | **done** — `sidx_update`/`sidx_erase` write the delta, D3's 1%/60 s merge is implemented, and the range read honours the retractions |
 | 5.4 | dense bitset | `index.c` | done; CRoaring at P4 (D7). Set algebra lives here, not in the executor |
 | 5.4 | ext bitmaps, file:/folder: bitmaps | `store.c` | done — built in `finalize`, so the snapshot format is unchanged |
-| 5.5 | aggregate columns + bubbling | — | not started (needs P2); `child-count:` is derived from the children vector instead |
+| 5.5 | aggregate columns + bubbling | — | not started; `child-count:` is derived from the children vector instead, and the vector *is* maintained across a removal — which is the part [B6] would have to get right |
 | 5.6-5.8 | content, dupe, sparse metadata | — | not started (P6) |
 | 6.1 | lexer → parser → AST | `lexer.c`, `parser.c` | **done** |
-| 6.2 | optimiser: selectivity estimate, driver selection | `query.c` | **done** for step 1-2 (exact cardinality per leaf, no histogram yet). Step 3 ordering and step 4 TopK not started — see below |
+| 6.2 | optimiser: selectivity estimate, driver selection | `query.c` | **done** for step 1-2 (exact cardinality per leaf, no histogram yet). Step 3 ordering and step 4 TopK not started — see below. The `size:`/`dm:`/`dc:` estimates are now upper bounds once the D3 delta is non-empty, because they count the main array without the retractions |
 | 6.3 | execution: candidates → bitmaps → matchers → sort → slice | `query.c` | **done**, including the second-stage FILTER_* pass |
-| 6.4 | result cache | `etp.c` | **done** — the full sorted set is kept and re-sliced |
+| 6.4 | result cache | `etp.c` | **done** — the full sorted set is kept and re-sliced, and invalidated by the index epoch |
 | 7 | full scan | `scan.c` | done; concurrency (D6) not started |
-| 7 | incremental | — | not started (P2) |
+| 7 | incremental | `scan.c` | **done** for the two reconcile passes and the mutation core; `esidx update <db> [--deep]`. fanotify/inotify not started |
 | 1-3 | FTP + `SITE EVERYTHING` | `etp.c` | **done** — all 32 subcommands, 22 sort names, the data channel for other FTP clients |
 
 **Two things in §6.2 deliberately not built**, with the reasoning recorded
@@ -565,6 +594,34 @@ with `./round.sh /usr`):
 |---|---|---|---|---|---|
 | `/etc` | 1 622 | 5.4 ms (298 k/s) | 0.4 ms | 0.3 ms | 95 KB |
 | `/usr` | 116 888 | 4.23 s (27.6 k/s) | 37-56 ms | 55 ms | 6.9 MB |
+
+**Incremental refresh**, same machine, same build, `-O2`, single thread. "Worst
+case" is every writable directory under `/usr` touched, so every stamp moved:
+
+| Pass | idle | worst case | what it costs |
+|---|---|---|---|
+| names | **0.1 ms** — 15 dirs (14 skipped, 1 descended), 14 entries seen | 110 ms — 7 776 dirs, 7 775 refreshed, 0 added/removed | one stat per directory whose parent changed |
+| deep | **4.23 s** — 8 590 dirs descended, 116 887 entries seen | same | one stat per entry |
+
+Four things these numbers settle:
+
+- **The cheap pass is the one to run often.** 0.1 ms on an unchanged 117 k-entry
+  tree means a 5 s interval costs 0.002 % of a core; the deep pass at 4.2 s means
+  a 10 min interval costs 0.7 %. Neither is a reason not to schedule them.
+- **A pass that finds nothing writes nothing to any index.** 0 added, 0 removed,
+  and — the part that matters for query latency — 0 delta rows, because
+  `esidx_touch` only reaches a sorted array when the column actually moved. So the
+  costs after a refresh are the costs before it: measured, `path:/usr *.conf
+  size:>1k` still spends 22.9 ms of eval over 78 296 candidates, `ext:conf`
+  0.05 ms, a browse 0.01 ms.
+- **The epoch does not move for a pass that found nothing** (`epoch=0` after four
+  idle passes on `/usr`). A refresh is invisible to the protocol layer's result
+  cache unless a query could actually return something different.
+- **Tombstones do not accumulate from a busy directory.** Rewriting one file in
+  `/usr/share` five times in a row costs 0.4-0.6 ms each and leaves one tombstone
+  from the final delete: the row is matched by name and refreshed in place. Ids
+  are only spent on names that genuinely appear or disappear, which is what makes
+  the D8 compaction threshold a safety net rather than routine work.
 
 `/usr` scan stats: 8 590 directories, 108 298 files, max depth 13, 567 distinct
 extensions. Finalize now also builds the ctime sorted array, the ext bitmaps and
@@ -683,13 +740,40 @@ P4 introduces CRoaring's single-header build behind an unchanged
 **Reason**: at fewer than 10⁷ entries a dense bitset is ~1.25 MB — irrelevant
 next to the string pool. Pulling in Roaring earlier only adds debugging surface.
 
+### D8 — Removal tombstones the row; ids are never reused
+
+**Decision**: `esidx_remove()` sets `EF_DEAD`, clears the id's `live` bit and
+leaves the row in place. Once tombstones exceed a quarter of the entry count,
+`esidx_compact()` rebuilds the index from the filesystem.
+
+**Reason**: the obvious alternative — a free list, handing a dead id to the next
+`esidx_add()` — looks free and is not. The id is referenced by the main sorted
+array (with the old value), by the delta (with a retraction of it), by the ext and
+type bitmaps, and by every `qset` the protocol layer is still holding. Reusing it
+means the retraction left in the delta can clear the *new* entry's bit, because the
+range reader walks the delta in order and a retraction always applies. The
+ordering that makes that safe would have to be enforced by every future writer.
+
+Tombstoning makes correctness local: `live` is the only authority on what exists,
+and it is derived from a flag in the column dump, so a snapshot round trip needs no
+reconciliation state at all — which is why the snapshot is still a plain dump of
+the columns and only gained the directory stamp.
+
+**Cost, measured**: memory grows with the tombstone ratio, and so does the
+per-query `bs_next` walk over the candidate words. Both are why compaction is
+automatic at 25 % rather than never — but §10 records that a tree whose *names*
+change costs nothing, so in practice the threshold is reached only by a workload
+that rewrites directories wholesale, and there a full rebuild is the cheaper
+answer anyway.
+
 ---
 
 ## 12. Risks
 
 1. **Histogram staleness** (§6.2) — after incremental changes the optimiser picks
    the wrong driver index. Mitigation: recompute on the same schedule as the D3
-   delta merge.
+   delta merge. Partly already true: the `size:`/`dm:`/`dc:` estimates count the
+   main array without its retractions, so they are upper bounds between merges.
 2. **`si:`** has no Linux counterpart. Parse it, reject it at execution time.
 3. **Regex cannot be indexed.** `regex:` is a full scan. Literal trigrams can be
    extracted from the pattern to pre-filter — plocate's `parse_trigrams` does
@@ -705,3 +789,21 @@ next to the string pool. Pulling in Roaring earlier only adds debugging surface.
 7. **`path_of()` is O(depth) with an allocation per call** [upstream-notes §3.4].
    Fine for display; will need the materialised path column once `path:`
    queries or deep trees make it a hotspot.
+8. **A periodic pass cannot see a change that happened *and was reverted*
+   between two passes** — or, more practically, a file whose attributes moved
+   while its parent's mtime did not is invisible to the names pass until the next
+   deep one. That is the whole reason the deep pass exists and the reason its
+   interval is a policy choice rather than a performance one. fanotify is the
+   real answer; until it lands, the honest statement is that the index is at most
+   one deep-pass interval behind on attributes.
+9. **Two text-matching bugs, both pre-existing and both found while writing the
+   incremental tests** (not fixed here — different layers, separate commits):
+   - `text_match()` retries every plain substring against the *backslash* path
+     form (`query.c:547`), so `name:nm` matches every row under `/tmp/nm`: a
+     term that names a file also matches every file below a directory of that
+     name. The retry is right for `path:` (the client does send backslashes) and
+     wrong for `name:`.
+   - `wc_match()`'s single-`*` loop (`regex.c:619`) exits on the end of the
+     subject without retrying the empty tail, so `*foo*` never matches anything
+     with characters after `foo`. `*.conf` works because the pattern ends in a
+     literal; the suite had no pattern ending in `*`.

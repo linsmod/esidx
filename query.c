@@ -663,6 +663,22 @@ static int bs_alloc(qctx_t *c, bitset_t *b)
     return bs_init(b, c->n);
 }
 
+/* Allocate a set holding every entry that still exists.
+ *
+ * A removed entry keeps its id and its row (design §11 D8), so "the id is inside
+ * the table" is not the same as "the entry is in the index". Every set that can
+ * become a final result starts here rather than from bs_set_all(), which is what
+ * keeps a tombstone out of the results without any of the forty matchers having
+ * to know that removals exist. Sets built as `bs_alloc_full` for an OR or a NOT
+ * do contain tombstones -- they are intermediates that are always combined into
+ * a live-seeded set with bs_and / bs_or / bs_andnot, never returned. */
+static int bs_alloc_live(qctx_t *c, bitset_t *b)
+{
+    if (bs_init(b, c->n) != 0) return -1;
+    bs_copy(b, &c->db->live);
+    return 0;
+}
+
 /* Allocate a scratch set that already holds every entry.
  *
  * This matters more than it looks. Matchers *intersect* with whatever set they
@@ -995,9 +1011,9 @@ static int m_child(qctx_t *c, const ast_t *t, bitset_t *out)
     /* the nested search runs unconstrained against the whole table */
     bitset_t keep_cand = c->cand;
     uint32_t keep_cnt = c->cand_count;
-    bs_set_all(&inner, c->n);
+    bs_copy(&inner, &c->db->live);
     c->cand = inner;
-    c->cand_count = c->n;
+    c->cand_count = bs_count(&inner);
     int rc = eval_node(c, t->sub, &inner);
     c->cand = keep_cand;
     c->cand_count = keep_cnt;
@@ -1549,7 +1565,6 @@ int qexec(const esidx_t *db, const ast_t *ast_in, const match_opts_t *mo,
     c.n = db->et.count;
 
     uint64_t t_plan0 = ts_us();
-    if (bs_alloc(&c, &c.cand) != 0) return -1;
 
     /* ---- steps 1 and 2: driver selection, then candidate seeding ---- */
     if (ast) {
@@ -1562,7 +1577,7 @@ int qexec(const esidx_t *db, const ast_t *ast_in, const match_opts_t *mo,
              * seed has to start as "everything" and be narrowed by the driver --
              * which also makes re-running the driver during the tree walk
              * idempotent. */
-            bs_set_all(&c.cand, c.n);
+            if (bs_alloc_live(&c, &c.cand) != 0) { qctx_done(&c); return -1; }
             if (eval_leaf(&c, leaf, &c.cand) != 0) { qctx_done(&c); return -1; }
             out->seed = bs_count(&c.cand);
             out->driver = leaf->uid;
@@ -1572,11 +1587,11 @@ int qexec(const esidx_t *db, const ast_t *ast_in, const match_opts_t *mo,
             LOGD("plan: driver=%s%s estimated=%u actual=%u of %u entries (%u leaves)",
                  fn, val, best, out->seed, c.n, nleaf);
         } else {
-            bs_set_all(&c.cand, c.n);
-            LOGD("plan: no index-backed leaf; all %u entries are candidates", c.n);
+            if (bs_alloc_live(&c, &c.cand) != 0) { qctx_done(&c); return -1; }
+            LOGD("plan: no index-backed leaf; all %u entries are candidates", bs_count(&c.cand));
         }
     } else {
-        bs_set_all(&c.cand, c.n);
+        if (bs_alloc_live(&c, &c.cand) != 0) { qctx_done(&c); return -1; }
     }
     c.cand_count = bs_count(&c.cand);
     out->t_plan_us = ts_us() - t_plan0;

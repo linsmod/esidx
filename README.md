@@ -22,15 +22,16 @@ behaviour carry over.
 ## Status
 
 Under active development. The index engine, the query language and the ETP server
-are all built and tested; **a client can connect and search today.** What is
-missing is staying current: collection is a full scan only, so a long-running
-server serves a stale index until it is restarted.
+are all built and tested; **a client can connect and search today.** An index can
+also be brought back in line with the filesystem without a rebuild, so it no longer
+goes stale while a server runs. What is still missing is *immediacy*: freshness
+comes from a periodic pass rather than from filesystem events.
 
 | Phase | Scope | State |
 |---|---|---|
 | P0 | columnar store, directory tree, L0/L1 capability, sort, paging | done |
 | P1 | FTP + `SITE EVERYTHING`, 32 subcommands, result cache | done |
-| P2 | incremental collection: directory-mtime skip, fanotify | full scan done, incremental not started |
+| P2 | incremental collection: directory-mtime skip, fanotify | reconcile + mutation core done (`esidx update`, 0.1 ms idle on `/usr`); fanotify not started |
 | P3 | full query-language parser: 40+ functions, 12 comparisons, modifiers, constants, macros | done |
 | P4 | name/path trigram index, prefix/suffix search, CRoaring, query optimiser | driver selection done; trigram/CRoaring not started |
 | P5 | content inverted index, sparse media metadata, `dupe:` | not started |
@@ -54,8 +55,8 @@ Requires a Linux target (ext4), GCC or Clang with C11, and `make`.
 Three suites, all runnable from a clean checkout:
 
 ```sh
-./test.sh              # index and query correctness   (109 assertions)
-./test_etp.sh          # protocol acceptance           (201 assertions)
+./test.sh              # index and query correctness   (165 assertions)
+./test_etp.sh          # protocol acceptance           (207 assertions)
 make test-all          # both, in that order
 
 ./round.sh             # one full round on a real tree, with timings
@@ -98,10 +99,23 @@ inside a `mktemp` directory, leaving the source tree clean.
 # page
 ./esidx query /etc.idx 'ext:conf' 'count:20' 'offset:40'
 
+# bring an existing index back in line with the filesystem
+./esidx update /etc.idx
+#   updated /etc.idx: 1622 live entries (was 1622, +0), 91 dirs (90 skipped,
+#   1 descended), 0 added, 0 removed, 90 refreshed in 0.3 ms
+./esidx update /etc.idx --deep     # also re-stat every entry (size, mtime, ctime)
+
 # serve ETP -- what the ETP client speaks
 ./esidx serve /etc.idx -p 2121
 #   esidx serving 1622 entries from /etc.idx on 127.0.0.1:2121 (loaded in 0.3 ms)
 ```
+
+`update` is the same walk in two modes. Without `--deep` it stats one directory
+per changed subtree and notices name changes; on an unchanged `/usr` that is
+15 stats and 0.1 ms. With `--deep` it stats every entry, which is what notices a
+file whose *content* changed — that moves the file's own mtime and nothing its
+parent can see — and costs 4.2 s on `/usr`. Both are safe to run repeatedly: a
+pass that finds nothing writes nothing to any index.
 
 ### Supported query language
 
@@ -205,12 +219,23 @@ costs a third of a millisecond because it walks 14 rows. The 24.3 ms outlier is 
 wildcard scan over 78 296 candidates — the in-memory text scan of design §5.2, and
 the measurement that says its 10⁶-entry activation threshold is too optimistic.
 
+Staying current costs this, measured on the same tree:
+
+| Pass | Idle | Worst case | What it costs |
+|---|---|---|---|
+| `update` | **0.1 ms** | 110 ms | one stat per directory whose parent changed |
+| `update --deep` | 4.23 s | 4.23 s | one stat per entry |
+
+A pass that finds nothing writes nothing to any index and does not move the index
+epoch, so it is invisible to a connected client — the query costs above are the
+query costs after a refresh.
+
 
 ## Documentation
 
 | File | Contents |
 |---|---|
-| [`docs/design.md`](docs/design.md) | architecture, capability → index mapping, implementation status, decisions D1-D7, risks |
+| [`docs/design.md`](docs/design.md) | architecture, capability → index mapping, implementation status, decisions D1-D8, risks |
 | [`docs/everything-syntax.md`](docs/everything-syntax.md) | the full Everything query language |
 | [`docs/upstream-notes.md`](docs/upstream-notes.md) | what plocate and FSearch do, with `file:line` citations, and what we took from each |
 | [`docs/research-log.txt`](docs/research-log.txt) | raw research log, kept for provenance only |
@@ -237,15 +262,15 @@ The protocol baseline is in-repo at `../etp_server-1.0.2.5/`
 esidx.h        public storage types and API
 syntax.h       AST, parser, ETP match options, executor and regex contracts
 etp.h          ETP server options
-store.c        string pool, columnar table, directory tree, ext/type bitmaps, snapshot
-scan.c         full scan
+store.c        string pool, columnar table, directory tree, ext/type bitmaps, mutation, snapshot
+scan.c         full scan, incremental reconcile
 index.c        dense bitset and set algebra
 lexer.c        the Everything token rules
 parser.c       tokens -> AST
 regex.c        backtracking regex + Everything wildcards
 query.c        matcher table, driver selection, two-stage execution, sorting
 etp.c          FTP control + SITE EVERYTHING
-main.c         CLI: build / query / serve
+main.c         CLI: build / update / query / serve
 log.c log.h    leveled logging, runtime-switchable
 timer.h        monotonic phase timing helpers
 tools/etp_probe.c   the acceptance client (built by `make etp-probe`)
