@@ -566,7 +566,7 @@ Each row: source → what was taken → how it lands here → why it changed.
 | 5.6-5.8 | content, dupe, sparse metadata | — | not started (P6) |
 | 6.1 | lexer → parser → AST | `lexer.c`, `parser.c` | **done** |
 | 6.2 | optimiser: selectivity estimate, driver selection | `query.c` | **done** for step 1-2 (exact cardinality per leaf, no histogram yet). Step 3 ordering and step 4 TopK not started — see below. The `size:`/`dm:`/`dc:` estimates are now upper bounds once the D3 delta is non-empty, because they count the main array without the retractions |
-| 6.3 | execution: candidates → bitmaps → matchers → sort → slice | `query.c` | **done**, including the second-stage FILTER_* pass |
+| 6.3 | execution: candidates → bitmaps → matchers → sort → slice | `query.c` | **done**, including the second-stage FILTER_* pass. The text matcher implements Everything's rule for *what a term reads* — the filename, or the path once the value carries a separator or says `path:` — verified shape by shape against voidtools' server; §12.10 has the table and the two shapes still open |
 | 6.4 | result cache | `etp.c` | **done** — the full sorted set is kept and re-sliced, and invalidated by the index epoch |
 | 7 | full scan | `scan.c` | done; concurrency (D6) not started |
 | 7 | incremental | `scan.c` | **done** for the two reconcile passes and the mutation core; `esidx update <db> [--deep]`. fanotify/inotify not started |
@@ -797,13 +797,53 @@ answer anyway.
    real answer; until it lands, the honest statement is that the index is at most
    one deep-pass interval behind on attributes.
 9. **Two text-matching bugs, both pre-existing and both found while writing the
-   incremental tests** (not fixed here — different layers, separate commits):
-   - `text_match()` retries every plain substring against the *backslash* path
-     form (`query.c:547`), so `name:nm` matches every row under `/tmp/nm`: a
-     term that names a file also matches every file below a directory of that
-     name. The retry is right for `path:` (the client does send backslashes) and
-     wrong for `name:`.
-   - `wc_match()`'s single-`*` loop (`regex.c:619`) exits on the end of the
-     subject without retrying the empty tail, so `*foo*` never matches anything
-     with characters after `foo`. `*.conf` works because the pattern ends in a
+   incremental tests** — both fixed now, and both pinned against the reference
+   rather than against our reading of the code:
+   - `text_match()` retried every plain substring against the *backslash* path
+     form (`wire_form()`), so `name:nm` matched every row under `/tmp/nm`: a term
+     that names a file also matched every file below a directory of that name. The
+     retry is right for `path:` (the client does send backslashes) and wrong for
+     `name:`. It is now scoped to the terms that read a path, which is what
+     Everything does — measured on one directory against voidtools' own server on
+     :21: `esidx` answers 3 there, the three entries *named* esidx, where reading
+     the path as well would answer 280.
+   - `wc_match()`'s single-`*` loop (`regex.c:619`) exited on the end of the
+     subject without retrying the empty tail, so `*foo*` never matched anything
+     with characters after `foo`. `*.conf` worked because the pattern ends in a
      literal; the suite had no pattern ending in `*`.
+
+10. **The scope of a term is `text_match()`'s decision, and it takes three rules,
+    not one.** Measured on one directory, ref = voidtools' server on :21 and ours on
+    the same tree. Every row now agrees; the 12 in the `path:esidx` row is the
+    reference's index holding 12 entries in that tree that WSL cannot see, and it
+    is the same 12 in every path-scoped count (6590 vs 6578 for the directory
+    itself).
+
+    | term | ref | ours | rule |
+    |---|---|---|---|
+    | `esidx`, `name:esidx`, `*esidx*`, `regex:esidx`, `ww:esidx` | 3 | 3 | no separator in the value: the **filename** |
+    | `path:esidx`, `esidx\main.c` | 280 / 1 | 268 / 1 | `path:`, or a separator in the value: the **path** |
+    | `esidx` + sep + `*` (either spelling) | 38 | 38 | `find -maxdepth 1` says 38: the direct children |
+    | `sidx` + sep + `*` | 0 | 0 | a wildcard may not begin inside a component |
+    | `*esidx/main.c`, `path:*/main.c`, `folder: esidx` + sep + `*` | 1 / 1 / 3 | same | |
+    | `path:*esidx*`, `path:*PC*`, `path:**esidx**` | 280 / 6590 / 280 | 268 / 6578 / 268 | `path:` + a leading star: **contains** |
+    | `path:*esidx` | 2 | 2 | no trailing star: ends-with |
+    | `path:*PC/esidx*` | 1 | 1 | a value with a separator is a fragment, and a fragment's trailing star cannot cross one |
+    | `path:esidx*`, `path:**esidx**` | 3 / 280 | 3 / 268 | no leading star: anchored at a component |
+
+    So: a leading star in an explicit `path:` value is what makes it a `contains`
+    test, and that is the only place a single star crosses a separator. Everything
+    else — a bare term with a separator in it, and a `path:` value without a
+    leading star — is anchored at a component boundary with a star that stops at
+    the next one. `*PC/esidx*` (bare) is the shape that keeps this honest: contains
+    would be 267 there and the reference says 1.
+
+11. **A wildcard over a path is a scan over several offsets of every path.** The
+    candidate offsets are the component boundaries and the separators, so an
+    *anchored* path term with a star costs O(path length × pattern) per row:
+    1.8 ms of eval for `esidx/*` over 6577 entries, against 0.4 ms for the bare
+    `esidx` on the same tree and 2.1 ms for the substring `path:esidx`. The
+    contains form is not in that class at all — `path:*esidx*` is one
+    `strcasestr` over the path, 1.0 ms, because a star on both ends of a value
+    means "occurs anywhere" and nothing else.
+

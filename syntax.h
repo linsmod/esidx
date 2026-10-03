@@ -221,6 +221,12 @@ const char *re_error(void);
  * to the whole filename, so ask wildcard_present() to find out which mode the
  * caller is in. */
 int wildcard_match(const char *pat, const char *s, int nocase);
+/* The unanchored form, for a pattern that searches a *path* rather than a whole
+ * filename: it looks for the pattern anywhere in the subject. `*` still refuses
+ * to cross a separator, so `esidx` + separator + star is the direct children and
+ * not the subtree. (Written out in pieces: a literal slash-star in a C comment
+ * opens a nested comment and -Wcomment says so, once per file.) */
+int wildcard_match_in(const char *pat, const char *s, int nocase);
 int wildcard_present(const char *pat);
 
 #endif /* ESIDX_SYNTAX_H */

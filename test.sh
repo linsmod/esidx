@@ -319,6 +319,66 @@ q "endwith:onf"            ; expect "endwith: no word boundary" "$(n "$LAST")" "
 q "suffix:onf"             ; expect "suffix: needs a word boundary" "$(n "$LAST")" "0"
 q "*.conf"                   ; expect "* is a wildcard over the whole name" "$(n "$LAST")" "3"
 q "?.conf"                   ; expect "? is one character"        "$(n "$LAST")" "3"
+
+# The next three blocks are the term-scope rules, pinned against the reference
+# server rather than against our reading of the code (the numbers in the comments
+# are `etp-probe` against voidtools' own server on :21, over one directory that
+# both servers index).
+#
+# `*` means "any characters, 0 or more" (everything-syntax.md L10-15), so a
+# trailing `*` has to be able to match the *empty* remainder -- otherwise the only
+# patterns that work are the ones whose literal ends at the end of the name:
+#   reference :21   *ZZZ*  ->  423 rows, incl. aaaZZZbbb.txt
+#   this build        *ZZZ*  ->  0
+# Here `on` sits strictly inside b.conf / c.conf / sub1/x.conf, while `conf` sits
+# at the end -- so the pair is the whole bug: same shape, position is all that
+# differs.
+q "*conf*"                   ; expect "*conf* (literal at the end) works"  "$(n "$LAST")" "3"
+q "*on*"                     ; expect "*on* (literal inside) works too"   "$(n "$LAST")" "3"
+q "name:*on*"                ; expect "name: with a trailing *"           "$(n "$LAST")" "3"
+# `name:` is the filename and a bare word is the filename too. Everything does
+# not fall back to the path, so a term naming one entry does not match everything
+# below a directory of that name:
+#   reference :21   name:sub1  ->  1 (the directory)
+#   this build        name:sub1  ->  3 (the directory and both things in it)
+q "name:sub1"                ; expect "name: is the filename, not the path" "$(n "$LAST")" "1"
+q "sub1"                     ; expect "a bare word is too"        "$(n "$LAST")" "1"
+q "regex:sub1"               ; expect "and so is an unanchored regex" "$(n "$LAST")" "1"
+q "path:sub1"                ; expect "path: still reads the path" "$(n "$LAST")" "4"
+# ...and the scope is the filename for a wildcard term too, which is the other
+# half of the same rule: `*sub1*` is the one directory, not the 4 entries whose
+# path mentions it.
+q "*sub1*"                   ; expect "a wildcard term is the filename as well" "$(n "$LAST")" "1"
+
+# A separator in the value switches the term to the path -- Everything's own
+# widening, measured on one directory against voidtools' server on :21 (the numbers
+# in the comments are the reference's; the counts below are the fixture's, which is
+# flat and small so a reader can check them by hand):
+#   esidx + sep + *   ->  38      esidx\main.c ->  1      folder: esidx + sep + * ->  3
+#   sidx + sep + *    ->   0      *esidx/main.c ->  1      path:*/main.c ->  1
+# 38 is what `find <dir>/esidx -mindepth 1 -maxdepth 1 | wc -l` says, so the star is
+# the direct children and not the subtree; and `sidx` -> 0 is what says a wildcard
+# may not begin inside a component -- while the literal `sidx/main.c` is 1, because
+# a literal with a separator is a substring and not a pattern.
+q 'sub1/x.conf'              ; expect "a separator in the value reads the path" "$(n "$LAST")" "1"
+q 'sub1\*.conf'              ; expect "a backslash separates there too"  "$(n "$LAST")" "1"
+q 'sub1/*'                   ; expect "a star stops at the next separator" "$(n "$LAST")" "2"
+q 'ub1/*'                    ; expect "a wildcard may not start mid-component" "$(n "$LAST")" "0"
+q 'ub1/x.conf'               ; expect "but a literal may: it is a substring" "$(n "$LAST")" "1"
+# `path:` + a value that *starts* with a star is Everything's contains form -- the
+# one shape where a star crosses a separator. Reference, same directory:
+#   path:*esidx*   ->  280 = every path containing esidx (ours 268: the reference's
+#                     index holds 12 entries in that tree that WSL cannot see)
+#   path:*PC*      -> 6590 = everything, because every path contains "PC"
+#   path:*esidx    ->    2 = the paths *ending* in esidx, so no trailing star still
+#                     means ends-with
+#   path:*PC/esidx*->    1 = ends_with("PC/esidx"), because a value with a separator
+#                     in it is a fragment and a fragment's trailing star cannot cross
+q 'path:*x.conf'             ; expect "path: with a leading star"      "$(n "$LAST")" "1"
+q 'path:*sub1*'              ; expect "a leading star makes it contains" "$(n "$LAST")" "4"
+q 'path:*sub1/x.conf'        ; expect "but a fragment stays anchored"  "$(n "$LAST")" "1"
+q 'path:*conf'               ; expect "no trailing star means ends-with" "$(n "$LAST")" "3"
+q 'folder: sub1/*'           ; expect "and it combines with folder:"    "$(n "$LAST")" "1"
 q "regex:^b.*conf\$"         ; expect "regex:"                    "$(n "$LAST")" "1"
 q 'path:regex:sub1/deep$'    ; expect "modifiers stack in the value" "$(n "$LAST")" "1"
 q 'path:regex:[a-z]\.conf$'  ; expect "regex classes and escapes"  "$(n "$LAST")" "3"

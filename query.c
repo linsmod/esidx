@@ -413,6 +413,17 @@ static bool wire_form(const esidx_t *db, eid_t id, scratch_t *sc)
 /* Whole-word test used by ww: and by prefix:/suffix: on a word boundary. */
 static int is_word_char(unsigned char c) { return isalnum(c) || c == '_' || c >= 0x80; }
 
+/* Does the string end with this suffix? The tail of a `path:` value is anchored
+ * this way -- `path:*esidx` is the two entries whose path ends in "esidx" on the
+ * reference, not the 267 that contain it. */
+static int ends_with(const char *s, const char *suf, int nocase)
+{
+    size_t sl = strlen(s), fl = strlen(suf);
+    if (fl > sl) return 0;
+    return nocase ? strcasecmp(s + (sl - fl), suf) == 0
+                  : strcmp(s + (sl - fl), suf) == 0;
+}
+
 static int text_match(const esidx_t *db, eid_t id, const ast_t *t,
                       const match_opts_t *mo, scratch_t *sc)
 {
@@ -429,8 +440,28 @@ static int text_match(const esidx_t *db, eid_t id, const ast_t *t,
         if (mo->match_diacritics)   m |= MOD_DIACRITICS;
     }
 
+    const char *pat = t->val ? t->val : "";
+
+    /* An unqualified term is a *filename* term, and the reference is emphatic
+     * about it: on one directory, `esidx` answers 3 -- the three entries named
+     * esidx -- where reading the path as well would answer 280, and `regex:esidx`
+     * answers the same 3 (etp-probe against voidtools' own server on :21).
+     *
+     * Everything widens the term to the full path the moment the value carries a
+     * separator, though: `esidx\main.c` answers 1 and `esidx\*` answers 38 on that
+     * same directory. So the separator is the switch, MOD_PATH is that switch said
+     * out loud, and both of them select the same subject.
+     *
+     * The wire_form() retry that follows belongs to the same half of the rule. The
+     * client builds its patterns out of the paths it was handed, and the paths it
+     * was handed are the backslash-separated ones the ETP PATH column carries, so
+     * a pattern written for `C:\Users\x` cannot match `/home/x` (round trip
+     * observed, AGENTS.md 5.1). Running that retry for a *name* is what turned
+     * `name:sub1` and a bare `sub1` into "the directory and both things in it". */
+    const int path_scope = (m & MOD_PATH) || strpbrk(pat, "/\\") != NULL;
+
     const char *subj;
-    if (m & MOD_PATH) {
+    if (path_scope) {
         /* fn:path / path: / path-part: all read the full path */
         if (!sc->buf) { sc->buf = malloc(65536); sc->cap = 65536; }
         if (!sc->buf) return 0;
@@ -439,8 +470,6 @@ static int text_match(const esidx_t *db, eid_t id, const ast_t *t,
     } else {
         subj = name_of(db, id);
     }
-
-    const char *pat = t->val ? t->val : "";
 
     /* stem: drops the extension before matching */
     if (t->fn && !strcmp(t->fn, "stem")) {
@@ -458,12 +487,9 @@ static int text_match(const esidx_t *db, eid_t id, const ast_t *t,
             return 0;
         }
         int hit = re_match(re, subj);
-        /* The client builds its regexes from the paths it was given, and the
-         * paths it was given are the backslash-separated ones the ETP PATH column
-         * carries. Retry against that spelling, or every pattern the client sends
-         * silently misses on a POSIX host. The retry has to happen BEFORE the free
-         * -- using `re` afterwards is a use-after-free that -O2 hides. */
-        if (!hit) hit = wire_form(db, id, sc) ? re_match(re, sc->buf) : 0;
+        /* The retry has to happen BEFORE the free -- using `re` afterwards is a
+         * use-after-free that -O2 hides. */
+        if (!hit && path_scope) hit = wire_form(db, id, sc) ? re_match(re, sc->buf) : 0;
         re_free(re);
         return hit;
     }
@@ -477,7 +503,7 @@ static int text_match(const esidx_t *db, eid_t id, const ast_t *t,
         normalise(subj, nb, sizeof(nb), nm);
         if (!pb[0]) return 1;                    /* the term reduced to nothing */
         if (strcasestr(nb, pb)) return 1;
-        if (wire_form(db, id, sc)) {
+        if (path_scope && wire_form(db, id, sc)) {
             normalise(sc->buf, nb, sizeof(nb), nm);
             return strcasestr(nb, pb) != NULL;
         }
@@ -485,13 +511,62 @@ static int text_match(const esidx_t *db, eid_t id, const ast_t *t,
     }
 
     if (wildcard_present(pat)) {
-        /* A wildcard means "the whole filename" (everything-syntax.md L35), so
-         * startwith:/endwith: cannot combine with one: there is no way to say
-         * "starts with" and "matches the whole string" at once. */
-        if (wildcard_match(pat, subj, !(m & MOD_CASE))) return 1;
-        if (wire_form(db, id, sc))
-            return wildcard_match(pat, sc->buf, !(m & MOD_CASE));
-        return 0;
+        const int nocase = !(m & MOD_CASE);
+        /* A wildcard in a *filename* means "the whole filename"
+         * (everything-syntax.md L35), so startwith:/endwith: cannot combine with
+         * one: there is no way to say "starts with" and "matches the whole string"
+         * at once. */
+        if (!path_scope) return wildcard_match(pat, subj, nocase);
+
+        /* In a *path* it means "somewhere in here" (see wildcard_match_in), and
+         * `\` is a separator there rather than an escape -- the reference answers
+         * 38 for "esidx", a backslash and a star, the same 38 it answers with a
+         * forward slash, and the same 38 `find -maxdepth 1` counts, so the
+         * backslash is not escaping the star. Comparing both sides in POSIX
+         * spelling is what makes the client's own spelling work without a second
+         * pass over the wire form. */
+        static __thread char ppat[4096];
+        size_t o = 0;
+        for (const char *p = pat; *p && o < sizeof(ppat) - 1; p++)
+            ppat[o++] = (*p == '\\') ? '/' : *p;
+        ppat[o] = '\0';
+
+        /* `path:` with a leading star is Everything's contains form, and it is the
+         * only shape where a star crosses a separator. On one directory the
+         * reference answers 280 for `path:*esidx*`, which is every path containing
+         * esidx, and 6590 -- all of them -- for `path:*PC*`, because every path
+         * contains "PC". So it is `full_path.contains(literal)` and nothing more:
+         * the stars at the ends are what makes it a contains test, and what is
+         * left between them is the literal to look for.
+         *
+         * A value that is itself a path fragment is the exception, and the
+         * exception is the trailing star: `path:*PC/esidx*` is 1 there, which is
+         * `ends_with("PC/esidx")`, where contains would be 267 -- the star cannot
+         * reach across the separator that is in the value. Same reference, same
+         * tree. And with no trailing star at all it is ends-with either way:
+         * `path:*esidx` is the 2 entries whose path ends in esidx.
+         *
+         * The leading star is what buys any of this. `path:esidx*` is the same
+         * directory's 3 -- the entries *named* esidx -- and a bare `*PC/esidx*` is 1
+         * where contains would be 267, so neither an anchored path: value nor a
+         * bare term with a separator in it may take this branch. */
+        if ((m & MOD_PATH) && ppat[0] == '*') {
+            const char *body = ppat + 1;
+            while (*body == '*') body++;
+            size_t blen = strlen(body);
+            bool open = blen && body[blen - 1] == '*';
+            while (open && blen && body[blen - 1] == '*') blen--;
+            static __thread char lit[4096];
+            if (blen >= sizeof(lit)) blen = sizeof(lit) - 1;
+            memcpy(lit, body, blen);
+            lit[blen] = '\0';
+            if (!strpbrk(lit, "/") && open)      /* path:*abc* -- abc occurs anywhere */
+                return (nocase ? strcasestr(subj, lit) : strstr(subj, lit)) != NULL;
+            /* an interior star survives as a literal, which no path holds, so those
+             * shapes fail closed rather than matching something odd */
+            return ends_with(subj, lit, nocase);
+        }
+        return wildcard_match_in(ppat, subj, nocase);
     }
 
     if (m & MOD_WHOLE)
@@ -543,8 +618,7 @@ static int text_match(const esidx_t *db, eid_t id, const ast_t *t,
 
     if (!*pat) return 1;
     if (strcasestr(subj, pat)) return 1;
-    /* the same fallback as the regex branch */
-    if (wire_form(db, id, sc)) return strcasestr(sc->buf, pat) != NULL;
+    if (path_scope && wire_form(db, id, sc)) return strcasestr(sc->buf, pat) != NULL;
     return 0;
 }
 

@@ -623,7 +623,13 @@ static int wc_match(const char *pat, const char *s, int nocase)
                 if (*s == '/' || *s == '\\') return 0;
                 if (wc_match(np, s, nocase)) return 1;
             }
-            return 0;
+            /* The loop stops on the terminating NUL without ever offering it as a
+             * position, so a `*` that has to swallow the tail of the name -- and a
+             * `*` may match nothing, so the tail may be empty -- was unreachable.
+             * `*conf*` happened to work because its literal ran to the end of the
+             * name, and `*on*` did not, because `on` does not: `b.conf` matched
+             * `conf*` against "" and `on*` against "f" was never tried. */
+            return wc_match(np, s, nocase);
         }
         if (!*s) {
             /* a trailing separator in the pattern is optional, so both `foo\`
@@ -682,6 +688,37 @@ int wildcard_match(const char *pat, const char *s, int nocase)
 {
     if (!pat || !s) return 0;
     return wc_match(pat, s, nocase);
+}
+
+/* The same match, unanchored: find the pattern anywhere in the subject.
+ *
+ * Everything anchors a wildcard to the whole *filename* (everything-syntax.md
+ * L35), which is what wildcard_match() does, but a `*` in a *path* finds its
+ * pattern anywhere in the path instead. Measured against voidtools' server on :21
+ * over one directory: "esidx", a separator and a star answers 38 there, and 38 is
+ * exactly what `find <dir>/esidx -mindepth 1 -maxdepth 1 | wc -l` says -- the
+ * direct children, not the subtree and not zero. An anchored whole-path match
+ * could not produce that: the pattern cannot consume a path that starts at
+ * `/mnt/c/`.
+ *
+ * The candidate start offsets are the ends of the path, the beginnings of its
+ * components, and the separators themselves -- a `*` may match nothing, so
+ * `path:` + a star + a separator + "main.c" finds the separator that ends
+ * `esidx/` even though the pattern begins with a component boundary the reference
+ * does not offer. What it may not do is begin *inside* a component: the reference
+ * answers 38 for "esidx", a separator and a star, and 0 for the same pattern with
+ * the leading `e` dropped. The `*` in wc_match() still refuses to cross a
+ * separator, which is what holds that count at the direct children. */
+int wildcard_match_in(const char *pat, const char *s, int nocase)
+{
+    if (!pat || !s) return 0;
+    for (const char *start = s;; start++) {
+        int sep = (*start == '/' || *start == '\\' ||
+                   start == s || start[-1] == '/' || start[-1] == '\\');
+        if (sep && wc_match(pat, start, nocase)) return 1;
+        if (!*start) break;
+    }
+    return 0;
 }
 
 int wildcard_present(const char *pat)
