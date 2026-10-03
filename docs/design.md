@@ -814,10 +814,12 @@ answer anyway.
 
 10. **The scope of a term is `text_match()`'s decision, and it takes three rules,
     not one.** Measured on one directory, ref = voidtools' server on :21 and ours on
-    the same tree. Every row now agrees; the 12 in the `path:esidx` row is the
-    reference's index holding 12 entries in that tree that WSL cannot see, and it
+    the same tree — every number in the table is re-measurable with `./cmp_ref.sh`,
+    which is also the term list. Every row agrees; the 12 in the `path:esidx` row is
+    the reference's index holding 12 entries in that tree that WSL cannot see, and it
     is the same 12 in every path-scoped count (6590 vs 6578 for the directory
-    itself).
+    itself), which is why `cmp_ref.sh` prints it once and marks those rows
+    `= delta`.
 
     | term | ref | ours | rule |
     |---|---|---|---|

@@ -12,6 +12,15 @@ subcommands rather than by sending a raw query string: it sets match options
 server turns those into a query internally. See [`design.md`](design.md) §1 for
 the subcommand list and §6 for the execution model.
 
+**What this document does not settle.** Everything's own documentation does not
+say which text an *unqualified* search term is matched against, and it does not
+say what a wildcard inside a `path:` value does. Both had to be measured against
+voidtools' own server rather than read off: design §12.10 has the table, and
+`./cmp_ref.sh` re-measures every row of it. In one line — a term with no
+separator in it matches the **filename**, a term with a separator in it (or an
+explicit `path:`) matches the **path**, and `path:` with a value that starts with
+a star is a "contains anywhere in the path" test.
+
 ---
 
 ## Operators — L2-8

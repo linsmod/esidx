@@ -55,9 +55,19 @@ Each layer has its own suite, and they are separate files on purpose:
 | `test.sh` | the **index**, against `find(1)`; plus a **language** suite against a flat fixture | scan, storage or parsing is wrong |
 | `test_etp.sh` | the **wire**, against the ETP client's own parsing rules | a reply would not be understood by the client |
 | `round.sh` | nothing — it is the end-to-end demonstration and the source of the numbers in the docs | (prints timings; asserts nothing) |
+| `cmp_ref.sh` | nothing — it re-measures every expected value quoted against the reference server (§1.4) | (prints a table; `--strict` exits 1 on a row the index delta does not explain) |
 
 Run the index suite before the protocol suite. A parse regression shows up as a
 protocol failure otherwise, and you will spend an hour in the wrong file.
+
+**A number in a comment is only worth something if the command that produced it is
+in the repo.** Every expected value this project quotes against the reference —
+in `test.sh`, in a commit message, in design §12 — comes from `./cmp_ref.sh`, which
+asks both servers the same question over one directory they both index, with the
+only difference being the spelling of the path. If you measure something against
+`:21` and it is not in that script's term list, the next reader cannot re-check it
+and the number decays into folklore. Add the term there in the same commit.
+
 
 ### 1.4 The official client as a test peer
 
@@ -492,6 +502,7 @@ here first.
 | query surface | `syntax.h` |
 | protocol options | `etp.h` |
 | how to check the server against a real client | §1.4 |
+| where a number quoted against the reference comes from | `./cmp_ref.sh` — it re-measures all of them in one run |
 | what is left | `docs/design.md` §10 — it carries the current measurements |
 
 ## 8. Before committing
@@ -502,6 +513,8 @@ here first.
 - [ ] `./round.sh /etc` runs and its numbers are sane
 - [ ] new assertions have an expected value that came from `find(1)` or a fixture
       a reader can check, not from running the code
+- [ ] any number quoted against `:21` is in `./cmp_ref.sh`'s term list, and
+      `./cmp_ref.sh` agrees with what the message claims
 - [ ] measurements in the message, with the previous value if there was one
 - [ ] `docs/design.md` §10 updated if a component changed state
 - [ ] any deviation from the reference server or the client has its reason written
