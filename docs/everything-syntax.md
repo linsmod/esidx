@@ -5,7 +5,7 @@ into the original document, which shipped with etp_server as `搜索语法` and 
 Everything's own documentation; it has been reformatted as tables here, with
 section headings kept in the order of the original.
 
-The Android client (ShareToPC) drives this through `SITE EVERYTHING`
+The ETP client drives this through `SITE EVERYTHING`
 subcommands rather than by sending a raw query string: it sets match options
 (`CASE`, `PATH`, `REGEX`, `WHOLE_WORD`, …), column toggles (`SIZE_COLUMN`,
 `PATH_COLUMN`, …), then `OFFSET`, `COUNT`, `SORT` and finally `QUERY`. The

@@ -9,7 +9,7 @@ Written in C11, no runtime dependencies beyond libc.
 
 ## What this is for
 
-ShareToPC's Android client browses and searches a desktop machine over **ETP** —
+The ETP client browses and searches a desktop machine over **ETP** —
 voidtools' Everything Server. ETP is FTP plus a `SITE EVERYTHING` extension
 carrying 32 subcommands for match options, column toggles, sorting, paging and
 execution. The server side is Everything itself, which is Windows-only.
@@ -70,7 +70,7 @@ make test-all          # both, in that order
   `./test.sh -v` echoes every query; `TEST_ROOT=/usr ./test.sh` indexes a bigger
   tree (slower, ~5 s).
 - **`test_etp.sh`** pins the *wire*, driven by `tools/etp_probe.c` — a
-  transcription of the Android client's own parsing rules, so "the probe
+  transcription of the ETP client's own parsing rules, so "the probe
   understood the reply" means "the client would understand the reply", fragile
   cases included. Its ten acceptance criteria are listed at the top of the file,
   each traced to the line of `EtpClient.java` or `etp_server.c` it comes from.
@@ -96,7 +96,7 @@ inside a `mktemp` directory, leaving the source tree clean.
 # page
 ./esidx query /etc.idx 'ext:conf' 'count:20' 'offset:40'
 
-# serve ETP -- what the Android client speaks
+# serve ETP -- what the ETP client speaks
 ./esidx serve /etc.idx -p 2121
 #   esidx serving 1622 entries from /etc.idx on 127.0.0.1:2121 (loaded in 0.3 ms)
 ```
@@ -254,5 +254,5 @@ round.sh       one full round, with timings
 
 ## License
 
-Not yet declared. Intended for the ShareToPC project; the protocol baseline it
+Not yet declared. The protocol baseline it
 implements (`../etp_server-1.0.2.5/`) is MIT, © voidtools / David Carpenter.

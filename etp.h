@@ -7,7 +7,7 @@
  * the port of `etp_server_client_t`'s command layer from voidtools' Everything
  * Server 1.0.2.5, with the `everything_plugin_*` adapter replaced by our own
  * index engine (D1). The wire behaviour is deliberately identical, because the
- * Android client is the consumer and it was written against that server.
+ * ETP client is the consumer and it was written against that server.
  *
  * Two facts about the consumer shape this file, both verified against
  * app/src/main/java/.../transfer/EtpClient.java:

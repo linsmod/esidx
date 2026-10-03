@@ -7,14 +7,14 @@
 #   TEST_ROOT=/usr ./test_etp.sh   also exercise a real index
 #
 # Independent of test.sh on purpose. test.sh pins the *index* against find(1);
-# this pins the *wire*, against the exact byte sequence the ShareToPC Android
-# client puts on the socket. Both were derived from the same two references -- the
+# this pins the *wire*, against the exact byte sequence the ETP client puts on
+# the socket. Both were derived from the same two references -- the
 # client's EtpClient.java and voidtools' etp_server.c 1.0.2.5 -- but they fail for
 # different reasons, so keeping them apart means a failure names its layer.
 #
 # The client side is tools/etp_probe.c, which is a transcription of the client's
 # own parsing rules rather than a generic FTP client. "The probe understood the
-# reply" is therefore exactly "the Android client would understand the reply",
+# reply" is therefore exactly "the ETP client would understand the reply",
 # including for the fragile cases: the reply terminator rule, the literal
 # `200-Query results` / `200 End.` markers, RESULT_COUNT being independent of every
 # column toggle, and per-item column lines having to precede their FILE/FOLDER line.
@@ -232,7 +232,7 @@ kill "$SRV_PID2" 2>/dev/null; SRV_PID2=""
 
 # ------------------------------------------- 2: the client's exact query sequence
 
-say "2. the Android client's query sequence, verbatim (criteria 3, 4, 5, 6)"
+say "2. the ETP client's query sequence, verbatim (criteria 3, 4, 5, 6)"
 echo "   EtpClient.query() sends CASE PATH REGEX WHOLE_WORD, then all seven"
 echo "   *_COLUMN toggles, then SORT, OFFSET, COUNT, SEARCH, QUERY."
 
@@ -589,6 +589,34 @@ cq "dm: today"                     "dm:today"                       "14"
 cq "a bare word as a substring"    "conf"                           "3"
 
 say "11. FTP verbs the client never sends, for other clients"
+
+# OPTS is the one verb the *official* Everything client sends that EtpClient.java
+# never does, and it is the first command after login. It arrived by running the
+# real client against this server: `Everything.exe -instance X -connect u:p@host:port`
+# puts `OPTS UTF8 ON` on the wire before any column toggle, and the server used to
+# answer 501 because it compared the whole argument against the bare word "UTF8".
+# The official client then never issued the toggles or QUERY at all, so es.exe sat
+# there with no IPC reply and no error anywhere -- a silent hang, which is why no
+# suite caught it: nothing here drives the official client.
+# Reply wording and the bare-argument rejection are the reference's, checked
+# against etp_server 1.0.2.5 listening on 127.0.0.1:21.
+etp "OPTS UTF8 ON/OFF, the official client's first command after login" "$SRV_PORT" <<'EOF'
+send USER anonymous
+send OPTS UTF8 ON
+send OPTS UTF8 OFF
+send OPTS UTF8
+send OPTS MLST
+EOF
+expect "  OPTS UTF8 ON is accepted, not rejected" \
+    "$(pwire | sed -n 2p | cut -c1-3)" "200"
+expect "  ...with the reference's wording" \
+    "$(pwire | sed -n 2p)" "200 UTF8 mode enabled."
+expect "  OPTS UTF8 OFF disables it again" \
+    "$(pwire | sed -n 3p)" "200 UTF8 mode disabled."
+expect "  the bare option is rejected, as the reference rejects it" \
+    "$(pwire | sed -n 4p | cut -c1-3)" "501"
+expect "  an unrelated option is rejected" \
+    "$(pwire | sed -n 5p | cut -c1-3)" "501"
 
 # FEAT deserves its own note. The server emits exactly the reference feature set
 # (etp_server.c:1728-1736), and the client's own readResponse() rule then

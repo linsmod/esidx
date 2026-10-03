@@ -1,7 +1,7 @@
 /* etp_probe -- the ETP acceptance client.
  *
  * Built only by `make etp-probe`; not part of the server. Its job is to answer one
- * question: *would the ShareToPC Android client understand this server?*
+ * question: *would the ETP client understand this server?*
  *
  * So it is a reimplementation of the client's own wire handling, not a generic FTP
  * client. Every parsing rule below is transcribed from
@@ -275,7 +275,7 @@ static void read_query_block(void)
 
 /* ------------------------------------------------------------- data channel
  *
- * The Android client never uses one, but PASV/EPSV + LIST/MLSD/RETR have to work
+ * The ETP client never uses one, but PASV/EPSV + LIST/MLSD/RETR have to work
  * for any other FTP client, and "the reply said 150" is not evidence that the
  * transfer happened. So the probe can open a real second connection:
  *

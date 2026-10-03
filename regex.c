@@ -1,7 +1,7 @@
 /* A small backtracking regular-expression engine (design §2 L2, risk 3).
  *
  * Why not PCRE2: the language we must accept is narrow. Everything's own
- * documentation, and every pattern the Android client actually sends, uses
+ * documentation, and every pattern the ETP client actually sends, uses
  * literals, `.`, character classes, anchors, groups, alternation and the three
  * quantifiers. Pulling in libpcre2 would add a shared library to a project whose
  * stated deployment goal is "any Linux box" (decision D5), and `regex:` is a full

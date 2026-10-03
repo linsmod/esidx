@@ -53,13 +53,91 @@ Each layer has its own suite, and they are separate files on purpose:
 | Suite | Pins | Fails when |
 |---|---|---|
 | `test.sh` | the **index**, against `find(1)`; plus a **language** suite against a flat fixture | scan, storage or parsing is wrong |
-| `test_etp.sh` | the **wire**, against the Android client's own parsing rules | a reply would not be understood by the client |
+| `test_etp.sh` | the **wire**, against the ETP client's own parsing rules | a reply would not be understood by the client |
 | `round.sh` | nothing — it is the end-to-end demonstration and the source of the numbers in the docs | (prints timings; asserts nothing) |
 
 Run the index suite before the protocol suite. A parse regression shows up as a
 protocol failure otherwise, and you will spend an hour in the wrong file.
 
-### 1.4 Commit per batch
+### 1.4 The official client as a test peer
+
+`tools/etp_probe.c` is a transcription, so it can only prove the server agrees
+with *our reading* of `EtpClient.java`. The reference server on `127.0.0.1:21`
+and the official client are both available on this machine, and together they
+close the loop. Neither substitutes for the suites; each answers a question the
+other cannot.
+
+**Point the official client at this server.** Everything accepts `-instance`, so
+the ETP instance lives beside the default one instead of replacing it. This is
+the exact invocation that works:
+
+```powershell
+# 1. a snapshot to serve (any tree; /etc is small and already indexed by the suites)
+wsl -u root -e bash -lc 'cd /mnt/c/Users/linswin/AndroidStudioProjects/ShareToPC/esidx && ./esidx build /etc -o /tmp/etc.idx'
+
+# 2. the server, detached. -v 4 IS the debug level -- do not also set ESIDX_LOG,
+#    which -v 4 overwrites anyway (§2.3).
+wsl -u root -e bash -lc 'cd /mnt/c/Users/linswin/AndroidStudioProjects/ShareToPC/esidx && \
+  setsid nohup ./esidx -v 4 serve /tmp/etc.idx -p 2121 --bind 127.0.0.1 \
+    -u etpuser -w s3cret >/tmp/srv.err 2>&1 </dev/null &'
+
+# 3. the client. ONE -ArgumentList string, so the instance name stays quoted.
+Start-Process -FilePath 'C:\Program Files\Everything\Everything.exe' `
+  -ArgumentList '-instance "esidx" -connect etpuser:s3cret@127.0.0.1:2121' `
+  -WindowStyle Minimized
+```
+
+`-v 4` logs every `< command` and `> reply` (`etp.c:858`, `etp.c:214`), which is
+the only way to see what the official client actually sends. Everything confirms
+the connection in its window title: `127.0.0.1 - Everything (ETP esidx)`.
+
+Then just watch `/tmp/srv.err`. This is how the `OPTS UTF8 ON` bug was found: the
+trace shows the client log in, send `OPTS UTF8 ON`, and then — because it never
+got a `200` — send nothing else at all. There is no error anywhere, on either
+side; it just goes quiet.
+
+Three things about this setup that each cost an hour to find:
+
+- **The server must outlive the WSL invocation.** A plain `&` dies with the
+  calling `wsl`, and then Everything simply reports nothing. Use
+  `setsid nohup ... </dev/null &`.
+- **Quote the instance name as one argument.** `Start-Process -ArgumentList
+  '-instance','ETP Client',...` does not add quotes, so Everything receives
+  `-instance ETP Client`, silently takes the instance name as `ETP` and treats
+  `Client` as the search text. The symptom is a *working* connection to the wrong
+  instance, so it is easy to miss.
+- **`pkill -f "esidx -v 4 serve"` kills the shell running it**, because the
+  pattern matches that shell's own command line. Use `pkill -x esidx`.
+
+**`es.exe` cannot drive it, and that is not our bug.** es.exe (voidtools, separate
+download from `https://www.voidtools.com/es.zip`) has no way to reach an ETP
+*client* instance. `-instance <name>` either falls back to the default instance —
+silently returning the local index, which looks like it worked — or returns
+`Error 8`, because Everything registers the window as
+`EVERYTHING_TASKBAR_NOTIFICATION_(<name>)` with the parentheses already in the
+class, so passing the name with or without them both miss. Verified by pointing
+an identically named instance at the reference server on `:21`, which behaves the
+same way; and `-get-result-count` is how you tell the two apart, because the
+local index answers with a six-figure number while a real ETP session answers
+with the server's own count.
+
+So the GUI instance is the peer that exercises the protocol, and it does so
+completely: it logs in, sends `OPTS UTF8 ON`, issues the column toggles, COUNT,
+SORT and QUERY, and reads the block back. Run the probe with that same command
+sequence to assert on what the GUI consumed:
+
+```sh
+./etp-probe 2121 -   # the script is the trace the GUI produced, verbatim
+```
+
+**Use the probe against `:21` too.** Running `etp-probe 21 <script>` is the only
+check that the probe's transcribed rules are satisfied by an implementation we
+did not write. It passes for every shape the suites cover. It also reproduces
+the one known deviation: the client's `readResponse` cannot classify ` MLSD` in
+the reference's own `211-` FEAT reply and stops there, which is why the client
+never sends FEAT (§5.1).
+
+### 1.5 Commit per batch
 
 One commit per layer, message written before the code is finished so the summary
 is about what changed and why rather than what was typed. The message must
@@ -106,6 +184,20 @@ The build has no `-Werror`, so a new warning is easy to miss. When a build emits
 anything, fix it before committing — and if a warning is genuinely unavoidable,
 suppress it with a comment saying why. Several warnings in this codebase are
 already load-bearing (`-Wformat-truncation` on a deliberate snprintf).
+
+### 2.3 `-v 3` is info, not debug
+
+`log.h:18-21` numbers the levels from 1 (`LOG_ERROR=1 … LOG_DEBUG=4`) and
+`log_init` passes `-v N` straight through as the enum value, so **`-v 3` is
+`LOG_INFO`** and the wire trace only appears at **`-v 4`**. Two traps in one:
+
+- every script in this repo says `-v 3`, which is why none of them ever showed a
+  `< command` or `> reply` line;
+- `log_init` reads `ESIDX_LOG` *first* and then lets any `-v N` overwrite it, so
+  `ESIDX_LOG=debug ./esidx -v 3 …` silently runs at info. Pick one.
+
+Debug is the level you want whenever the question is "what did the peer actually
+send" — see §1.4.
 
 ---
 
@@ -175,6 +267,7 @@ Record that in the commit message. Examples from this codebase:
 | `SIZE` returned 550 for files | only directories were in `di_lookup`, and only LIST was tested |
 | `COUNT` defaulted to 0 | the reference defaults to `0xffffffff` (`:1207`); no test omitted COUNT |
 | the 503 guard fired on an armed PASV | the guard was copied from a reference whose state variable means something slightly different |
+| `OPTS UTF8 ON` answered `501`, hanging the official client | `EtpClient.java` never sends `OPTS`, so the probe never sent it either — the verb was only on the wire when the real client was pointed at the server (§1.4). A rejection the client does not treat as fatal just stops it sending anything else, which looks like a hang with no error anywhere. |
 
 ### 3.5 A test that cannot fail is worse than no test
 
@@ -246,7 +339,7 @@ counter first, in its own commit.
 
 ### 5.1 The client is the specification
 
-The consumer is `ShareToPC`'s `EtpClient.java`. When a protocol or language
+The consumer is the ETP client, `EtpClient.java`. When a protocol or language
 question arises, the answer is in that file, and the citation goes in a comment.
 Its behaviours that are not obvious and that this server matches deliberately:
 
@@ -260,6 +353,15 @@ Its behaviours that are not obvious and that this server matches deliberately:
 | `COUNT` is only sent when positive | `:260` | the default must be "unlimited", matching `etp_server.c:1207` |
 | closes the socket right after QUIT without reading | `:460` | a clean EOF is normal, not an error |
 | cannot parse the reference server's own FEAT reply | `:430-436` | do not "fix" the server around it; the client never sends FEAT |
+
+The official Everything client is a second, independent reader, and it disagrees
+with `EtpClient.java` in one place that matters: it sends `OPTS UTF8 ON` as the
+first command after login. A server that does not answer that `200` never gets
+the column toggles or the QUERY, and the failure looks like nothing at all. So
+`OPTS` is implemented to the reference's rules — `UTF8 ON`/`UTF8 OFF` accepted,
+the bare `OPTS UTF8` rejected — and pinned in `test_etp.sh` §11. Treat the two
+clients as two specifications and satisfy both: where they differ, the reference
+server's behaviour is the tie-breaker.
 
 ### 5.2 Match the reference byte for byte, then document the deviation
 

@@ -6,7 +6,7 @@
  *
  *   - the reply grammar: `200-Query results` opens a multi-line block, every data
  *     line carries exactly one leading space, and the block ends with `200 End.`
- *     (etp_server.c:5189-5272). The Android client's parser keys on those three
+ *     (etp_server.c:5189-5272). The ETP client's parser keys on those three
  *     literals and strips leading whitespace, so the spacing is load-bearing.
  *   - the 32 `EVERYTHING` subcommands and their one-line `200 ...` acknowledgements
  *     (:3953-4244). An unknown subcommand answers `500 Unknown Everything
@@ -565,7 +565,7 @@ static void everything_cmd(const esidx_t *db, client_t *c,
 
 /* ----------------------------------------------------------- data connection */
 
-/* The Android client never uses a data connection; these exist so that an
+/* The ETP client never uses a data connection; these exist so that an
  * ordinary FTP client can LIST and RETR (design §1.3, ref G4). */
 
 static void data_close(client_t *c)
@@ -741,7 +741,7 @@ static void do_list(const esidx_t *db, client_t *c, const char *arg, bool longfm
 
 /* MLST/MLSD/LIST formatting.
  *
- * The Android client never asks for these, so they exist for an ordinary FTP
+ * The ETP client never asks for these, so they exist for an ordinary FTP
  * client (design §1.3). The MLSD fact lines follow RFC 3659 §7, which is what
  * Everything advertises in FEAT (" MLSD", " MLST type*;size*;modify*;"). */
 
@@ -877,7 +877,7 @@ static void handle_command(const etp_opts_t *o, const esidx_t *db, client_t *c,
     if (!strcasecmp(verb, "NOOP")) { c_reply(c, "200 NOOP ok.\r\n"); return; }
 
     if (!c->logged_in) {
-        /* Everything answers 530 to everything but USER/PASS/QUIT. The Android
+        /* Everything answers 530 to everything but USER/PASS/QUIT. The ETP
          * client's connect() sends USER then PASS and reads one reply each, so
          * this boundary matters. */
         c_reply(c, "530 Not logged on.\r\n");
@@ -900,10 +900,24 @@ static void handle_command(const etp_opts_t *o, const esidx_t *db, client_t *c,
         return;
     }
     if (!strcasecmp(verb, "OPTS")) {
-        if (!strcasecmp(param, "UTF8") || !strcasecmp(param, "utf8"))
-            c_reply(c, "200 UTF8 set to on.\r\n");
-        else
-            c_reply(c, "501 Option not understood.\r\n");
+        /* `OPTS UTF8 ON|OFF` and nothing else. The official client sends
+         * `OPTS UTF8 ON` as the first command after login and will not send the
+         * column toggles or QUERY until it is answered 200, so rejecting the
+         * argument -- as this did -- hangs the session with no error anywhere.
+         * Matching the argument exactly also means rejecting the bare
+         * `OPTS UTF8`, which the reference rejects even though FEAT advertises
+         * UTF8 (etp_server.c:1728-1736). Wording is the reference's too: the
+         * client only requires the "200 " prefix, but D1 says match byte for
+         * byte where the cost is nil. */
+        int on = -1;
+        if (!strncasecmp(param, "UTF8", 4) && (param[4] == ' ' || param[4] == '\0')) {
+            const char *v = param + 4;
+            while (*v == ' ') v++;
+            if (!strcasecmp(v, "ON")) on = 1;
+            else if (!strcasecmp(v, "OFF")) on = 0;
+        }
+        if (on < 0) c_reply(c, "501 Invalid option.\r\n");
+        else c_reply(c, "200 UTF8 mode %s.\r\n", on ? "enabled" : "disabled");
         return;
     }
     if (!strcasecmp(verb, "SYST")) { c_reply(c, "215 UNIX Type: L8\r\n"); return; }

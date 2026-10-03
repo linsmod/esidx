@@ -192,7 +192,7 @@ uint32_t esidx_win_attributes(const esidx_t *db, eid_t id)
     if (f & EF_HIDDEN) a |= 0x02u;   /* FILE_ATTRIBUTE_HIDDEN    */
     if (f & EF_READONLY) a |= 0x01u; /* FILE_ATTRIBUTE_READONLY  */
     /* FILE_ATTRIBUTE_ARCHIVE (0x20) is what Everything sets on every ordinary
-     * file; the Android client only masks off 0x02|0x04, so setting it is safe
+     * file; the ETP client only masks off 0x02|0x04, so setting it is safe
      * and matches the reference server's output. */
     if (!(f & EF_DIR)) a |= 0x20u;
     return a;

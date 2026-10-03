@@ -9,9 +9,8 @@
 # This is not a test -- test.sh and test_etp.sh are. It is the demonstration that
 # the three layers fit together on data nobody curated: scan a real filesystem,
 # build the derived indexes, serve ETP, and walk a session shaped like the one the
-# ShareToPC Android client performs (connect, browse, drill down, search, page,
-# sort, disconnect), printing the phase timings at each step.
-#
+# ETP client performs (connect, browse, drill down, search, page, sort,
+# disconnect), printing the phase timings at each step.
 # It is also where the numbers in README.md and docs/design.md come from, so that
 # those tables cannot drift away from the code without someone noticing.
 
@@ -86,7 +85,7 @@ TREE_WS=${TEST_ROOT//\//\\}
 
 # ------------------------------------------------- 3. the session a client runs
 
-hr "3. the session the Android client performs"
+hr "3. the session the ETP client performs"
 
 drive "connect, then nothing else -- the handshake on its own" <<'EOF'
 send NOOP

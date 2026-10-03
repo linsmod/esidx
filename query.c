@@ -578,7 +578,7 @@ static const char *const macro_exe[] = {
     "msp","pif","rpm","scr","so", NULL };
 
 /* `type:<name>` (L143). The names are matched loosely -- "picture" and "image"
- * are the same set -- because the Android client's category picker sends display
+ * are the same set -- because the ETP client's category picker sends display
  * names rather than internal ones, and Everything itself aliases several of them.
  * The two arrays are index-aligned; TYPE_NAMES[n] resolves to TYPE_SETS[n]. */
 static const char *const *const type_sets[] = {
@@ -692,7 +692,7 @@ static int eval_node(qctx_t *c, const ast_t *t, bitset_t *out);
 /* ------------------------------------------------------------- path helpers */
 
 /* Accept a path as the client sends it. The ETP wire is Windows-flavoured: the
- * Android client joins `path + "\\" + name` (EtpClient.fullPath), so a path that
+ * ETP client joins `path + "\\" + name` (EtpClient.fullPath), so a path that
  * came from us and went through the client comes back with mixed separators.
  * Normalising here is what keeps `parent:` a hash hit instead of a miss. */
 static void normalise_path(const char *in, char *out, size_t outsz)

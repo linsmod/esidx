@@ -31,7 +31,7 @@ test: esidx
 	./test.sh
 
 # protocol acceptance, driven over a real socket by a transcription of the
-# Android client's own parsing rules (tools/etp_probe.c)
+# ETP client's own parsing rules (tools/etp_probe.c)
 etp-probe: tools/etp_probe.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
