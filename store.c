@@ -102,6 +102,7 @@ eid_t esidx_add(esidx_t *db, eid_t parent, const char *name, uint16_t depth,
     et->ctime[id]     = ctime;
     et->ext_id[id]    = (flags & EF_DIR) ? 0 : ext_of(db, name);
 
+    if (parent == EID_NONE) db->root_eid = id;
     if (parent != EID_NONE) di_add_child(&db->di, parent, id);
     return id;
 }
@@ -148,6 +149,53 @@ eid_t di_lookup(const esidx_t *db, const char *path)
         i = (i + 1) & di->ht_mask;
     }
     return EID_NONE;
+}
+
+const char *name_of(const esidx_t *db, eid_t id)
+{
+    if (id >= db->et.count) return "";
+    return sp_get(&db->names, db->et.name[id].off);
+}
+
+const char *ext_of_str(const esidx_t *db, eid_t id)
+{
+    if (id >= db->et.count) return "";
+    uint16_t e = db->et.ext_id[id];
+    return e ? sp_get(&db->exts, e - 1) : "";
+}
+
+uint32_t di_child_count(const esidx_t *db, eid_t dir)
+{
+    if (dir < db->di.child_cap) return db->di.child[dir].n;
+    return 0;
+}
+
+void parent_path_of(const esidx_t *db, eid_t id, char *out, size_t outsz)
+{
+    if (id >= db->et.count || !outsz) { if (outsz) out[0] = '\0'; return; }
+    eid_t p = db->et.parent[id];
+    if (p == EID_NONE || p >= db->et.count) { out[0] = '\0'; return; }
+    path_of(db, p, out, outsz);
+}
+
+/* Win32 attribute bits, for the ATTRIBUTES column and for sorting by them.
+ * Only H and D have an ext4 equivalent (everything-syntax.md L239-240); the rest
+ * of the mask Everything reports has no filesystem counterpart, so it is left
+ * clear rather than invented. R (read-only) is the one more that maps cleanly
+ * onto a POSIX mode bit, and is derived from the entry's stored flags. */
+uint32_t esidx_win_attributes(const esidx_t *db, eid_t id)
+{
+    if (id >= db->et.count) return 0;
+    uint16_t f = db->et.flags[id];
+    uint32_t a = 0;
+    if (f & EF_DIR)    a |= 0x10u;   /* FILE_ATTRIBUTE_DIRECTORY */
+    if (f & EF_HIDDEN) a |= 0x02u;   /* FILE_ATTRIBUTE_HIDDEN    */
+    if (f & EF_READONLY) a |= 0x01u; /* FILE_ATTRIBUTE_READONLY  */
+    /* FILE_ATTRIBUTE_ARCHIVE (0x20) is what Everything sets on every ordinary
+     * file; the Android client only masks off 0x02|0x04, so setting it is safe
+     * and matches the reference server's output. */
+    if (!(f & EF_DIR)) a |= 0x20u;
+    return a;
 }
 
 void path_of(const esidx_t *db, eid_t id, char *out, size_t outsz)
@@ -217,6 +265,111 @@ uint32_t sidx_range_to_bitset(const sidx_t *s, int64_t lo, int64_t hi, bitset_t 
     return cnt;
 }
 
+/* -------------------------------------------------------------- ext bitmaps */
+
+/* ext_id is the byte offset in the exts pool plus one, so it is sparse. `tab` is
+ * a small open-addressed map from ext_id to a dense slot; linear probing is fine
+ * at a load factor of 0.5 (ref A12 considered and rejected for the trigram table,
+ * where the probe distribution matters; here it does not). */
+int ext_index_build(ext_index_t *xi, const esidx_t *db)
+{
+    ext_index_free(xi);
+    const entry_table_t *et = &db->et;
+    if (et->count == 0) return 0;
+
+    uint32_t cap = 64;
+    while (cap < et->count) cap <<= 1;
+    uint32_t *tab = calloc(cap, sizeof(uint32_t));
+    uint32_t *ids = malloc(cap * sizeof(uint32_t));
+    if (!tab || !ids) { free(tab); free(ids); return -1; }
+    uint32_t mask = cap - 1, n = 0;
+
+    for (uint32_t i = 0; i < et->count; i++) {
+        uint16_t e = et->ext_id[i];
+        if (!e) continue;
+        uint32_t h = (e * 2654435761u) & mask;
+        while (tab[h] && ids[tab[h] - 1] != e) h = (h + 1) & mask;
+        if (tab[h]) continue;
+        tab[h] = n + 1;
+        ids[n++] = e;
+    }
+
+    bitset_t *sets = calloc(n ? n : 1, sizeof(bitset_t));
+    uint32_t *counts = calloc(n ? n : 1, sizeof(uint32_t));
+    if (!sets || !counts) {
+        free(sets); free(counts); free(tab); free(ids);
+        return -1;
+    }
+    for (uint32_t s = 0; s < n; s++) {
+        if (bs_init(&sets[s], et->count) != 0) {
+            for (uint32_t k = 0; k < s; k++) bs_free(&sets[k]);
+            free(sets); free(counts); free(tab); free(ids);
+            return -1;
+        }
+    }
+    for (uint32_t i = 0; i < et->count; i++) {
+        uint16_t e = et->ext_id[i];
+        if (!e) continue;
+        uint32_t h = (e * 2654435761u) & mask;
+        while (ids[tab[h] - 1] != e) h = (h + 1) & mask;
+        bs_set(&sets[tab[h] - 1], i);
+        counts[tab[h] - 1]++;
+    }
+
+    xi->n = n;
+    xi->ids = ids;
+    xi->counts = counts;
+    xi->sets = sets;
+    xi->tab = tab;
+    xi->tab_mask = mask;
+    LOGD("ext bitmaps: %u distinct extensions over %u entries", n, et->count);
+    return 0;
+}
+
+void ext_index_free(ext_index_t *xi)
+{
+    if (xi->sets) {
+        for (uint32_t i = 0; i < xi->n; i++) bs_free(&xi->sets[i]);
+        free(xi->sets);
+    }
+    free(xi->ids);
+    free(xi->counts);
+    free(xi->tab);
+    memset(xi, 0, sizeof(*xi));
+}
+
+static int ext_slot(const ext_index_t *xi, uint16_t ext_id)
+{
+    if (!xi->tab || !ext_id) return -1;
+    uint32_t h = (ext_id * 2654435761u) & xi->tab_mask;
+    while (xi->tab[h]) {
+        if (xi->ids[xi->tab[h] - 1] == ext_id) return (int)(xi->tab[h] - 1);
+        h = (h + 1) & xi->tab_mask;
+    }
+    return -1;
+}
+
+uint32_t ext_index_select(const ext_index_t *xi, const uint16_t *ids, uint32_t n,
+                          bitset_t *out)
+{
+    bs_clear(out);
+    uint32_t cnt = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        int s = ext_slot(xi, ids[i]);
+        if (s < 0) continue;             /* extension not present in this index */
+        bs_or(out, &xi->sets[s]);
+        cnt++;
+    }
+    return cnt;
+}
+
+uint32_t ext_index_count(const ext_index_t *xi, uint16_t ext_id)
+{
+    int s = ext_slot(xi, ext_id);
+    if (s < 0) return UINT32_MAX;
+    return xi->counts[s];
+}
+
 /* --------------------------------------------------------------- database */
 
 void esidx_init(esidx_t *db)
@@ -225,6 +378,7 @@ void esidx_init(esidx_t *db)
     db->di.ht_off = calloc(1024, sizeof(uint32_t));
     db->di.ht_val = calloc(1024, sizeof(eid_t));
     db->di.ht_mask = 1023;
+    db->root_eid = EID_NONE;
 }
 
 void esidx_free(esidx_t *db)
@@ -236,7 +390,9 @@ void esidx_free(esidx_t *db)
     for (uint32_t i = 0; i < db->di.child_cap; i++) free(db->di.child[i].items);
     free(db->di.child);
     free(db->di.ht_off); free(db->di.ht_val);
-    sidx_free(&db->by_size); sidx_free(&db->by_mtime);
+    sidx_free(&db->by_size); sidx_free(&db->by_mtime); sidx_free(&db->by_ctime);
+    ext_index_free(&db->ext);
+    bs_free(&db->type.all); bs_free(&db->type.dirs); bs_free(&db->type.files);
     memset(db, 0, sizeof(*db));
 }
 
@@ -279,6 +435,24 @@ static void di_hash_build(esidx_t *db)
          ncap ? (double)db->di.ht_count / (double)ncap : 0.0);
 }
 
+/* file: / folder: as whole-table bitmaps (design §2, L1). Two bitmaps rather
+ * than a scan because the type filter is on every request the client makes. */
+static void type_index_build(type_index_t *ti, esidx_t *db)
+{
+    bs_free(&ti->all); bs_free(&ti->dirs); bs_free(&ti->files);
+    uint32_t n = db->et.count;
+    if (!n) return;
+    bs_init(&ti->all, n);
+    bs_init(&ti->dirs, n);
+    bs_init(&ti->files, n);
+    for (uint32_t i = 0; i < n; i++) {
+        bs_set(&ti->all, i);
+        if (db->et.flags[i] & EF_DIR) bs_set(&ti->dirs, i);
+        else                        bs_set(&ti->files, i);
+    }
+    LOGD("type bitmaps: %u dirs, %u files", bs_count(&ti->dirs), bs_count(&ti->files));
+}
+
 void esidx_finalize(esidx_t *db)
 {
     uint64_t t0 = ts_us();
@@ -293,6 +467,20 @@ void esidx_finalize(esidx_t *db)
     t0 = ts_us();
     sidx_build(&db->by_mtime, db->et.mtime, db->et.count);
     TSDONE("finalize: sorted index mtime", t0);
+
+    /* dc: needs its own sorted array; without it the leaf could only be a scan,
+     * and the client asks for DATE_CREATED on every search */
+    t0 = ts_us();
+    sidx_build(&db->by_ctime, db->et.ctime, db->et.count);
+    TSDONE("finalize: sorted index ctime", t0);
+
+    t0 = ts_us();
+    ext_index_build(&db->ext, db);
+    TSDONE2("finalize: ext bitmaps", t0, "(%u extensions)", db->ext.n);
+
+    t0 = ts_us();
+    type_index_build(&db->type, db);
+    TSDONE("finalize: type bitmaps", t0);
 }
 
 void esidx_log_stats(const esidx_t *db, const char *phase)
@@ -409,8 +597,10 @@ int esidx_load(esidx_t *db, const char *path)
 
     /* rebuild derived structures: children lists, path hash, sorted indexes */
     uint64_t t1 = ts_us();
+    db->root_eid = EID_NONE;
     for (uint32_t i = 0; i < et->count; i++) {
-        if (et->parent[i] != EID_NONE) di_add_child(&db->di, et->parent[i], i);
+        if (et->parent[i] == EID_NONE) db->root_eid = i;
+        else di_add_child(&db->di, et->parent[i], i);
     }
     TSDONE("load: rebuild children vectors", t1);
 

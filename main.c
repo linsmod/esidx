@@ -39,77 +39,10 @@ static void usage(void)
 
 /* ------------------------------------------------------------- arg parsing */
 
-static int64_t parse_size(const char *s)
-{
-    char *end = NULL;
-    double v = strtod(s, &end);
-    if (end) {
-        switch (*end) {
-        case 't': case 'T': v *= 1024.0 * 1024.0 * 1024.0 * 1024.0; break;
-        case 'g': case 'G': v *= 1024.0 * 1024.0 * 1024.0; break;
-        case 'm': case 'M': v *= 1024.0 * 1024.0; break;
-        case 'k': case 'K': v *= 1024.0; break;
-        default: break;
-        }
-    }
-    return (int64_t)v;
-}
-
-static int64_t parse_time_val(const char *s)
-{
-    time_t now = time(NULL);
-
-    if (!strcasecmp(s, "today")) {
-        struct tm tm;
-        localtime_r(&now, &tm);
-        tm.tm_hour = tm.tm_min = tm.tm_sec = 0;
-        return (int64_t)mktime(&tm);
-    }
-    if (!strcasecmp(s, "yesterday")) {
-        struct tm tm;
-        localtime_r(&now, &tm);
-        tm.tm_hour = tm.tm_min = tm.tm_sec = 0;
-        return (int64_t)mktime(&tm) - 86400;
-    }
-    if (*s == 'd' && s[1] && isdigit((unsigned char)s[1])) {
-        /* relative: 7d = within last 7 days */
-        long days = strtol(s + 1, NULL, 10);
-        return now - days * 86400;
-    }
-    char *end = NULL;
-    long long v = strtoll(s, &end, 10);
-    return (int64_t)v;
-}
-
-/* parse "OP VALUE" where OP in {>, <, >=, <=} ; also "a..b" / "a-b" */
-static void apply_cmp(const char *v, int64_t *lo, int64_t *hi, int is_time)
-{
-    int64_t (*pv)(const char *) = is_time ? parse_time_val : parse_size;
-
-    const char *dots = strstr(v, "..");
-    if (dots) {
-        char a[64], b[64];
-        size_t la = (size_t)(dots - v);
-        if (la >= sizeof(a)) la = sizeof(a) - 1;
-        memcpy(a, v, la); a[la] = '\0';
-        snprintf(b, sizeof(b), "%s", dots + 2);
-        *lo = pv(a); *hi = pv(b);
-        LOGD("cmp: %s -> range [%lld, %lld]", v, (long long)*lo, (long long)*hi);
-        return;
-    }
-    if (v[0] == '>') {
-        if (v[1] == '=') *lo = pv(v + 2);
-        else             *lo = pv(v + 1) + 1;
-    } else if (v[0] == '<') {
-        if (v[1] == '=') *hi = pv(v + 2);
-        else             *hi = pv(v + 1) - 1;
-    } else if (v[0] == '=') {
-        int64_t x = pv(v + 1); *lo = x; *hi = x;
-    } else {
-        int64_t x = pv(v); *lo = x; *hi = x;
-    }
-    LOGD("cmp: %s -> range [%lld, %lld]", v, (long long)*lo, (long long)*hi);
-}
+/* NOTE: the query string is parsed by the real front end (syntax.h), not here.
+ * These helpers are gone; what remains of CLI parsing is the subcommand table
+ * and the leading sort:/count:/offset: options, which exist only so the test
+ * suite can drive the executor without a protocol layer. */
 
 /* ------------------------------------------------------------------- build */
 
@@ -160,6 +93,15 @@ static int cmd_build(int argc, char **argv)
 
 /* ------------------------------------------------------------------- query */
 
+/* Everything past argv[1] is joined into one search string and handed to the real
+ * parser. The old hand-rolled token loop could not express `a | b`, `!x`,
+ * `size:<1m` or `<a b>` groups, which is exactly the set of forms the ETP client
+ * sends.
+ *
+ * `sort:`, `count:` and `offset:` are pulled out wherever they appear rather than
+ * only at the front, because they are the CLI's stand-ins for the ETP sort/OFFSET/
+ * COUNT subcommands and the test suite interleaves them with search terms. They
+ * are not search functions in the language, so nothing is lost by removing them. */
 static int cmd_query(int argc, char **argv)
 {
     if (argc < 1) { usage(); return 1; }
@@ -177,94 +119,95 @@ static int cmd_query(int argc, char **argv)
     uint64_t t_load = ts_us();
     double lms = (double)(t_load - t0) / 1000.0;
 
-    query_t q;
-    query_init(&q);
-    uint16_t extbuf[64];
-    uint32_t next = 0;
+    sort_spec_t sort = { SORT_NAME, 0 };
+    uint32_t offset = 0, count = 0;
+
+    size_t need = 1;
+    for (int i = 1; i < argc; i++) need += strlen(argv[i]) + 1;
+    char *expr = malloc(need);
+    if (!expr) { esidx_free(&db); return 1; }
+    size_t elen = 0;
+    expr[0] = '\0';
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
-        if (!strncasecmp(a, "parent:", 7)) {
-            eid_t id = di_lookup(&db, a + 7);
-            if (id == EID_NONE) {
-                fprintf(stderr, "no such dir: %s\n", a + 7);
-                LOGD("parent lookup miss: %s", a + 7);
-                esidx_free(&db);
-                return 1;
-            }
-            q.parent = (int)id;
-            LOGD("parent:%s -> eid %u", a + 7, id);
-        } else if (!strcasecmp(a, "folder:")) {
-            q.type_filter = 1;
-        } else if (!strcasecmp(a, "file:")) {
-            q.type_filter = 2;
-        } else if (!strncasecmp(a, "ext:", 4)) {
-            const char *p = a + 4;
-            while (*p && next < 64) {
-                const char *e = strchr(p, ';');
-                size_t l = e ? (size_t)(e - p) : strlen(p);
-                char buf[32];
-                if (l >= sizeof(buf)) l = sizeof(buf) - 1;
-                /* ext ids are interned lowercase (see ext_of), so fold here
-                 * too -- Everything's ext: is case-insensitive */
-                for (size_t i = 0; i < l; i++)
-                    buf[i] = (char)tolower((unsigned char)p[i]);
-                buf[l] = '\0';
-                if (l)
-                    extbuf[next++] = ext_intern((esidx_t *)&db, buf);
-                if (!e) break;
-                p = e + 1;
-            }
-        } else if (!strncasecmp(a, "size:", 5)) {
-            apply_cmp(a + 5, &q.size_lo, &q.size_hi, 0);
-        } else if (!strncasecmp(a, "dm:", 3)) {
-            apply_cmp(a + 3, &q.mtime_lo, &q.mtime_hi, 1);
-        } else if (!strncasecmp(a, "sort:", 5)) {
+        if (!strncasecmp(a, "sort:", 5)) {
             char key[32] = {0}, ord[32] = {0};
             sscanf(a + 5, "%31[^:]:%31s", key, ord);
-            if      (!strcasecmp(key, "size"))  q.sort_key = SORT_SIZE;
+            if      (!strcasecmp(key, "size"))  sort.key = SORT_SIZE;
             else if (!strcasecmp(key, "mtime") ||
-                     !strcasecmp(key, "date_modified")) q.sort_key = SORT_MTIME;
-            else if (!strcasecmp(key, "path"))  q.sort_key = SORT_PATH;
+                     !strcasecmp(key, "date_modified")) sort.key = SORT_MTIME;
+            else if (!strcasecmp(key, "ctime") ||
+                     !strcasecmp(key, "date_created"))  sort.key = SORT_CTIME;
+            else if (!strcasecmp(key, "path"))  sort.key = SORT_PATH;
             else if (!strcasecmp(key, "ext") ||
-                     !strcasecmp(key, "extension")) q.sort_key = SORT_EXT;
-            else q.sort_key = SORT_NAME;
-            q.sort_desc = (!strcasecmp(ord, "desc") || !strcasecmp(ord, "descending"));
-            LOGD("sort:%s -> key=%d desc=%d", a + 5, (int)q.sort_key, q.sort_desc);
-        } else if (!strncasecmp(a, "count:", 6)) {
-            q.count = (uint32_t)strtoul(a + 6, NULL, 10);
-        } else if (!strncasecmp(a, "offset:", 7)) {
-            q.offset = (uint32_t)strtoul(a + 7, NULL, 10);
-        } else {
-            q.name_substr = a;
-            LOGD("bare word -> substring %s", a);
+                     !strcasecmp(key, "extension")) sort.key = SORT_EXT;
+            else sort.key = SORT_NAME;
+            sort.desc = (!strcasecmp(ord, "desc") || !strcasecmp(ord, "descending"));
+            continue;
         }
+        if (!strncasecmp(a, "count:", 6))  { count  = (uint32_t)strtoul(a + 6, NULL, 10); continue; }
+        if (!strncasecmp(a, "offset:", 7)) { offset = (uint32_t)strtoul(a + 7, NULL, 10); continue; }
+        if (elen) expr[elen++] = ' ';
+        size_t al = strlen(a);
+        memcpy(expr + elen, a, al + 1);
+        elen += al;
     }
-    q.ext_ids = extbuf;
-    q.next = next;
+
+    char err[256] = {0};
+    ast_t *ast = syntax_parse(expr, err, sizeof(err));
+    if (!ast && err[0]) {
+        fprintf(stderr, "parse error: %s\n  in: %s\n", err, expr);
+        free(expr);
+        esidx_free(&db);
+        return 1;
+    }
+    char dumped[1024];
+    ast_dump(ast, dumped, sizeof(dumped));
+    LOGD("query: ast = %s", dumped[0] ? dumped : "<match all>");
 
     uint64_t tq = ts_us();
-    eid_t *res = NULL;
-    uint32_t nr = query_exec(&db, &q, &res);
+    qset_t set;
+    if (qexec(&db, ast, NULL, sort, &set) != 0) {
+        fprintf(stderr, "query failed\n");
+        free(expr);
+        ast_free(ast);
+        esidx_free(&db);
+        return 1;
+    }
     uint64_t t1 = ts_us();
     double qms = (double)(t1 - tq) / 1000.0;
 
+    eid_t *page = NULL;
+    uint32_t np = qset_slice(&set, offset, count, &page);
+
     char *pbuf = malloc(65536);
-    for (uint32_t i = 0; i < nr; i++) {
-        path_of(&db, res[i], pbuf, 65536);
+    for (uint32_t i = 0; i < np; i++) {
+        path_of(&db, page[i], pbuf, 65536);
         char tstr[32] = "";
-        time_t mt = (time_t)db.et.mtime[res[i]];
+        time_t mt = (time_t)db.et.mtime[page[i]];
         struct tm tm;
         if (localtime_r(&mt, &tm)) strftime(tstr, sizeof(tstr), "%Y-%m-%d %H:%M", &tm);
         printf("%c %12lld  %s  %s\n",
-               (db.et.flags[res[i]] & EF_DIR) ? 'd' : '-',
-               (long long)db.et.size[res[i]], tstr, pbuf);
+               (db.et.flags[page[i]] & EF_DIR) ? 'd' : '-',
+               (long long)db.et.size[page[i]], tstr, pbuf);
     }
     free(pbuf);
-    free(res);
+    free(page);
 
-    fprintf(stderr, "loaded in %.1f ms, %u results in %.1f ms (end-to-end %.1f ms)\n",
-            lms, nr, qms, (double)(t1 - t0) / 1000.0);
+    fprintf(stderr, "loaded in %.1f ms, %u of %u results in %.1f ms (end-to-end %.1f ms)\n",
+            lms, np, set.n, qms, (double)(t1 - t0) / 1000.0);
+    if (log_enabled(LOG_INFO))
+        LOGI("query: %u matched (dirs=%u files=%u) | plan %.3f ms, eval %.3f ms, sort %.3f ms"
+             " | driver leaf #%u seeded %u of %u candidates from %u leaves",
+             set.n, set.n_dir, set.n_file,
+             (double)set.t_plan_us / 1000.0, (double)set.t_eval_us / 1000.0,
+             (double)set.t_sort_us / 1000.0,
+             set.driver, set.seed, db.et.count, set.leaf_cnt);
+
+    qset_free(&set);
+    free(expr);
+    ast_free(ast);
     esidx_free(&db);
     return 0;
 }

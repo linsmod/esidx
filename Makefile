@@ -16,20 +16,28 @@ CFLAGS  += -O0 -g -DESIDX_DEBUG -fsanitize=address,undefined -fno-omit-frame-poi
 LDFLAGS += -fsanitize=address,undefined
 endif
 
-OBJS = store.o index.o scan.o query.o log.o main.o
+# storage + index (design §4, §5) | syntax (§6.1) | execution (§6.3) | protocol (§1)
+OBJS = store.o index.o scan.o lexer.o parser.o regex.o query.o log.o main.o
 
 all: esidx
 
 esidx: $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
 
-%.o: %.c esidx.h log.h timer.h
+%.o: %.c esidx.h syntax.h log.h timer.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 test: esidx
 	./test.sh
 
+# protocol acceptance, run against a real socket (design §10, P1)
+test-etp: esidx
+	./test_etp.sh
+
+# both suites; the syntax/query suite first so a parse regression is obvious
+test-all: test test-etp
+
 clean:
 	rm -f $(OBJS) esidx
 
-.PHONY: all test clean
+.PHONY: all test test-etp test-all clean

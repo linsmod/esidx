@@ -22,8 +22,9 @@ typedef uint32_t eid_t;
 #define EID_NONE ((eid_t)0xFFFFFFFFu)
 
 /* entry flags */
-#define EF_DIR     0x0001u
-#define EF_HIDDEN  0x0002u
+#define EF_DIR      0x0001u
+#define EF_HIDDEN   0x0002u
+#define EF_READONLY 0x0004u
 
 /* ----------------------------------------------------------- string pool */
 
@@ -85,6 +86,18 @@ void bs_free(bitset_t *b);
 void bs_set(bitset_t *b, uint32_t i);
 bool bs_test(const bitset_t *b, uint32_t i);
 void bs_clear(bitset_t *b);
+void bs_clear_bit(bitset_t *b, uint32_t i);
+uint32_t bs_count(const bitset_t *b);
+/* Set algebra. The language's `space` / `|` / `!` map straight onto these
+ * (design §5.4), which is why they live in the index layer and not in a query
+ * helper. */
+void bs_and(bitset_t *dst, const bitset_t *src);
+void bs_or(bitset_t *dst, const bitset_t *src);
+void bs_andnot(bitset_t *dst, const bitset_t *src);
+void bs_not(bitset_t *b);
+void bs_set_all(bitset_t *b, uint32_t nbits);
+/* first set bit at or after `i`, or b->nbits when there is none */
+uint32_t bs_next(const bitset_t *b, uint32_t i);
 
 /* ---------------------------------------------------------- sorted index */
 
@@ -107,6 +120,31 @@ void sidx_build(sidx_t *s, const int64_t *vals, uint32_t n);
 void sidx_free(sidx_t *s);
 /* append [lo,hi] matching ids into bitset */
 uint32_t sidx_range_to_bitset(const sidx_t *s, int64_t lo, int64_t hi, bitset_t *out);
+
+/* ------------------------------------------------------------- enum bitmap */
+
+/* One bitmap per extension (design §5.4). Extensions are few and low
+ * cardinality, so a dense set per interned ext is the whole index -- there is
+ * no need for a compressed structure until the ext count explodes.
+ *
+ * ext_id is the byte offset of the extension inside the exts pool plus one, so
+ * it is sparse and cannot index an array directly; `tab` maps ext_id to a
+ * dense slot. */
+typedef struct {
+    uint32_t   n;        /* distinct extensions */
+    uint32_t  *ids;      /* slot -> ext_id */
+    uint32_t  *counts;   /* slot -> entries carrying it, for the selectivity
+                          * estimate in design §6.2 -- computing it here is what
+                          * lets the optimiser cost ext: without a scan */
+    bitset_t  *sets;     /* slot -> entries carrying it */
+    uint32_t  *tab;      /* open addressing, value = slot + 1, 0 = empty */
+    uint32_t   tab_mask;
+} ext_index_t;
+
+/* file: and folder: as whole-table bitmaps (design §2, L1) */
+typedef struct {
+    bitset_t all, dirs, files;
+} type_index_t;
 
 /* --------------------------------------------------------------- database */
 
@@ -132,6 +170,10 @@ typedef struct {
     dir_index_t   di;
     sidx_t        by_size;
     sidx_t        by_mtime;
+    sidx_t        by_ctime;
+    ext_index_t   ext;      /* ext: bitmap set, built in finalize */
+    type_index_t  type;     /* file:/folder: bitmaps, built in finalize */
+    eid_t         root_eid; /* the scanned root; parent:"" and root: anchor here */
     scan_stats_t  scan;
 } esidx_t;
 
@@ -146,46 +188,45 @@ eid_t esidx_add(esidx_t *db, eid_t parent, const char *name, uint16_t depth,
 int  esidx_scan(esidx_t *db, const char *root);
 void esidx_finalize(esidx_t *db);   /* build dir paths hash + sorted indexes */
 
+/* child count of a directory entry (design §5.5 aggregate, derived not stored) */
+uint32_t di_child_count(const esidx_t *db, eid_t dir);
+
 /* snapshot (decision D4: mmap load, plain write) */
 int  esidx_save(const esidx_t *db, const char *path);
 int  esidx_load(esidx_t *db, const char *path);
 
-/* ----------------------------------------------------------------- query */
+/* ------------------------------------------------------------- ext bitmaps */
 
-/* sort keys, aligned with ETP sort names (etp_server.c:472-494) */
-typedef enum {
-    SORT_NAME = 0,
-    SORT_PATH,
-    SORT_SIZE,
-    SORT_MTIME,
-    SORT_EXT
-} sort_key_t;
+int      ext_index_build(ext_index_t *xi, const esidx_t *db);
+void     ext_index_free(ext_index_t *xi);
+/* OR every listed extension into `out`. Unknown extensions contribute nothing. */
+uint32_t ext_index_select(const ext_index_t *xi, const uint16_t *ids, uint32_t n,
+                          bitset_t *out);
+/* selectivity estimate for one ext id, or UINT32_MAX when unknown */
+uint32_t ext_index_count(const ext_index_t *xi, uint16_t ext_id);
 
-typedef struct {
-    int      parent;        /* eid of parent dir, or -1 for whole tree */
-    int      type_filter;   /* 0 any, 1 dir only, 2 file only */
-    const char *name_substr;/* P0: in-memory substring scan; trigram at P4 (§5.2) */
-    int64_t  size_lo, size_hi;
-    int64_t  mtime_lo, mtime_hi;
-    uint16_t *ext_ids;      /* accepted ext ids; NULL/next==0 = any */
-    uint32_t next;
+/* ---------------------------------------------------------------- helpers */
 
-    sort_key_t sort_key;
-    int        sort_desc;
-    uint32_t   offset, count;   /* count==0 -> all */
-} query_t;
-
-void query_init(query_t *q);
-/* returns number of results; *out is malloc'd array of eid */
-uint32_t query_exec(const esidx_t *db, const query_t *q, eid_t **out);
-
-/* helpers exposed for main.c / future protocol layer */
-eid_t di_lookup(const esidx_t *db, const char *path);
-void  path_of(const esidx_t *db, eid_t id, char *out, size_t outsz);
-uint16_t ext_intern(esidx_t *db, const char *name);
+/* exposed to the query and protocol layers */
+eid_t      di_lookup(const esidx_t *db, const char *path);
+void       path_of(const esidx_t *db, eid_t id, char *out, size_t outsz);
+uint16_t   ext_intern(esidx_t *db, const char *name);
+const char *name_of(const esidx_t *db, eid_t id);
+const char *ext_of_str(const esidx_t *db, eid_t id);
+/* parent directory path of `id`; empty string for the root itself */
+void       parent_path_of(const esidx_t *db, eid_t id, char *out, size_t outsz);
+/* Win32 attribute bits, as the ETP ATTRIBUTES column reports them */
+uint32_t   esidx_win_attributes(const esidx_t *db, eid_t id);
 
 /* scan counters (zero after esidx_init, filled by esidx_scan) */
 const scan_stats_t *esidx_scan_stats(const esidx_t *db);
 void esidx_log_stats(const esidx_t *db, const char *phase);
+
+/* ----------------------------------------------------------------- query */
+
+/* The query surface lives in syntax.h: the AST, the parser, the ETP match
+ * options and the executor. Kept out of here so that esidx.h stays the storage
+ * contract and syntax.h is the layer above it. */
+#include "syntax.h"
 
 #endif /* ESIDX_H */

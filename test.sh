@@ -128,8 +128,7 @@ q "parent:$TREE/empty"
 expect "parent: of an empty dir -> nothing"   "$(n "$LAST")" "0"
 
 q "parent:$TREE/sub1/nope"
-[ "$RC" -ne 0 ] && ok "parent: on a missing dir exits non-zero" \
-                || bad "parent: on a missing dir exits non-zero"
+expect "parent: on a missing dir -> nothing"    "$(n "$LAST")" "0"
 
 say "extension filter"
 
@@ -233,7 +232,126 @@ q "parent:$TREE/sub2"
 expect "parent: == find -mindepth 1 -maxdepth 1" \
        "$(n "$LAST")" "$(find "$TREE/sub2" -mindepth 1 -maxdepth 1 | wc -l)"
 
+# ------------------------------------------------------------------- syntax
+#
+# Everything above pins the *index*: the numbers come from find(1). Everything
+# below pins the *language*, against a second, deliberately flat fixture whose
+# contents are known exactly -- a syntax regression and an index regression look
+# identical from the outside but have nothing to do with each other, and the deep
+# chain in $TREE makes hand-written counts unreadable.
+#
+# FLAT (13 entries = 5 dirs + 8 files):
+#   dirs  FLAT sub1 sub2 empty sub1/deep
+#   txt   a.txt sub2/y.txt sub1/deep/leaf.txt
+#   conf  b.conf c.conf sub1/x.conf
+#   log   d.log
+#   none  .hidden      (a leading dot is not an extension)
+# NOTE the root entry's own name is the path it was given, not "flat", so a query
+# on the root's name or length behaves differently from a real directory's.
+
+FLAT="$TMP/flat"
+mkdir -p "$FLAT/sub1/deep" "$FLAT/sub2" "$FLAT/empty"
+: >"$FLAT/a.txt"
+printf 'x%.0s' $(seq 1 500)  >"$FLAT/b.conf"
+printf 'x%.0s' $(seq 1 5000) >"$FLAT/c.conf"
+: >"$FLAT/d.log"
+printf 'y%.0s' $(seq 1 200)  >"$FLAT/sub1/x.conf"
+printf 'z%.0s' $(seq 1 100)  >"$FLAT/sub2/y.txt"
+printf 'q' >"$FLAT/sub1/deep/leaf.txt"
+: >"$FLAT/.hidden"
+FLAT_DB="$TMP/flat.idx"
+build "$FLAT" "$FLAT_DB" >/dev/null
+expect "flat fixture has 13 entries" "$BUILT" "13"
+DB="$FLAT_DB"
+
+say "query language: L0 structural"
+
+q "folder:"      ; expect "folder:"                    "$(n "$LAST")" "5"
+q "file:"        ; expect "file:"                      "$(n "$LAST")" "8"
+q "!folder:"     ; expect "!folder:"                   "$(n "$LAST")" "8"
+q "root:"        ; expect "root: is the top level"     "$(n "$LAST")" "8"
+q "parent:$FLAT" ; expect "parent:"                    "$(n "$LAST")" "8"
+q "depth:1"      ; expect "depth:1"                    "$(n "$LAST")" "8"
+q "depth:2"      ; expect "depth:2"                    "$(n "$LAST")" "3"
+q "depth:>1"     ; expect "depth:>1"                   "$(n "$LAST")" "4"
+
+say "query language: L1 scalar and enum"
+
+q "ext:conf"          ; expect "ext:conf"              "$(n "$LAST")" "3"
+q "ext:conf;txt"      ; expect "ext: is a ;-separated OR" "$(n "$LAST")" "6"
+q "ext:*.conf"        ; expect "ext: tolerates a wildcard" "$(n "$LAST")" "3"
+q "ext:CONF"          ; expect "ext: folds case"       "$(n "$LAST")" "3"
+q "size:>1k" "file:"  ; expect "size:>1k"              "$(n "$LAST")" "1"
+q "size:<1k" "file:"  ; expect "size:<1k"              "$(n "$LAST")" "7"
+q "size:100..1000"    ; expect "size:a..b"             "$(n "$LAST")" "3"
+q "size:empty" "file:"; expect "size:empty is the 0-byte constant" "$(n "$LAST")" "3"
+q "dm:>2000-01-01"    ; expect "dm: with an ISO date"  "$(n "$LAST")" "13"
+q "dm:<2000-01-01"    ; expect "dm: before everything" "$(n "$LAST")" "0"
+q "dc:>2000-01-01"    ; expect "dc: has its own index" "$(n "$LAST")" "13"
+q "empty:"            ; expect "empty:"                "$(n "$LAST")" "4"
+q "attrib:h"          ; expect "attrib:h finds the dot file" "$(n "$LAST")" "1"
+q "attrib:!h"         ; expect "attrib:!h"             "$(n "$LAST")" "12"
+q "child-count:0"     ; expect "child-count:0"         "$(n "$LAST")" "9"
+q "len:4"             ; expect "len: (root name is its path)" "$(n "$LAST")" "3"
+
+say "query language: operators"
+
+q "ext:conf | ext:log"           ; expect "| is OR"           "$(n "$LAST")" "4"
+q "ext:conf !file:"              ; expect "! is AND-NOT"      "$(n "$LAST")" "0"
+q "!folder: ext:txt"             ; expect "juxtaposition is AND" "$(n "$LAST")" "3"
+q "<ext:conf ext:log>"           ; expect "<> groups, AND inside" "$(n "$LAST")" "0"
+q "ext:conf | <ext:log ext:txt>" ; expect "grouping inside OR" "$(n "$LAST")" "3"
+q "ext:<conf log>"               ; expect "fn:<a b> is an AND list" "$(n "$LAST")" "0"
+q "ext:<conf | log>"             ; expect "fn:<a|b> is an OR list"  "$(n "$LAST")" "4"
+q "ext:<conf;log>"               ; expect "fn:<a;b> is an OR list"  "$(n "$LAST")" "4"
+q "!!folder:"                    ; expect "!! collapses"      "$(n "$LAST")" "5"
+
+say "query language: text and modifiers"
+
+q "conf"                     ; expect "a bare word is a substring" "$(n "$LAST")" "3"
+q "CONF"                     ; expect "substring ignores case"     "$(n "$LAST")" "3"
+q "name:x.conf"              ; expect "name:"                      "$(n "$LAST")" "1"
+q "path:sub1"                ; expect "path: searches the full path" "$(n "$LAST")" "4"
+q "whole:b.conf"             ; expect "whole:"                     "$(n "$LAST")" "1"
+q "startwith:sub"            ; expect "startwith: no word boundary" "$(n "$LAST")" "2"
+q "prefix:sub"               ; expect "prefix: needs a word boundary" "$(n "$LAST")" "0"
+q "endwith:onf"            ; expect "endwith: no word boundary" "$(n "$LAST")" "3"
+q "suffix:onf"             ; expect "suffix: needs a word boundary" "$(n "$LAST")" "0"
+q "*.conf"                   ; expect "* is a wildcard over the whole name" "$(n "$LAST")" "3"
+q "?.conf"                   ; expect "? is one character"        "$(n "$LAST")" "3"
+q "regex:^b.*conf\$"         ; expect "regex:"                    "$(n "$LAST")" "1"
+q 'path:regex:sub1/deep$'    ; expect "modifiers stack in the value" "$(n "$LAST")" "1"
+q 'path:regex:[a-z]\.conf$'  ; expect "regex classes and escapes"  "$(n "$LAST")" "3"
+q "case:regex:^B"            ; expect "case: is case SENSITIVE"    "$(n "$LAST")" "0"
+q "nocase:regex:^B"          ; expect "nocase: overrides the default" "$(n "$LAST")" "1"
+q "ww:conf"                  ; expect "ww:"                       "$(n "$LAST")" "3"
+q "child:b.conf"             ; expect "child:<expr>"              "$(n "$LAST")" "1"
+
+say "query language: macros and unsupported functions"
+
+q "type:document"   ; expect "type:document"              "$(n "$LAST")" "3"
+q "type:picture"    ; expect "type: with no members here" "$(n "$LAST")" "0"
+q "type:nosuchtype" ; expect "type: unknown name -> nothing" "$(n "$LAST")" "0"
+q "content:xyz"     ; expect "content: parses, matches nothing" "$(n "$LAST")" "0"
+q "si:xyz"          ; expect "si: is rejected at execution" "$(n "$LAST")" "0"
+q "dupe:"           ; expect "dupe: is not supported yet" "$(n "$LAST")" "0"
+
+say "query language: errors are reported, never swallowed"
+
+for bad in '<a' 'a |' '"unterminated' 'ext:conf )'; do
+    "$BIN" query "$FLAT_DB" "$bad" >/dev/null 2>"$TMP/err"
+    if [ $? -ne 0 ] && grep -q 'parse error' "$TMP/err"; then
+        ok "rejects '$bad'"
+    else
+        bad "rejects '$bad'" "$(cat "$TMP/err")"
+    fi
+    cat "$TMP/err" >>"$DIAG"
+done
+
+DB="$TREE_DB"
+
 # ------------------------------------------------------------------ errors
+
 
 say "error handling"
 
@@ -295,9 +413,9 @@ grep -q '\[info \]' "$TMP/err" \
     || bad "ESIDX_LOG=info enables INFO"
 
 ESIDX_LOG=info "$BIN" query "$TREE_DB" count:1 >/dev/null 2>"$TMP/err"
-grep -q 'query: range=' "$TMP/err" \
+grep -q 'plan .* eval .* sort' "$TMP/err" \
     && ok "query phase timings are emitted" \
-    || bad "query phase timings are emitted"
+    || bad "query phase timings are emitted" "$(cat "$TMP/err")"
 
 ESIDX_LOG=debug "$BIN" query "$TREE_DB" count:1 >/dev/null 2>"$TMP/err"
 grep -q '\[debug\]' "$TMP/err" \
@@ -325,10 +443,28 @@ say "performance (visibility, not assertions)"
 
 DB="$TMP/perf.idx"
 "$BIN" build "$TEST_ROOT" -o "$DB" 2>&1 >/dev/null | sed 's/^/   /'
-ESIDX_LOG=info "$BIN" query "$DB" count:5 2>&1 >/dev/null \
-    | grep -E 'query:|loaded in' | sed 's/^/   /'
-ESIDX_LOG=info "$BIN" query "$DB" "parent:$TEST_ROOT" "count:5" 2>&1 >/dev/null \
-    | grep -E 'query: candidates' | sed 's/^/   /'
+printf '\n== the queries the ETP client actually issues\n'
+# These four shapes are what EtpClient.query + EtpBrowseViewModel put on the wire.
+# Printing them next to the phase timings is the point of the section: it is the
+# only place where the driver's effect is visible.
+ESIDX_LOG=info "$BIN" query "$DB" "ext:conf" "sort:size:desc" "count:5" \
+    2>&1 >/dev/null | grep -E 'matched|loaded in' | sed 's/^/   unfiltered   /'
+ESIDX_LOG=info "$BIN" query "$DB" "parent:$TEST_ROOT" "folder:" \
+    "sort:name:ascending" "count:200" \
+    2>&1 >/dev/null | grep -E 'matched|loaded in' | sed 's/^/   browse:parent /'
+ESIDX_LOG=info "$BIN" query "$DB" "image:" "count:50" \
+    2>&1 >/dev/null | grep -E 'matched|loaded in' | sed 's/^/   category:image /'
+ESIDX_LOG=info "$BIN" query "$DB" "path:$TEST_ROOT" "*.conf" "size:>1k" \
+    "sort:date_modified:descending" "count:50" \
+    2>&1 >/dev/null | grep -E 'matched|loaded in' | sed 's/^/   search:path+wc/'
+
+printf '\n== driver selection (why the timings above look the way they do)\n'
+ESIDX_LOG=debug "$BIN" query "$DB" "parent:$TEST_ROOT" "folder:" "count:5" \
+    2>&1 >/dev/null | grep -E 'plan: driver' | sed 's/^/   /'
+ESIDX_LOG=debug "$BIN" query "$DB" "size:>1k" "file:" "count:5" \
+    2>&1 >/dev/null | grep -E 'plan: driver' | sed 's/^/   /'
+ESIDX_LOG=debug "$BIN" query "$DB" "someword" "count:5" \
+    2>&1 >/dev/null | grep -E 'plan: (driver|no index)' | sed 's/^/   /'
 
 printf '\n== summary: %d passed, %d failed\n' "$PASS" "$FAIL"
 if [ "$FAIL" -ne 0 ]; then
