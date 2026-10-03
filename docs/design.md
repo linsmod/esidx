@@ -322,6 +322,27 @@ inverted indexes.
 4. **TopK** — when `offset + count` is far below the candidate count, maintain a
    bounded heap instead of a full sort.
 
+**Implemented: step 2, and step 1 well enough to serve it.** No histogram is
+needed yet, because for every leaf that can win the driver role the exact count
+is already available in O(1) or O(log n), which is better than a 128-bucket
+estimate would be:
+
+| Leaf | Estimate | Cost |
+|---|---|---|
+| `parent:` | the children vector's length | O(1) |
+| `root:` | the root's children length | O(1) |
+| `file:` / `folder:` | the type bitmap's popcount | O(n/64) |
+| `ext:` | the sum of the per-extension cardinalities, computed once in `finalize` | O(k) |
+| `size:` / `dm:` / `dc:` | the same binary search the range query will do | O(log n + k) |
+| text, `regex:`, `depth:`, `attrib:` | not index-backed, never a driver | — |
+
+A `NOT` can never seed: its result is the complement, which is large. An `OR`
+returns at least the sum of its operands, so it only wins when both operands are
+poor. That is the whole of `pick_driver`, and the choice is logged at DEBUG so it
+is inspectable rather than implicit.
+
+Steps 3 and 4 are deliberately absent; §10 records why.
+
 ### 6.3 Execution
 
 ```
@@ -505,33 +526,74 @@ Each row: source → what was taken → how it lands here → why it changed.
 
 | § | Component | File | State |
 |---|---|---|---|
-| 4.1 | Columnar table, name pool, ext pool | `store.c` | done, 8 columns; `atime` / aggregates / `frn` outstanding |
-| 4.2 | `path_of()` parent-chain rebuild | `store.c:153` | done; path materialisation pending §4.2 |
-| 5.1 | `dir_id → children`, `path → eid` hash | `store.c:118,243` | done |
-| 5.2 | trigram index, sorted/reversed name arrays | — | not started (P4) |
-| 5.3 | sorted array + delta buffer | `store.c:186,200` | structure done; the delta path has no writer until P2 |
-| 5.4 | dense bitset | `index.c` | done; CRoaring at P4 (D7) |
-| 5.5 | aggregate columns + bubbling | — | not started (needs P2) |
+| 4.1 | Columnar table, name pool, ext pool | `store.c` | done, 9 columns (`by_ctime` added for `dc:`); aggregates and `frn` still outstanding |
+| 4.2 | `path_of()` parent-chain rebuild | `store.c` | done; path materialisation pending §4.2 |
+| 5.1 | `dir_id → children`, `path → eid` hash | `store.c` | done |
+| 5.2 | trigram index, sorted/reversed name arrays | — | not started (P4); the in-memory scan is measured below and is the reason |
+| 5.3 | sorted array + delta buffer | `store.c` | structure done; the delta path has no writer until P2 |
+| 5.4 | dense bitset | `index.c` | done; CRoaring at P4 (D7). Set algebra lives here, not in the executor |
+| 5.4 | ext bitmaps, file:/folder: bitmaps | `store.c` | done — built in `finalize`, so the snapshot format is unchanged |
+| 5.5 | aggregate columns + bubbling | — | not started (needs P2); `child-count:` is derived from the children vector instead |
 | 5.6-5.8 | content, dupe, sparse metadata | — | not started (P6) |
-| 6.3 | execution: candidates → bitmaps → matchers → sort → slice | `query.c:86` | done for the L0/L1 subset; no second-stage filtering |
-| 6.4 | result cache | — | not started (P1) |
+| 6.1 | lexer → parser → AST | `lexer.c`, `parser.c` | **done** |
+| 6.2 | optimiser: selectivity estimate, driver selection | `query.c` | **done** for step 1-2 (exact cardinality per leaf, no histogram yet). Step 3 ordering and step 4 TopK not started — see below |
+| 6.3 | execution: candidates → bitmaps → matchers → sort → slice | `query.c` | **done**, including the second-stage FILTER_* pass |
+| 6.4 | result cache | `etp.c` | **done** — the full sorted set is kept and re-sliced |
 | 7 | full scan | `scan.c` | done; concurrency (D6) not started |
 | 7 | incremental | — | not started (P2) |
-| 1-3 | FTP + `SITE EVERYTHING` + syntax layer | — | not started (P1/P3) |
+| 1-3 | FTP + `SITE EVERYTHING` | `etp.c` | **done** — all 32 subcommands, 22 sort names, the data channel for other FTP clients |
 
-**Measured baseline** (WSL, Ubuntu 22.04, ext4, `-O2`, single thread):
+**Two things in §6.2 deliberately not built**, with the reasoning recorded
+rather than the code written on speculation:
 
-| Tree | Entries | Scan | Finalize | Load | Unfiltered query | Snapshot |
-|---|---|---|---|---|---|---|
-| `/etc` | 1 617 | 5-60 ms | 0.4 ms | 0.4 ms | < 1 ms | 95 KB |
-| `/usr` | 116 888 | 5.2 s (22 k entries/s) | 24 ms | 38 ms | 46 ms (42 ms of it sorting) | 7.3 MB |
+- **Step 3, ordering the non-indexable conditions.** There is exactly one
+  non-indexable leaf class today (the text scan), so ordering among them cannot
+  pay. It becomes worth building when §5.2's trigram index lands and there are
+  several text leaves to order.
+- **Step 4, the bounded TopK heap.** `RESULT_COUNT` has to be the size of the
+  *whole* matched set (etp_server.c:5190), so every id is collected and sorted
+  regardless; and keeping the sorted array is what lets the protocol layer
+  re-slice a page without re-running the query. A heap would replace the
+  `O(n log n)` compare stage with `O(n log k)` — real, but on the key this client
+  actually sorts by, the row set is already a directory listing. Measured below:
+  sorting only becomes the dominant cost above ~10⁴ rows.
 
-Scan stats for `/usr`: 8 590 directories, 108 298 files, max depth 13,
-`fstatat` failures 0, 8 591 `getdents64` calls totalling 5.0 MB, 0 unreadable
-directories. Reproduce with `ESIDX_LOG=info ./esidx build /usr -o /tmp/usr.idx`.
+**Measured baseline** (WSL2, Ubuntu 22.04, ext4, `-O2`, single thread; reproduce
+with `./round.sh /usr`):
 
-The 46 ms unfiltered query is the reason the optimiser (§6.2) cannot wait: it is
-a full sort over 116 888 rows with no driver index.
+| Tree | Entries | Scan | Finalize | Load | Snapshot |
+|---|---|---|---|---|---|
+| `/etc` | 1 622 | 5.4 ms (298 k/s) | 0.4 ms | 0.3 ms | 95 KB |
+| `/usr` | 116 888 | 4.23 s (27.6 k/s) | 37-56 ms | 55 ms | 6.9 MB |
+
+`/usr` scan stats: 8 590 directories, 108 298 files, max depth 13, 567 distinct
+extensions. Finalize now also builds the ctime sorted array, the ext bitmaps and
+the type bitmaps, which is why it grew from ~24 ms to ~37 ms; the load path pays
+the same ~20 ms extra.
+
+Query cost on `/usr`, as the protocol layer reports it — the candidate count is
+the whole point, because it is what the driver index bought:
+
+| Query | Candidates | plan | eval | sort | total |
+|---|---|---|---|---|---|
+| `parent:"/usr" folder:` | **14** / 116 888 | 0.18 ms | 0.01 ms | 0.01 ms | **0.33 ms** |
+| `ext:conf` | 608 / 116 888 | 0.17 ms | 0.01 ms | 0.13 ms | 0.37 ms |
+| `image:` (category) | 13 569 / 116 888 | 0.27 ms | 0.10 ms | 4.98 ms | 5.4 ms |
+| `path:/usr *.conf size:>1k` | 78 296 / 116 888 | 0.39 ms | **23.8 ms** | 0.03 ms | 24.3 ms |
+
+Two things fall out of that table:
+
+- The old implementation spent 42 of 46 ms in `qsort` over 116 888 rows on an
+  *unfiltered* query. A browse request now costs 0.33 ms because `parent:` seeds
+  the candidate bitmap and the matcher pass walks 14 rows, not the index. That was
+  the reason §6.2 step 2 was on the roadmap; it is now the reason it is not.
+- The remaining 23.8 ms is a `*.conf` wildcard scan over 78 296 candidates. That
+  is §5.2's trigram index, and the measurement is what justifies its activation
+  threshold (10⁶ entries) being optimistic: at 10⁵ the in-memory scan is already
+  the dominant cost of a real query. The gate should be revisited at P4 — either
+  lower the threshold or add the name-sorted and reversed-name arrays from §5.2,
+  which are cheaper than a trigram index and would serve `startwith:`/`endwith:`
+  directly.
 
 ---
 

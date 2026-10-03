@@ -392,9 +392,10 @@ static void do_query(const esidx_t *db, client_t *c)
 
     send_query_results(db, c, &c->cache);
 
-    LOGI("query: '%s' -> %u results (dirs=%u files=%u) | plan %.3f eval %.3f "
-         "sort %.3f ms | total %.3f ms",
+    LOGI("query: '%s' -> %u results (dirs=%u files=%u) | %u of %u candidates from "
+         "driver leaf #%u of %u | plan %.3f eval %.3f sort %.3f ms | total %.3f ms",
          c->search, c->cache.n, c->cache.n_dir, c->cache.n_file,
+         c->cache.seed, db->et.count, c->cache.driver, c->cache.leaf_cnt,
          (double)c->cache.t_plan_us / 1000.0,
          (double)c->cache.t_eval_us / 1000.0,
          (double)c->cache.t_sort_us / 1000.0,
@@ -1185,6 +1186,11 @@ static void client_init(client_t *c, int fd)
     c->pasv_listen = -1;
     c->data_fd = -1;
     c->peer_fd = -1;
+    /* etp_server.c:1207 -- COUNT defaults to "unlimited", not zero. It matters:
+     * the client only sends COUNT when it is positive (EtpClient.java:260), so a
+     * default of 0 would make every query that omitted it return no rows at all,
+     * while the reference returns the whole match set. */
+    c->count = 0xffffffffu;
     snprintf(c->cwd, sizeof(c->cwd), "/");
 }
 
