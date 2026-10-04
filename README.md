@@ -273,18 +273,23 @@ Building it, on the same host:
 
 | | `/usr` | `/work` = **5 476 485** entries, 506 GiB |
 |---|---|---|
-| scan (walk) | 1 206 ms | **55 653 ms** (98 k/s) |
-| finalize | 286 ms | 5 194 ms |
+| scan (walk) | 1 206 ms | **53 143 ms** (103 k/s) |
+| finalize | 286 ms | 6 313 ms |
 | save | 27 ms | 600 ms |
-| **build, total** | **1 492 ms** | **60 847 ms** |
+| **build, total** | **1 492 ms** | **59 456 ms** |
 | load | 327 ms | 5 664 ms |
-| snapshot | 25.1 MiB | 414 MiB |
-| peak rss | 82.2 MiB | **1 223 MiB** |
+| snapshot | 20.8 MiB | 298 MiB |
+| peak rss | 80.6 MiB | **1 174 MiB** |
+
+The `/work` column is one run of `./ledger.sh /work`, so its walk figure moves with the
+page cache by several seconds between runs — 53.1 s here against the 55.7 s the same
+command printed before this change. The byte counts and the ledger below do not move: they
+are what the code does to a tree of that shape, not what the disk was doing.
 
 `find /work -xdev -printf '%y %b' | awk` — one `lstat` and one `readdir` per entry and
-nothing else — takes **56.75 s** on the same tree, so the walk costs 2 % less than
-`find` and the whole build, every derived index and a 414 MiB snapshot included, costs
-7 % more than `find`'s single pass. Design §10 has the per-syscall split, and it says the
+nothing else — takes **56.75 s** on the same tree, so the walk costs 6 % less than
+`find` and the whole build, every derived index and a 298 MiB snapshot included, costs
+5 % more than `find`'s single pass. Design §10 has the per-syscall split, and it says the
 walk is 59 % `getdents64` (652 k calls, 392 B each, latency-bound) and 18 % `fstatat`
 (1.81 µs a call, and no I/O at all, which is why "batch stat by inode" is not worth
 building); the only lever left on that walk is D6's concurrency.
@@ -295,14 +300,15 @@ building); the only lever left on that walk is D6's concurrency.
 each — and it is the only way to tell a structure that is too big from one that is merely
 sized by the wrong number. `./ledger.sh <tree>` prints it together with the snapshot size
 and the query shapes, so a figure quoted from it can be re-measured with one command. On
-`/work` (1 223 MiB peak, 1 092 MiB accounted):
+`/work` (1 174 MiB peak, 1 039 MiB accounted):
 
 | | touched | address | |
 |---|---|---|---|
 | name trigram lists | 318.6 MiB | 320.3 | 99 % of the posting-list capacity in use |
 | entry columns | 282.0 | 282.0 | trimmed to the entry count, incl. the `nchild` aggregate |
 | sorted arrays ×3 | 250.7 | 250.7 | 62.7 MiB of that is `sidx_ent_t` padding |
-| names pool | 96.0 | 128.0 | 1 499 994 distinct basenames over 5 476 485 entries |
+| names pool | 37.3 | 64.0 | one copy per distinct name: 1 499 995 of them |
+| name intern table | 5.7 | 8.0 | 2 097 152 slots for those names |
 | dir vector headers | 16.0 | 16.0 | indexed by directory ordinal, not by id |
 | eid → dir ordinal map | 6.4 | 6.4 | 2 097 152 slots for 630 472 directories |
 | name rank | 63.8 | 122.6 | 1 493 203 distinct folded names |
@@ -310,11 +316,14 @@ and the query shapes, so a figure quoted from it can be re-measured with one com
 | ext index | 15.1 | 11.5 | 16 384 slots for 6 765 extensions |
 | dir path hash | 5.0 | 16.0 | load factor 0.31 |
 
-What is left, largest first: the names pool holds 3.65 copies of every name, the three
-sorted arrays spend 62.7 MiB on `sidx_ent_t` padding, and the children vectors are at 53 %
-occupancy. The extension pool's own lookup was a scan of every extension interned so far
-until this release: 519 string compares per intern on `/work`, 2.19 G of them per build,
-now 1.16 per intern — 5.8 s of user time on a build that is otherwise I/O-bound.
+What is left, largest first: the three sorted arrays spend 62.7 MiB on `sidx_ent_t`
+padding, the children vectors are at 53 % occupancy, and 56.6 MiB of directory paths sit
+in a pool at all when the parent chain already rebuilds them. The names pool used to be
+the first item on that list — 3.65 copies of every name, 96 MiB — and is now 37.3 MiB
+with a 5.7 MiB table beside it. The extension pool's own lookup was a scan of every
+extension interned so far until recently: 519 string compares per intern on `/work`,
+2.19 G of them per build, now 1.16 per intern — 5.8 s of user time on a build that is
+otherwise I/O-bound.
 
 Query cost on `/usr`:
 

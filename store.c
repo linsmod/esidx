@@ -12,26 +12,166 @@
 
 /* ------------------------------------------------------------ string pool */
 
-uint32_t sp_intern(strpool_t *sp, const char *s, size_t n)
+int sp_intern(strpool_t *sp, const char *s, size_t n, uint32_t *off)
 {
     if (sp->len + n + 1 > sp->cap) {
         size_t ncap = sp->cap ? sp->cap : 65536;
         while (sp->len + n + 1 > ncap) ncap *= 2;
         char *nb = realloc(sp->buf, ncap);
-        if (!nb) return 0;
+        if (!nb) return -1;
         sp->buf = nb;
         sp->cap = ncap;
     }
-    uint32_t off = (uint32_t)sp->len;
-    memcpy(sp->buf + off, s, n);
-    sp->buf[off + n] = '\0';
+    uint32_t at = (uint32_t)sp->len;
+    memcpy(sp->buf + at, s, n);
+    sp->buf[at + n] = '\0';
     sp->len += n + 1;
-    return off;
+    *off = at;
+    return 0;
 }
 
 const char *sp_get(const strpool_t *sp, uint32_t off)
 {
     return sp->buf + off;
+}
+
+/* FNV-1a over the bytes of a NUL-terminated string. One hash function for every table
+ * in this file, because three of them are keyed on a name and a reader comparing them
+ * needs to know they are keyed the same way. */
+static uint32_t hash_bytes(const char *s)
+{
+    uint32_t h = 2166136261u;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        h ^= *p;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+/* ------------------------------------------------- the names intern table
+ *
+ * `names` used to be append-only, so a tree with many directories holding the same
+ * basenames stored one copy per *entry*: 1 499 994 distinct basenames over 5 476 485
+ * entries on /work, and 96 MiB of pool where the distinct names need about 26. Interning
+ * is the textbook answer and it is the same shape ext_intern() already has -- open
+ * addressing on the string, slot value = pool offset + 1, 0 = empty, FNV over the
+ * bytes. This is the fifth place that convention is written down and the second table
+ * keyed on the name itself; rk_intern() above is the third and hashes content for a
+ * different reason.
+ *
+ * Derived, so no snapshot mentions it (D4): a load rebuilds it from the offsets the
+ * entries already carry, which is one pass and no pool writes. The *pool* is persisted
+ * as it stands, deduped -- so a snapshot is smaller, and a v3 snapshot that predates this
+ * (a pool with duplicates in it) loads unchanged and simply keeps the duplicates, because
+ * two entries pointing at two copies of one name are two keys. Correctness does not
+ * depend on the pool being clean; only the saving does.
+ */
+#define NM_TAB_MIN 1024
+
+/* Fill the table from the entries -- the post-load path, where no table exists yet.
+ *
+ * One slot per *distinct* name, and the strcmp that costs is what makes it one: the
+ * entries share names by design (that is the whole point of the pool), so a slot per
+ * entry puts 5 476 485 keys into a table sized for 1 499 994 of them and the probe below
+ * never finds a free slot. The first version of this function did exactly that and hung
+ * the /work build at 100 % CPU; see nm_tab_grow() for why growth must not come through
+ * here at all. Sized from the entry count, which is an upper bound on the distinct names
+ * and therefore puts the load factor under 3/4 without knowing the real figure. */
+static int nm_tab_build(esidx_t *db)
+{
+    uint32_t ncap = NM_TAB_MIN;
+    while (ncap * 3 < db->et.count * 4) ncap *= 2;
+
+    uint32_t *nt = calloc(ncap, sizeof(uint32_t));
+    if (!nt) {
+        LOGE("names: cannot allocate the intern table (%u slots)", ncap);
+        return -1;
+    }
+    uint32_t mask = ncap - 1, count = 0;
+    for (uint32_t i = 0; i < db->et.count; i++) {
+        if (db->et.flags[i] & EF_DEAD) continue;    /* a tombstone owns no name */
+        uint32_t off = db->et.name[i].off;
+        const char *name = sp_get(&db->names, off);
+        uint32_t h = hash_bytes(name) & mask;
+        while (nt[h] && strcmp(sp_get(&db->names, nt[h] - 1), name) != 0)
+            h = (h + 1) & mask;
+        if (nt[h]) continue;                        /* already interned */
+        nt[h] = off + 1;
+        count++;
+    }
+    free(db->nm_tab);
+    db->nm_tab = nt;
+    db->nm_mask = mask;
+    db->nm_count = count;
+    return 0;
+}
+
+/* Double the table, rehashing the keys it already holds.
+ *
+ * The entries are deliberately not read: they are the wrong source here. Growth happens
+ * once per 3/4 load, and re-inserting every entry on each of those passes is both O(n)
+ * per doubling and -- because the entries outnumber the distinct names -- a table that
+ * fills up. Keys in the table are unique by construction, so no strcmp is needed either:
+ * a slot holds an offset and the string at that offset is the key. */
+static int nm_tab_grow(esidx_t *db)
+{
+    uint32_t ncap = (db->nm_mask + 1) * 2;
+    uint32_t *nt = calloc(ncap, sizeof(uint32_t));
+    if (!nt) {
+        LOGE("names: cannot grow the intern table to %u slots", ncap);
+        return -1;
+    }
+    uint32_t mask = ncap - 1;
+    for (uint32_t s = 0; s <= db->nm_mask; s++) {
+        if (!db->nm_tab[s]) continue;
+        uint32_t off = db->nm_tab[s] - 1;
+        uint32_t h = hash_bytes(sp_get(&db->names, off)) & mask;
+        while (nt[h]) h = (h + 1) & mask;
+        nt[h] = off + 1;
+    }
+    free(db->nm_tab);
+    db->nm_tab = nt;
+    db->nm_mask = mask;
+    return 0;
+}
+
+/* The pool offset of `name`, appending it only if it is not there yet.
+ *
+ * Returns offset + 1, and 0 on failure, which is the slot convention again: offset 0 is
+ * the first name every index ever interns, so it cannot double as the error. */
+static uint32_t name_intern(esidx_t *db, const char *name, uint32_t n)
+{
+    /* A load leaves the table empty, and building it is a pass over the entries. Doing
+     * that lazily rather than in the load path means a server that is only served from
+     * never pays for it -- the same bargain esidx_build_name_rank() makes. */
+    if (!db->nm_tab && nm_tab_build(db) != 0) return 0;
+    /* 3/4 load, so the table cannot fill before the next doubling. */
+    if ((db->nm_count + 1) * 4 > (db->nm_mask + 1) * 3 && nm_tab_grow(db) != 0)
+        return 0;
+
+    uint32_t h = hash_bytes(name) & db->nm_mask;
+    while (db->nm_tab[h]) {
+        uint32_t off = db->nm_tab[h] - 1;
+        if (strcmp(sp_get(&db->names, off), name) == 0) return db->nm_tab[h];
+        h = (h + 1) & db->nm_mask;
+    }
+
+    uint32_t off;
+    if (sp_intern(&db->names, name, n, &off) != 0) {
+        LOGE("names: cannot append '%s' to the pool", name);
+        return 0;
+    }
+    db->nm_tab[h] = off + 1;
+    db->nm_count++;
+    return off + 1;
+}
+
+static void nm_tab_free(esidx_t *db)
+{
+    free(db->nm_tab);
+    db->nm_tab = NULL;
+    db->nm_mask = 0;
+    db->nm_count = 0;
 }
 
 /* ------------------------------------------------------- name order (design §10) */
@@ -49,22 +189,14 @@ static void fold_name(const char *name, char *buf, size_t bufsz)
     buf[i] = '\0';
 }
 
-static uint32_t hash_bytes(const char *s)
-{
-    uint32_t h = 2166136261u;
-    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
-        h ^= *p;
-        h *= 16777619u;
-    }
-    return h;
-}
-
 /* Rank of a folded name, interning it into `folded` if it is new.
  *
- * The table is hashed on the *content*, not on a pool offset, because sp_intern()
- * appends unconditionally and so hands two identical names two different offsets.
- * One strcmp per probe on a matching string is the price; hashing the offset would
- * have needed a deduplicating intern to be correct. */
+ * The table is hashed on the *content*, not on a pool offset, because `folded` is
+ * append-only and so hands two identical names two different offsets. One strcmp per
+ * probe on a matching string is the price; hashing the offset would need a deduplicating
+ * intern to be correct -- which the *names* pool now has (name_intern() above), and which
+ * this pool deliberately does not: ranks are over distinct folded names, so a second copy
+ * of one is a bug there rather than 70 MiB of waste. */
 static uint32_t rk_intern(esidx_t *db, const char *folded)
 {
     uint32_t h = hash_bytes(folded) & db->rk_mask;
@@ -74,7 +206,10 @@ static uint32_t rk_intern(esidx_t *db, const char *folded)
         h = (h + 1) & db->rk_mask;
     }
     uint32_t rank = db->n_ranks++;
-    db->rk_off[rank] = sp_intern(&db->folded, folded, strlen(folded));
+    if (sp_intern(&db->folded, folded, strlen(folded), &db->rk_off[rank]) != 0) {
+        db->n_ranks--;
+        return 0;
+    }
     db->rk_tab[h] = rank + 1;
     return rank;
 }
@@ -335,7 +470,8 @@ uint16_t ext_intern(esidx_t *db, const char *name)
         LOGE("ext: more than %u distinct extensions; ids are 16-bit", UINT16_MAX - 1);
         return 0;
     }
-    uint32_t noff = sp_intern(&db->exts, name, strlen(name));
+    uint32_t noff;
+    if (sp_intern(&db->exts, name, strlen(name), &noff) != 0) return 0;
     uint32_t cap = db->n_ext + 1;
     if (cap > db->ext_off_cap) {
         uint32_t ncap = db->ext_off_cap ? db->ext_off_cap * 2 : 256;
@@ -434,13 +570,21 @@ static int link_new(esidx_t *db, eid_t id)
 eid_t esidx_add(esidx_t *db, eid_t parent, const entry_in_t *in)
 {
     entry_table_t *et = &db->et;
+    size_t nlen = strlen(in->name);
+
+    /* The name first, before any column is touched: it is the one step here that can
+     * fail on its own, and a failed intern used to be stored as offset 0 -- which is the
+     * pool's *first* name, so the row came out carrying someone else's name. Interning
+     * returns offset + 1 and 0 on failure, because offset 0 is a real answer. */
+    uint32_t slot = name_intern(db, in->name, (uint32_t)nlen);
+    if (!slot) return EID_NONE;
+
     if (et->count == et->cap) {
         if (et_grow(et, et->cap ? et->cap * 2 : 1024) != 0) return EID_NONE;
     }
     eid_t id = et->count++;
-    size_t nlen = strlen(in->name);
 
-    et->name[id].off  = sp_intern(&db->names, in->name, nlen);
+    et->name[id].off  = slot - 1;
     et->name[id].len  = (uint32_t)nlen;
     et_init_col(et, id);
     et->parent[id]    = parent;
@@ -764,7 +908,9 @@ int di_hash_insert(esidx_t *db, eid_t dir)
     }
     if (reuse != UINT32_MAX) i = reuse;
     else di->ht_count++;
-    di->ht_off[i] = sp_intern(&db->dpaths, buf, strlen(buf)) + 1;
+    uint32_t poff;
+    if (sp_intern(&db->dpaths, buf, strlen(buf), &poff) != 0) return -1;
+    di->ht_off[i] = poff + 1;
     di->ht_val[i] = dir;
     return 0;
 }
@@ -1545,6 +1691,7 @@ void esidx_free(esidx_t *db)
 {
     free(db->names.buf); free(db->exts.buf); free(db->dpaths.buf); free(db->ext_off);
     free(db->ext_tab);
+    nm_tab_free(db);
     free(db->et.parent); free(db->et.depth); free(db->et.flags);
     free(db->et.size); free(db->et.mtime); free(db->et.ctime); free(db->et.stamp);
     free(db->et.ext_id); free(db->et.name); free(db->et.nchild);
@@ -1606,7 +1753,9 @@ static void di_hash_build(esidx_t *db)
         uint32_t probe = 0;
         while (db->di.ht_off[h] != 0) { h = (h + 1) & db->di.ht_mask; probe++; }
         if (probe > max_probe) max_probe = probe;
-        db->di.ht_off[h] = sp_intern(&db->dpaths, buf, strlen(buf)) + 1;
+        uint32_t poff;
+        if (sp_intern(&db->dpaths, buf, strlen(buf), &poff) != 0) { free(buf); return; }
+        db->di.ht_off[h] = poff + 1;
         db->di.ht_val[h] = i;
         db->di.ht_count++;
     }
@@ -1826,6 +1975,20 @@ void esidx_log_mem(const esidx_t *db, const char *phase)
     }
     mem_row(phase, "entry columns", col_used, col_bytes, &total);
     mem_row(phase, "names pool", db->names.len, db->names.cap, &total);
+    if (db->nm_tab) {
+        /* calloc'd, and only the occupied slots are ever written, so the address column
+         * is what a `ulimit -v` would see while the touched column is what the process
+         * is charged for. Four bytes against a name of ~20: the pool this table exists to
+         * shrink was three and a half times larger. */
+        mem_row(phase, "name intern table",
+                (uint64_t)db->nm_count * sizeof(uint32_t),
+                ((uint64_t)db->nm_mask + 1) * sizeof(uint32_t), &total);
+        LOGI("%s: mem names: %u distinct names over %u entries (%.2f copies each, was "
+             "one per entry), table %u slots",
+             phase, db->nm_count, et->count,
+             et->count ? (double)db->nm_count / (double)et->count : 0.0,
+             db->nm_mask + 1);
+    }
 
     /* The header array is indexed by directory ordinal, so its capacity tracks the
      * number of directories rather than the number of ids -- which is the whole

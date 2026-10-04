@@ -41,7 +41,13 @@ typedef struct {
     size_t  len, cap;
 } strpool_t;
 
-uint32_t   sp_intern(strpool_t *sp, const char *s, size_t n);
+/* Append `n` bytes plus a NUL, and hand back where they landed. Returns 0 on
+ * allocation failure, which is why the offset comes out through the pointer: a failed
+ * append used to return 0, and 0 is also where the pool's first string is, so a caller
+ * that stored it got the *first* name in the pool rather than an error. Four pools call
+ * this, and one of them interns (store.c's name table) -- where an ambiguous 0 is not a
+ * theoretical question. */
+int      sp_intern(strpool_t *sp, const char *s, size_t n, uint32_t *off);
 const char *sp_get(const strpool_t *sp, uint32_t off);
 
 /* ------------------------------------------------- entry table (columnar) */
@@ -317,6 +323,18 @@ typedef struct {
 
 typedef struct {
     strpool_t     names;
+    /* The intern table for `names`: open addressing on the name, slot value = pool
+     * offset + 1, 0 = empty. It is what keeps the pool at one copy per *distinct*
+     * basename rather than one per entry -- 1 499 994 against 5 476 485 on /work, which
+     * is 96 MiB of pool where 26 will do. The same shape as the ext table two fields
+     * down, and derived like it (D4): a load rebuilds it from the offsets the entries
+     * carry, and nothing in a snapshot depends on it.
+     *
+     * Built by esidx_add() as names arrive, and once on the first add after a load --
+     * lazily, so a server that is only served from never pays for the pass. */
+    uint32_t     *nm_tab;
+    uint32_t      nm_mask;
+    uint32_t      nm_count;    /* occupied slots = distinct names interned */
     strpool_t     exts;
     /* The dir hash's keys: one full path per directory, in interning order, and
      * deliberately NOT in `names`. A hash slot has to hold something stable to

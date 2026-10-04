@@ -69,10 +69,14 @@ col2() { printf '%s\n' "$1" | awk 'NF{print $2}' | tr '\n' ' '; }
 paths() { printf '%s\n' "$1" | awk 'NF{print $NF}' | tr '\n' ' '; }
 
 # build <root> <outfile> -> sets $BUILT to the entry count, echoes diagnostics
+# Bounded, because one storage bug made a build loop at 100 % CPU rather than fail, and
+# a suite that waits with it reports nothing at all. 120 s is three orders of magnitude
+# more than the largest tree here needs (/etc is under a second), so a timeout is never
+# the answer being tested -- and TEST_ROOT=/ ./test.sh still fits, having room to spare.
 BUILT=""
 build() {
     # the "indexed N entries" line goes to stderr, so capture it there
-    if "$BIN" build "$1" -o "$2" >/dev/null 2>"$TMP/be"; then
+    if timeout 120 "$BIN" build "$1" -o "$2" >/dev/null 2>"$TMP/be"; then
         BUILT=$(sed -n 's/^indexed \([0-9]*\) entries.*/\1/p' "$TMP/be")
         grep -E '^indexed ' "$TMP/be" | sed 's/^/   /'
         cat "$TMP/be" >>"$DIAG"
@@ -1265,6 +1269,114 @@ q "ext:${PAD}e5"
 expect "a 6 900-character ext: term is answered whole, not cut" "$(n "$LAST")" "1"
 strays=$(printf '%s\n' "$LAST" | grep -vc '\.e5$')
 expect "and the term at its very end is the one that matched" "$strays" "0"
+
+# ----------------------------------------------------------- name interning
+#
+# The pool holds one copy per *distinct* name, so the fixture's 250 `leaf.txt` files --
+# one per nested directory, the deepest 252 levels down -- share a single copy of it.
+# That is invisible in every count above, which is why it needs two assertions of its
+# own: one that the sharing happened, and one that sharing did not make two rows the
+# same row.
+#
+# The expected pool size is derived from find(1) and sort -u, like everything else here:
+# the sum of the distinct basenames plus the root's own stored name, which is the
+# absolute path it was indexed from (scan.c:169) rather than a basename. A pool that
+# stored one copy per entry would be larger by every duplicate, and the assertion names
+# the number it wants so a failure says which of the two it was.
+
+say "name interning"
+
+DB="$TREE_DB"
+
+# The pool size is a build-time statistic (INFO, AGENTS.md 2.3), so this build is its own.
+"$BIN" -v 3 build "$TREE" -o "$TMP/pool.idx" >/dev/null 2>"$TMP/err"
+POOL_GOT=$(sed -n 's/.*names_pool=\([0-9]*\) bytes.*/\1/p' "$TMP/err" | head -1)
+POOL_WANT=$({ printf '%s\n' "$TREE"
+              find "$TREE" -mindepth 1 | awk -F/ '{print $NF}'
+            } | sort -u | awk '{ n += length($0) + 1 } END { print n + 0 }')
+expect "the names pool holds one copy per distinct name ($POOL_GOT bytes)" \
+    "${POOL_GOT:-0}" "$POOL_WANT"
+
+q "name:leaf.txt"
+expect "all 250 nested leaf.txt files are found by name" "$(n "$LAST")" "250"
+distinct_paths=$(printf '%s\n' "$LAST" | awk 'NF{print $NF}' | sort -u | grep -c .)
+expect "and sharing one copy left every one of them its own path" \
+    "$distinct_paths" "250"
+# The size column is the other half of the row's identity, and these files are all one
+# byte, so it cannot be used here -- the paths above are the discriminator, and they are
+# read out of the *snapshot*, so this is also the reload path.
+q "ext:txt"
+expect "the extension index is unaffected by the pool sharing" "$(n "$LAST")" "253"
+
+# And the same through a reconcile, which is where the table is rebuilt from the entries
+# rather than filled as they arrive: a new file with a name the pool already holds must
+# not add a second copy, and must still be its own row.
+NEW="$TREE/sub2/leaf.txt"
+printf 'q' >"$NEW"
+"$BIN" -v 3 update "$TREE_DB" >/dev/null 2>"$TMP/err"
+q "name:leaf.txt"
+expect "a name the pool already holds is indexed as a new row" "$(n "$LAST")" "251"
+distinct_paths=$(printf '%s\n' "$LAST" | awk 'NF{print $NF}' | sort -u | grep -c .)
+expect "with 251 distinct paths among them" "$distinct_paths" "251"
+POOL_AFTER=$(sed -n 's/.*names_pool=\([0-9]*\) bytes.*/\1/p' "$TMP/err" | head -1)
+expect "and the pool did not grow for it" "$POOL_AFTER" "$POOL_GOT"
+# The table the reconcile had to build first -- every entry here shares one of ~30 names,
+# so it is built from the entries and not from the walk, and a fill that takes one slot
+# per entry instead of per name reports the entry count. The order the two groups above
+# are created in does not matter here, which is why this is the assertion and not the
+# growth one: sibling directories come back in filesystem order, not the order they were
+# made in.
+NM_AFTER=$(sed -n 's/.*mem names: \([0-9]*\) distinct names over.*/\1/p' "$TMP/err" | head -1)
+NM_WANT=$({ printf '%s\n' "$TREE"
+            find "$TREE" -mindepth 1 | awk -F/ '{print $NF}'
+          } | sort -u | grep -c .)
+expect "the table a reconcile builds holds one slot per distinct name" \
+    "${NM_AFTER:-0}" "$NM_WANT"
+rm -f "$NEW"
+
+# The fixture above has ~30 distinct names over 1 522 entries, which cannot reach the
+# part of the table that broke: the table only grows once per 3/4 load of *distinct*
+# names, so with 30 names it never grows at all. This one is built to cross that line
+# with duplicates already in the table's source, which is what a growth pass reads.
+#
+# The order of the three groups is the whole point. Directory 1 holds 400 distinct
+# names, directory 2 holds the *same* 400 again and then 400 more -- so the walk interns
+# 768 distinct names (the point where the table grows) only after 400 of them are already
+# stored twice. A growth pass that takes one slot per entry rather than per name reports
+# 1 169 where the answer is 801, and on a tree with /work's 3.65 copies per name it fills
+# the table up and never finishes. `build` is bounded by a timeout, so the second half of
+# that is a failure rather than a stuck suite.
+DUP="$TMP/dup"
+mkdir -p "$DUP/1" "$DUP/2"
+for i in $(seq 1 400);   do printf 'a' >"$DUP/1/n${i}.txt"; done
+for i in $(seq 1 400);   do printf 'a' >"$DUP/2/n${i}.txt"; done
+for i in $(seq 401 800); do printf 'a' >"$DUP/2/n${i}.txt"; done
+DUP_DB="$TMP/dup.idx"
+# at -v 3, because the pool size is a build statistic (INFO, AGENTS.md 2.3) and the
+# `build` helper runs at the default level
+if timeout 120 "$BIN" -v 3 build "$DUP" -o "$DUP_DB" >/dev/null 2>"$TMP/err"; then
+    ok "a build whose entries outnumber its names finishes"
+else
+    bad "a build whose entries outnumber its names finishes" "see $TMP/err"
+fi
+cat "$TMP/err" >>"$DIAG"
+DB="$DUP_DB"
+# 800 distinct names + the two directory names + the root's own stored name, over 1 201
+# entries.
+POOL_DUP=$(sed -n 's/.*names_pool=\([0-9]*\) bytes.*/\1/p' "$TMP/err" | head -1)
+POOL_DUP_WANT=$({ printf '%s\n' "$DUP"
+                  find "$DUP" -mindepth 1 | awk -F/ '{print $NF}'
+                } | sort -u | awk '{ n += length($0) + 1 } END { print n + 0 }')
+expect "800 distinct names stored 1 200 times is 803 names in the pool" \
+    "${POOL_DUP:-0}" "$POOL_DUP_WANT"
+# The pool cannot tell one slot per name from one slot per entry -- a duplicated name
+# still resolves to its one copy either way. The ledger's own count can, and it is the
+# number that decides whether the table can ever fill up.
+NM_DISTINCT=$(sed -n 's/.*mem names: \([0-9]*\) distinct names over.*/\1/p' "$TMP/err" | head -1)
+expect "and the intern table holds one slot per name, not per entry" \
+    "${NM_DISTINCT:-0}" "803"
+q "name:n400.txt"
+expect "and both copies of one of them are still their own rows" "$(n "$LAST")" "2"
 
 # --------------------------------------------------------------- logging
 

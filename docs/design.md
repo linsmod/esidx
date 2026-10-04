@@ -707,6 +707,7 @@ Each row: source → what was taken → how it lands here → why it changed.
 | § | Component | File | State |
 |---|---|---|---|
 | 4.1 | Columnar table, name pool, ext pool | `store.c` | done, 9 columns (`by_ctime` added for `dc:`); aggregates and `frn` still outstanding |
+| 4.1 | name interning | `store.c` | **done** — the pool holds one copy per *distinct* name rather than one per entry: 96.0 → 37.3 MiB on /work for a 5.7 MiB table, and −61.6 MB of snapshot with it. One hash and one probe per entry in the walk, which measures as a wash on CPU (§10's ledger) |
 | 4.2 | `path_of()` parent-chain rebuild | `store.c` | done; path materialisation pending §4.2 |
 | 4.2 | extension-name interning | `store.c` | **done** — an open-addressed table over the name, so `ext_intern()` is O(1) instead of a scan of every name interned so far: 519 string compares per call down to 1.16 on /work, which is 5.8 s of user time on a build that is otherwise I/O-bound. Derived, so no snapshot mentions it (§4.2 for the two off-by-ones it took to get right) |
 | 5.1 | `dir_id → children`, `path → eid` hash | `store.c` | done |
@@ -1210,31 +1211,36 @@ Six things it says that no document recorded, and what has been done about each:
   children**, which on /work is 630 472 of 651 897: a childless directory needs no vector, and
   not giving it one costs nothing.
 - **The names pool holds 3.65 copies of every name** — 1 499 994 distinct basenames against
-  5 476 485 entries, and `sp_intern()` only appends despite the name. This one is not a
-  ledger row but a waste of the same kind, and it is the largest item still open: the pool
-  is 96.0 MiB where the distinct names need about 26. Interning it means a hash table over
-  the entry names, which is the same structure the extension pool has just been given
-  (§4.2) — that one turned out to be worth **5.8 s of user time on a /work build**, so the
-  same shape on the names pool is a memory win and a per-entry cost at the same time.
+  5 476 485 entries, and `sp_intern()` only appended despite the name. **Done**, and it is
+  the largest single item the ledger ever named: the pool is 37.3 MiB where the distinct
+  names need about 26, against 96.0 before, for a 5.7 MiB table (2 097 152 slots, 0.71
+  load) beside it. The snapshot follows the pool down, 374 608 534 → 313 011 674 bytes,
+  because the pool is written verbatim and deduped bytes are bytes not written twice.
+  What it costs is one hash and one probe per entry *in the walk* — measured on /work,
+  +0.5 s of user time over 5 476 485 entries, against −2.1 s of system time from a pool
+  that no longer doubles to 128 MiB, so the CPU is a wash and the memory is not. It is
+  built by `esidx_add()` as names arrive and once on the first add after a load, lazily,
+  so a server that is only served from never pays for the pass.
 
 `sidx_ent_t`'s 62.7 MiB of padding and the 56.6 MiB of directory paths copied into the pool are
 in the same category and equally unfixed; the paths are derived data (D4) and should not be in
 a persisted pool at all, which is why they now live in one of their own.
 
-Where the ledger stands after the three commits that acted on it, `/work` again:
+Where the ledger stands after the commits that acted on it, `/work` again:
 
 | | touched | address | |
 |---|---|---|---|
 | name trigram lists | 318.6 | 320.3 | exact-sized |
 | entry columns | 282.0 | 282.0 | 261.1 + the `nchild` aggregate |
 | sorted arrays ×3 | 250.7 | 250.7 | 62.7 MiB of that is `sidx_ent_t` padding |
-| names pool | 96.0 | 128.0 | 1 499 994 distinct basenames over 5 476 485 entries |
+| names pool | 37.3 | 64.0 | **interned** — was 96.0 / 128.0 |
+| name intern table | 5.7 | 8.0 | 2 097 152 slots for 1 499 995 distinct names |
 | dir vector headers | 16.0 | 16.0 | indexed by directory ordinal |
 | name rank | 63.8 | 122.6 | |
 | dir children vectors | 39.4 | 39.4 | 5 476 484 ids in 10 324 800 slots |
 | eid → dir ordinal map | 6.4 | 6.4 | 2 097 152 slots for 630 472 directories |
 | dir path hash | 5.0 | 16.0 | load factor 0.31 |
-| **total** | **1 091.6** | 1 632 | **peak rss 1 222.7**, was 1 418.4 |
+| **total** | **1 038.6** | 1 578 | **peak rss 1 173.7**, was 1 418.4 at the first ledger |
 
 ---
 
