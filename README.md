@@ -269,7 +269,7 @@ Building it, on the same host:
 | **build, total** | **1 492 ms** | **60 847 ms** |
 | load | 327 ms | 5 664 ms |
 | snapshot | 25.1 MiB | 414 MiB |
-| peak rss | 87.3 MiB | **1 306 MiB** |
+| peak rss | 82.2 MiB | **1 223 MiB** |
 
 `find /work -xdev -printf '%y %b' | awk` — one `lstat` and one `readdir` per entry and
 nothing else — takes **56.75 s** on the same tree, so the walk costs 2 % less than
@@ -283,22 +283,24 @@ building); the only lever left on that walk is D6's concurrency.
 
 `esidx -v 3 build <tree>` prints a per-structure ledger — allocated against used, one line
 each — and it is the only way to tell a structure that is too big from one that is merely
-sized by the wrong number. On `/work` (1 306 MiB peak, 1 176 MiB accounted):
+sized by the wrong number. On `/work` (1 223 MiB peak, 1 092 MiB accounted):
 
 | | touched | address | |
 |---|---|---|---|
 | name trigram lists | 318.6 MiB | 320.3 | 99 % of the posting-list capacity in use |
-| entry columns | 261.1 | 261.1 | trimmed to the entry count |
+| entry columns | 282.0 | 282.0 | trimmed to the entry count, incl. the `nchild` aggregate |
 | sorted arrays ×3 | 250.7 | 250.7 | 62.7 MiB of that is `sidx_ent_t` padding |
 | names pool | 96.0 | 128.0 | 1 499 994 distinct basenames over 5 476 485 entries |
-| dir vector headers | 128.0 | 128.0 | **651 897 live of 8 388 608 slots** |
+| dir vector headers | 16.0 | 16.0 | indexed by directory ordinal, not by id |
+| eid → dir ordinal map | 6.4 | 6.4 | 2 097 152 slots for 630 472 directories |
 | name rank | 63.8 | 122.6 | 1 493 203 distinct folded names |
 | dir children vectors | 39.4 | 39.4 | 5 476 484 ids in 10 324 800 slots |
 | ext index | 15.1 | 11.5 | 16 384 slots for 6 765 extensions |
 | dir path hash | 5.0 | 16.0 | load factor 0.31 |
 
-The two bold rows are what is left to do: `di.child` is indexed by entry id when 12 % of ids
-are directories, and it is the largest single piece of pure waste in the index.
+What is left, largest first: the names pool holds 3.65 copies of every name, the three
+sorted arrays spend 62.7 MiB on `sidx_ent_t` padding, and the children vectors are at 53 %
+occupancy.
 
 Query cost on `/usr`:
 

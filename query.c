@@ -830,11 +830,9 @@ static int m_parent(qctx_t *c, const ast_t *t, bitset_t *out)
         }
     }
     bs_clear(out);
-    uint32_t cc = di_child_count(c->db, id);
-    if (cc && id < c->db->di.child_cap) {
-        const childvec_t *cv = &c->db->di.child[id];
-        for (uint32_t i = 0; i < cv->n; i++) bs_set(out, cv->items[i]);
-    }
+    const childvec_t *cv = di_children(c->db, id);
+    if (!cv) return 0;
+    for (uint32_t i = 0; i < cv->n; i++) bs_set(out, cv->items[i]);
     return 0;
 }
 
@@ -844,7 +842,8 @@ static int m_root(qctx_t *c, const ast_t *t, bitset_t *out)
     eid_t r = c->db->root_eid;
     bs_clear(out);
     if (r == EID_NONE) return 0;
-    const childvec_t *cv = &c->db->di.child[r];
+    const childvec_t *cv = di_children(c->db, r);
+    if (!cv) return 0;
     for (uint32_t i = 0; i < cv->n; i++) bs_set(out, cv->items[i]);
     return 0;
 }
@@ -1046,15 +1045,16 @@ static int m_attrib(qctx_t *c, const ast_t *t, bitset_t *out)
 }
 
 /* empty: -- a file with no bytes, or a directory with no children (L89 of
- * design §2). child_count is derived from the children vector, so no aggregate
- * column has to be maintained yet (§5.5). */
+ * design §2). The directory case reads a bit rather than a child count: this runs
+ * once per candidate row, and the ordinal lookup a count would need is a
+ * dependent load per row (design §10, "the memory ledger"). */
 static int m_empty(qctx_t *c, const ast_t *t, bitset_t *out)
 {
     const entry_table_t *et = &c->db->et;
     int want_empty = (t->cmp == CMP_EQ);
     for (uint32_t i = 0, nn = c->n; i < nn; i++) {
         if (!bs_test(out, i)) continue;
-        int e = (et->flags[i] & EF_DIR) ? (di_child_count(c->db, i) == 0)
+        int e = (et->flags[i] & EF_DIR) ? di_is_empty(c->db, i)
                                         : (et->size[i] == 0);
         if (e != want_empty) bs_clear_bit(out, i);
     }

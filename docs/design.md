@@ -683,7 +683,7 @@ Each row: source → what was taken → how it lands here → why it changed.
 | 5.3 | sorted array + delta buffer | `store.c` | **done** — `sidx_update`/`sidx_erase` write the delta, D3's 1%/60 s merge is implemented, and the range read honours the retractions |
 | 5.4 | dense bitset | `index.c` | done; CRoaring at P4 (D7). Set algebra lives here, not in the executor |
 | 5.4 | ext bitmaps, file:/folder: bitmaps | `store.c` | done — built in `finalize`, so the snapshot format is unchanged |
-| 5.5 | aggregate columns + bubbling | — | not started; `child-count:` is derived from the children vector instead, and the vector *is* maintained across a removal — which is the part [B6] would have to get right |
+| 5.5 | aggregate columns + bubbling | `store.c` | **first aggregate done** — `nchild`, the child count, stored rather than derived and maintained in the same two functions that maintain the children vectors. It exists because those vectors are indexed by directory ordinal and `child-count:` reads the value once per candidate row: measured over 372 084 rows, reading the count out of the vector cost 2.4 -> 6.4 ms of eval. Not persisted (the load path rebuilds the vectors and the count together, D4). The remaining aggregates, and bubbling them to ancestors, are not started |
 | 5.6-5.8 | content, dupe, sparse metadata | — | not started (P6) |
 | 6.1 | lexer → parser → AST | `lexer.c`, `parser.c` | **done** |
 | 6.2 | optimiser: selectivity estimate, driver selection | `query.c` | **done** for step 1-2 (exact cardinality per leaf, no histogram yet). Step 3 ordering and step 4 TopK not started — see below. The `size:`/`dm:`/`dc:` estimates are now upper bounds once the D3 delta is non-empty, because they count the main array without the retractions. A text leaf can be costed from its shortest trigram posting list (§5.2) but is **still not a driver**: the filter narrows eval, not the candidate count |
@@ -1020,7 +1020,7 @@ the tree the `find(1)` baseline in `AGENTS.md` was taken on:
 | build, total | 1 492 ms | **60 847 ms** |
 | load | 327 ms | 5 664 ms |
 | snapshot | 25.1 MiB | 414 MiB |
-| peak rss | 87.3 MiB | **1 306 MiB** |
+| peak rss | 82.2 MiB | **1 223 MiB** |
 | entries/s, warm | 308 000 | 98 400 |
 
 The `/usr` figure is the same measurement as the 268 k/s quoted above, run with a warm
@@ -1170,10 +1170,14 @@ Six things it says that no document recorded, and what has been done about each:
   touched for 318.6 MiB of ids. Now counted first and sized exactly, at the cost of a second
   walk over the names: −85 MiB of peak rss for +21 % on `finalize`, which is +5 % of a /work
   build and is re-run by every load.
-- **`di.child` is indexed by entry id.** 651 897 of 8 388 608 slots are a directory's, and the
-  growth path memsets every new range, so all 128 MiB is resident. **Not fixed**: the fix is a
-  dense directory ordinal, which is §7's rank/select and D7's CRoaring, and it is worth doing
-  for the 118 MiB alone.
+- **`di.child` was indexed by entry id.** 651 897 of 8 388 608 slots were a directory's, and the
+  growth path memsets every new range, so all 128 MiB was resident. It is indexed by a dense
+  **directory ordinal** now, with an open-addressed eid → ordinal map (6.4 MiB) beside it:
+  16 MiB of headers, −112 MiB of peak rss. A column would have cost 22 MiB on every row — and
+  22 MiB in the snapshot — to serve the 12 % that are directories, and rank/select is O(n) to
+  repair after a reconcile inserts one directory. **Ordinals go to directories that have
+  children**, which on /work is 630 472 of 651 897: a childless directory needs no vector, and
+  not giving it one costs nothing.
 - **The names pool holds 3.65 copies of every name** — 1 499 994 distinct basenames against
   5 476 485 entries, and `sp_intern()` only appends despite the name. Interning is a hash
   table, which is also what `ext_intern()`'s linear scan over the interned names wants; that
@@ -1182,6 +1186,21 @@ Six things it says that no document recorded, and what has been done about each:
 `sidx_ent_t`'s 62.7 MiB of padding and the 56.6 MiB of directory paths copied into the pool are
 in the same category and equally unfixed; the paths are derived data (D4) and should not be in
 a persisted pool at all, which is why they now live in one of their own.
+
+Where the ledger stands after the three commits that acted on it, `/work` again:
+
+| | touched | address | |
+|---|---|---|---|
+| name trigram lists | 318.6 | 320.3 | exact-sized |
+| entry columns | 282.0 | 282.0 | 261.1 + the `nchild` aggregate |
+| sorted arrays ×3 | 250.7 | 250.7 | 62.7 MiB of that is `sidx_ent_t` padding |
+| names pool | 96.0 | 128.0 | 1 499 994 distinct basenames over 5 476 485 entries |
+| dir vector headers | 16.0 | 16.0 | indexed by directory ordinal |
+| name rank | 63.8 | 122.6 | |
+| dir children vectors | 39.4 | 39.4 | 5 476 484 ids in 10 324 800 slots |
+| eid → dir ordinal map | 6.4 | 6.4 | 2 097 152 slots for 630 472 directories |
+| dir path hash | 5.0 | 16.0 | load factor 0.31 |
+| **total** | **1 091.6** | 1 632 | **peak rss 1 222.7**, was 1 418.4 |
 
 ---
 

@@ -399,8 +399,8 @@ static void ctab_load(upd_t *u, uint32_t depth, eid_t dir)
     t->dead = false;
     t->mask = t->cap - 1;
 
-    if (dir >= db->di.child_cap) return;
-    const childvec_t *cv = &db->di.child[dir];
+    const childvec_t *cv = di_children(db, dir);
+    if (!cv) return;
     for (uint32_t i = 0; i < cv->n; i++) {
         eid_t kid = cv->items[i];
         uint32_t h = name_hash(name_of(db, kid)) & t->mask;

@@ -62,7 +62,20 @@ typedef struct {
     int64_t  *stamp;
     uint16_t *ext_id;   /* interned into exts pool; 0 = none */
     strref_t *name;
+    /* design §5.5's first aggregate column, and the first thing in this codebase
+     * that is stored rather than derived. It is here because the children vectors
+     * are indexed by directory ordinal: `child-count:` and `empty:` ask the question
+     * once per candidate row, and a count read out of a vector would mean an ordinal
+     * probe per row -- measured at 2.4 -> 6.4 ms of eval over 372 084 rows, which is
+     * a leaf the query language calls index-backed getting slower. Maintained in the
+     * two functions that maintain the vector, so the two cannot disagree. */
+    uint32_t *nchild;
 } entry_table_t;
+
+typedef struct {
+    uint64_t *w;
+    uint32_t  nbits;
+} bitset_t;
 
 /* --------------------------------------------------------- directory tree */
 
@@ -72,22 +85,35 @@ typedef struct {
 } childvec_t;
 
 typedef struct {
-    childvec_t *child;     /* indexed by dir eid */
+    /* Indexed by *directory ordinal*, not by entry id. It used to be indexed by
+     * eid, which spends a 16-byte vector header on every id in the table when 12 %
+     * of them are directories: 8 388 608 headers on /work, of which 651 897 are
+     * live, and the growth path memsets every new range, so all 128 MiB of it was
+     * resident -- the largest single piece of pure waste in the index (design §10,
+     * "the memory ledger"). `di_ord()` is the reverse map, and it is a hash rather
+     * than a column because a column would be four bytes on every row -- 22 MiB on
+     * /work, and 22 MiB more in the snapshot -- to serve the 12 % that are
+     * directories. It is a hash rather than rank/select because a reconcile
+     * inserts directories one at a time and every rank structure that is not a
+     * Fenwick tree costs O(n) to repair. */
+    childvec_t *child;
+    uint32_t    child_n;      /* ordinals in use: one per indexed directory */
     uint32_t    child_cap;
 
+    /* eid -> ordinal, open addressing, value = ordinal + 1 so that 0 means empty.
+     * The same convention as the other three open-addressed tables here. Keys are
+     * dense ids, so the id masks well enough on its own. */
+    uint32_t   *ord_slot;
+    uint32_t    ord_mask;     /* capacity-1, capacity is power of two */
+    uint32_t    ord_count;
+    eid_t      *ord_eid;      /* ordinal -> eid, so a lookup can hand back an id */
+
     /* path -> eid open-addressing hash (Robin Hood variant, ref A12) */
-    uint32_t   *ht_off;    /* strref off into names pool; 0 = empty */
+    uint32_t   *ht_off;    /* strref off into the dpaths pool; 0 = empty */
     eid_t      *ht_val;
     uint32_t    ht_mask;   /* capacity-1, capacity is power of two */
     uint32_t    ht_count;
 } dir_index_t;
-
-/* ---------------------------------------------------------------- bitmap */
-
-typedef struct {
-    uint64_t *w;
-    uint32_t  nbits;
-} bitset_t;
 
 int  bs_init(bitset_t *b, uint32_t nbits);
 void bs_free(bitset_t *b);
@@ -399,6 +425,15 @@ void esidx_finalize(esidx_t *db);   /* build dir paths hash + sorted indexes */
 
 /* child count of a directory entry (design §5.5 aggregate, derived not stored) */
 uint32_t di_child_count(const esidx_t *db, eid_t dir);
+/* The children vector of a directory, or NULL if it is not an indexed directory.
+ * Every reader goes through this so the ordinal lookup lives in one place. The
+ * `mutable` variant exists for the two callers that shrink a vector in place
+ * (esidx_remove walking a subtree, and the reconcile's claim of a new child);
+ * passing a const one to them is a compile error rather than a silent no-op. */
+const childvec_t *di_children(const esidx_t *db, eid_t dir);
+childvec_t       *di_children_mut(esidx_t *db, eid_t dir);
+/* Is this directory empty? A bit, because `empty:` asks it per candidate row. */
+bool di_is_empty(const esidx_t *db, eid_t dir);
 
 /* snapshot (decision D4: mmap load, plain write) */
 int  esidx_save(const esidx_t *db, const char *path);
@@ -453,7 +488,7 @@ bool tri_index_filter(const tri_index_t *ti, const char *lit, bitset_t *out);
 /* exposed to the query and protocol layers */
 eid_t      di_lookup(const esidx_t *db, const char *path);
 eid_t      di_lookup_name(const esidx_t *db, eid_t dir, const char *name);
-int        di_remove_child(dir_index_t *di, eid_t dir, eid_t child);
+int        di_remove_child(esidx_t *db, eid_t dir, eid_t child);
 /* Insert/erase a directory's path. Erasing marks the slot rather than backing
  * the probe chain up, because a linear-probe table with a hole in it cannot
  * distinguish "absent" from "present, further along". */

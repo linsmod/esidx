@@ -1113,6 +1113,19 @@ inc_sync "after the refused update"
 # 13. the answers survive the snapshot round trip, tombstones and all
 cp "$INC_DB" "$TMP/inc-copy.idx"
 if u; then ok "a second refresh is still a no-op"; else bad "second refresh"; fi
+DB="$INC_DB"
+
+# child-count: and empty: must answer the same after a reload as before it. The
+# aggregate is rebuilt from the children vectors on load rather than read back,
+# which is only correct if nothing else also counts. The first version of that
+# change read the column *and* let the rebuild increment it, so every parent came
+# back with twice its children -- and every child-count assertion in this file
+# passed, because all of them read a freshly built index. Nothing asserted the one
+# thing that could tell the two apart, which is what these three are for.
+q "child-count:1"; CC1=$(n "$LAST")
+q "child-count:0"; CC0=$(n "$LAST")
+q "empty:";        EMP=$(n "$LAST")
+
 q ""
 cp "$INC_DB" "$TMP/inc-copy.idx"
 DB="$TMP/inc-copy.idx"
@@ -1121,6 +1134,13 @@ expect "the reloaded snapshot holds the same rows" "$(n "$LAST")" "$(inc_find)"
 q "ext:txt"
 expect "and the same extension bitmap" "$(n "$LAST")" \
     "$(find "$INC" -type f -name '*.txt' | wc -l)"
+
+q "child-count:1"
+expect "and the same child-count:1 rows after a reload" "$(n "$LAST")" "$CC1"
+q "child-count:0"
+expect "and the same child-count:0 rows after a reload" "$(n "$LAST")" "$CC0"
+q "empty:"
+expect "and the same empty: rows after a reload" "$(n "$LAST")" "$EMP"
 DB="$INC_DB"
 
 # 13b. the snapshot must not grow just because it was refreshed. di_hash_build()

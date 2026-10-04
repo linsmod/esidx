@@ -177,6 +177,15 @@ uint32_t esidx_name_rank(const esidx_t *db, eid_t id)
 
 /* ------------------------------------------------------------ entry table */
 
+/* §5.5's aggregate, stored. Its width is the entry count like every other column,
+     * and like every other column it is initialised by et_grow()'s caller: a new row
+     * has no children, and the only two functions that change that are di_add_child()
+     * and di_remove_child(). */
+static void et_init_col(entry_table_t *et, uint32_t id)
+{
+    et->nchild[id] = 0;
+}
+
 static int et_grow(entry_table_t *et, uint32_t ncap)
 {
     /* Each pointer is stored as soon as it is reallocated rather than at the end.
@@ -192,6 +201,7 @@ static int et_grow(entry_table_t *et, uint32_t ncap)
     int64_t  *k = realloc(et->stamp,  ncap * sizeof(int64_t));    if (!k) return -1; et->stamp = k;
     uint16_t *e = realloc(et->ext_id, ncap * sizeof(uint16_t));   if (!e) return -1; et->ext_id = e;
     strref_t *r = realloc(et->name,   ncap * sizeof(strref_t));   if (!r) return -1; et->name = r;
+    uint32_t *k2 = realloc(et->nchild, ncap * sizeof(uint32_t)); if (!k2) return -1; et->nchild = k2;
     et->cap = ncap;
     return 0;
 }
@@ -222,7 +232,7 @@ static void et_trim(entry_table_t *et)
 }
 
 /* from the dir-tree section below */
-int di_add_child(dir_index_t *di, eid_t dir, eid_t child);
+int di_add_child(esidx_t *db, eid_t dir, eid_t child);
 
 /* The id of an extension name: dense, 1-based, 0 meaning "none". The name goes into the
  * pool and its *offset* goes into ext_off, so the id cannot outgrow 16 bits the way a
@@ -348,6 +358,7 @@ eid_t esidx_add(esidx_t *db, eid_t parent, const entry_in_t *in)
 
     et->name[id].off  = sp_intern(&db->names, in->name, nlen);
     et->name[id].len  = (uint32_t)nlen;
+    et_init_col(et, id);
     et->parent[id]    = parent;
     et->depth[id]     = in->depth;
     et->flags[id]     = in->flags;
@@ -358,7 +369,7 @@ eid_t esidx_add(esidx_t *db, eid_t parent, const entry_in_t *in)
     et->ext_id[id]    = (in->flags & EF_DIR) ? 0 : ext_of(db, in->name);
 
     if (parent == EID_NONE) db->root_eid = id;
-    else if (di_add_child(&db->di, parent, id) != 0) return EID_NONE;
+    else if (di_add_child(db, parent, id) != 0) return EID_NONE;
 
     if (db->built) {
         if (link_new(db, id) != 0) { LOGE("cannot index new entry %s", in->name); return EID_NONE; }
@@ -422,7 +433,7 @@ static void kill_one(esidx_t *db, eid_t id)
 
     if (et->flags[id] & EF_DIR) di_hash_erase(db, id);
     eid_t p = et->parent[id];
-    if (p != EID_NONE) di_remove_child(&db->di, p, id);
+    if (p != EID_NONE) di_remove_child(db, p, id);
 
     et->flags[id] |= EF_DEAD;
     bump_epoch(db);
@@ -434,12 +445,15 @@ int esidx_remove(esidx_t *db, eid_t id)
     if (id >= et->count || (et->flags[id] & EF_DEAD)) return 0;
 
     /* Children first, so the tree is never left with a live row whose parent is
-     * a tombstone -- that combination is what path_of() would walk into. */
-    while (id < db->di.child_cap && db->di.child[id].n) {
-        childvec_t *cv = &db->di.child[id];
+     * a tombstone -- that combination is what path_of() would walk into. The
+     * ordinal and the vector are re-read every turn because the recursion removes
+     * from this very vector (di_remove_child swap-removes) and can reallocate it. */
+    const childvec_t *cv = di_children(db, id);
+    while (cv && cv->n) {
         eid_t kid = cv->items[cv->n - 1];
-        cv->n--;
+        di_children_mut(db, id)->n--;
         esidx_remove(db, kid);
+        cv = di_children(db, id);
     }
     kill_one(db, id);
     return 0;
@@ -459,40 +473,131 @@ static uint32_t hash_str(const char *s)
     return h;
 }
 
-int di_add_child(dir_index_t *di, eid_t dir, eid_t child)
+/* The reverse map. EID_NONE for an id that is not an indexed directory -- which
+ * includes every tombstone, whose ordinal is deliberately left in place rather
+ * than renumbered (D8). */
+uint32_t di_ord(const dir_index_t *di, eid_t dir)
 {
-    if (dir >= di->child_cap) {
-        uint32_t ncap = di->child_cap ? di->child_cap : 1024;
-        while (dir >= ncap) ncap *= 2;
-        childvec_t *nc = realloc(di->child, ncap * sizeof(childvec_t));
-        if (!nc) return -1;
-        memset(nc + di->child_cap, 0, (ncap - di->child_cap) * sizeof(childvec_t));
-        di->child = nc;
-        di->child_cap = ncap;
+    if (!di->ord_slot || dir == EID_NONE) return EID_NONE;
+    uint32_t h = dir & di->ord_mask;
+    for (;;) {
+        uint32_t v = di->ord_slot[h];
+        if (!v) return EID_NONE;
+        if (di->ord_eid[v - 1] == dir) return v - 1;
+        h = (h + 1) & di->ord_mask;
     }
-    childvec_t *cv = &di->child[dir];
+}
+
+/* Index `dir` under the next ordinal. Growth is by doubling on the table and on
+ * the header array together, so both stay a power of two apart and neither can be
+ * the smaller one's excuse for the other. */
+static int di_ord_add(dir_index_t *di, eid_t dir)
+{
+    if (!di->ord_slot) {
+        di->ord_slot = calloc(1024, sizeof(uint32_t));
+        if (!di->ord_slot) return -1;
+        di->ord_mask = 1023;
+    }
+    if ((di->ord_count + 1) * 4 >= (di->ord_mask + 1) * 3) {
+        uint32_t ncap = (di->ord_mask + 1) * 2;
+        uint32_t *ns = calloc(ncap, sizeof(uint32_t));
+        if (!ns) return -1;
+        for (uint32_t o = 0; o < di->ord_count; o++) {
+            uint32_t h = di->ord_eid[o] & (ncap - 1);
+            while (ns[h]) h = (h + 1) & (ncap - 1);
+            ns[h] = o + 1;
+        }
+        free(di->ord_slot);
+        di->ord_slot = ns;
+        di->ord_mask = ncap - 1;
+    }
+    uint32_t ord = di->ord_count;
+    eid_t *ne = realloc(di->ord_eid, ((size_t)ord + 1) * sizeof(eid_t));
+    if (!ne) return -1;
+    di->ord_eid = ne;
+    di->ord_eid[ord] = dir;
+    di->ord_count = ord + 1;
+
+    uint32_t h = dir & di->ord_mask;
+    while (di->ord_slot[h]) h = (h + 1) & di->ord_mask;
+    di->ord_slot[h] = ord + 1;
+    return (int)ord;
+}
+
+static int di_ord_grow(dir_index_t *di, uint32_t ord)
+{
+    if (ord < di->child_cap) return 0;
+    uint32_t ncap = di->child_cap ? di->child_cap : 1024;
+    while (ord >= ncap) ncap *= 2;
+    childvec_t *nc = realloc(di->child, (size_t)ncap * sizeof(childvec_t));
+    if (!nc) return -1;
+    memset(nc + di->child_cap, 0, (size_t)(ncap - di->child_cap) * sizeof(childvec_t));
+    di->child = nc;
+    di->child_cap = ncap;
+    return 0;
+}
+
+int di_add_child(esidx_t *db, eid_t dir, eid_t child)
+{
+    dir_index_t *di = &db->di;
+    uint32_t ord = di_ord(di, dir);
+    if (ord == EID_NONE) {
+        int added = di_ord_add(di, dir);
+        if (added < 0) return -1;
+        ord = (uint32_t)added;
+    }
+    if (di_ord_grow(di, ord) != 0) return -1;
+
+    childvec_t *cv = &di->child[ord];
     if (cv->n == cv->cap) {
         uint32_t ncap = cv->cap ? cv->cap * 2 : 8;
-        eid_t *ni = realloc(cv->items, ncap * sizeof(eid_t));
+        eid_t *ni = realloc(cv->items, (size_t)ncap * sizeof(eid_t));
         if (!ni) return -1;
         cv->items = ni;
         cv->cap = ncap;
     }
     cv->items[cv->n++] = child;
+    /* The aggregate column moves with the vector, here and in di_remove_child and
+     * nowhere else: `child-count:` and `empty:` read it once per candidate row, and
+     * a count read out of the vector would mean an ordinal probe per row. */
+    if (dir < db->et.count) db->et.nchild[dir]++;
     return 0;
+}
+
+const childvec_t *di_children(const esidx_t *db, eid_t dir)
+{
+    uint32_t ord = di_ord(&db->di, dir);
+    if (ord == EID_NONE || ord >= db->di.child_cap) return NULL;
+    return &db->di.child[ord];
+}
+
+childvec_t *di_children_mut(esidx_t *db, eid_t dir)
+{
+    uint32_t ord = di_ord(&db->di, dir);
+    if (ord == EID_NONE || ord >= db->di.child_cap) return NULL;
+    return &db->di.child[ord];
+}
+
+bool di_is_empty(const esidx_t *db, eid_t dir)
+{
+    if (dir >= db->et.count) return true;
+    return db->et.nchild[dir] == 0;
 }
 
 /* Swap-remove rather than preserve order: nothing depends on the order, and a
  * removal from a directory holding thousands of entries must not be O(n) memmove
  * on top of the O(n) search. */
-int di_remove_child(dir_index_t *di, eid_t dir, eid_t child)
+int di_remove_child(esidx_t *db, eid_t dir, eid_t child)
 {
-    if (dir >= di->child_cap) return -1;
-    childvec_t *cv = &di->child[dir];
+    dir_index_t *di = &db->di;
+    uint32_t ord = di_ord(di, dir);
+    if (ord == EID_NONE || ord >= di->child_cap) return -1;
+    childvec_t *cv = &di->child[ord];
     for (uint32_t i = 0; i < cv->n; i++) {
         if (cv->items[i] != child) continue;
         cv->items[i] = cv->items[cv->n - 1];
         cv->n--;
+        if (dir < db->et.count && db->et.nchild[dir]) db->et.nchild[dir]--;
         return 0;
     }
     return -1;
@@ -503,8 +608,8 @@ int di_remove_child(dir_index_t *di, eid_t dir, eid_t child)
  * single entry, and path_of() there would be O(depth) per lookup. */
 eid_t di_lookup_name(const esidx_t *db, eid_t dir, const char *name)
 {
-    if (dir >= db->di.child_cap) return EID_NONE;
-    const childvec_t *cv = &db->di.child[dir];
+    const childvec_t *cv = di_children(db, dir);
+    if (!cv) return EID_NONE;
     for (uint32_t i = 0; i < cv->n; i++) {
         eid_t id = cv->items[i];
         if (strcmp(name_of(db, id), name) == 0) return id;
@@ -641,8 +746,8 @@ const char *ext_of_str(const esidx_t *db, eid_t id)
 
 uint32_t di_child_count(const esidx_t *db, eid_t dir)
 {
-    if (dir < db->di.child_cap) return db->di.child[dir].n;
-    return 0;
+    if (dir >= db->et.count) return 0;
+    return db->et.nchild[dir];
 }
 
 /* The full path of the directory containing this entry -- what the wire's PATH column
@@ -1357,9 +1462,11 @@ void esidx_free(esidx_t *db)
     free(db->names.buf); free(db->exts.buf); free(db->dpaths.buf); free(db->ext_off);
     free(db->et.parent); free(db->et.depth); free(db->et.flags);
     free(db->et.size); free(db->et.mtime); free(db->et.ctime); free(db->et.stamp);
-    free(db->et.ext_id); free(db->et.name);
+    free(db->et.ext_id); free(db->et.name); free(db->et.nchild);
     for (uint32_t i = 0; i < db->di.child_cap; i++) free(db->di.child[i].items);
     free(db->di.child);
+    free(db->di.ord_slot);
+    free(db->di.ord_eid);
     free(db->di.ht_off); free(db->di.ht_val);
     sidx_free(&db->by_size); sidx_free(&db->by_mtime); sidx_free(&db->by_ctime);
     ext_index_free(&db->ext);
@@ -1611,17 +1718,18 @@ void esidx_log_mem(const esidx_t *db, const char *phase)
     const entry_table_t *et = &db->et;
     uint64_t total = 0;
 
-    /* The nine columns, allocated at cap and holding count. sizeof each, so a
+    /* The columns, allocated at cap and holding count. sizeof each, so a
      * changed column cannot silently keep the old sum. */
-    struct { const void *p; size_t sz; } col[9] = {
+    enum { COL_N = 10 };
+    struct { const void *p; size_t sz; } col[COL_N] = {
         { et->parent, sizeof(eid_t)    }, { et->depth,  sizeof(uint16_t) },
         { et->flags,  sizeof(uint16_t) }, { et->size,   sizeof(int64_t)  },
         { et->mtime,  sizeof(int64_t)  }, { et->ctime,  sizeof(int64_t)  },
         { et->stamp,  sizeof(int64_t)  }, { et->ext_id, sizeof(uint16_t) },
-        { et->name,   sizeof(strref_t) },
+        { et->name,   sizeof(strref_t) }, { et->nchild, sizeof(uint32_t) },
     };
     uint64_t col_bytes = 0, col_used = 0;
-    for (int i = 0; i < 9; i++) {
+    for (int i = 0; i < COL_N; i++) {
         if (!col[i].p) continue;
         col_bytes += (uint64_t)et->cap * col[i].sz;
         col_used  += (uint64_t)et->count * col[i].sz;
@@ -1629,29 +1737,28 @@ void esidx_log_mem(const esidx_t *db, const char *phase)
     mem_row(phase, "entry columns", col_used, col_bytes, &total);
     mem_row(phase, "names pool", db->names.len, db->names.cap, &total);
 
-    /* di.child is `child_cap` vector headers indexed by entry id, and only a
-     * directory's slot is ever used: on /work that is 8 388 608 headers of which
-     * 651 897 are live. All of it is resident -- the growth path memsets the new
-     * range -- so this row is the one sparse index that costs real memory rather
-     * than address space. */
+    /* The header array is indexed by directory ordinal, so its capacity tracks the
+     * number of directories rather than the number of ids -- which is the whole
+     * point of the change, and the row states both so the ratio stays checkable. */
     if (db->di.child) {
-        uint32_t ndirs = 0;
-        for (uint32_t i = 0; i < et->count && i < db->di.child_cap; i++)
-            if ((et->flags[i] & EF_DIR) && !(et->flags[i] & EF_DEAD)) ndirs++;
+        uint32_t ndirs = db->di.ord_count;
         uint64_t hdr = (uint64_t)db->di.child_cap * sizeof(childvec_t);
         mem_row(phase, "dir vector headers", hdr, hdr, &total);
-        LOGI("%s: mem dir headers: %u live of %u slots (%.0f%%)",
-             phase, ndirs, db->di.child_cap,
-             db->di.child_cap ? 100.0 * (double)ndirs / (double)db->di.child_cap : 0.0);
+        LOGI("%s: mem dir headers: %u directories, %u slots (%.0f%%), eid->ordinal "
+             "map %u slots", phase, ndirs, db->di.child_cap,
+             db->di.child_cap ? 100.0 * (double)ndirs / (double)db->di.child_cap : 0.0,
+             db->di.ord_mask + 1);
 
-        /* Every vector's whole capacity is resident: realloc copies the old contents
-         * and the new element is written, so nothing is ever untouched. */
         uint64_t items_used = 0, items_bytes = 0;
         for (uint32_t d = 0; d < db->di.child_cap; d++) {
             items_used  += (uint64_t)db->di.child[d].n * sizeof(eid_t);
             items_bytes += (uint64_t)db->di.child[d].cap * sizeof(eid_t);
         }
         mem_row(phase, "dir children vectors", items_bytes, items_bytes, &total);
+        mem_row(phase, "eid -> dir ordinal map",
+                ((uint64_t)db->di.ord_mask + 1 + db->di.ord_count) * sizeof(uint32_t),
+                ((uint64_t)db->di.ord_mask + 1 + db->di.ord_count) * sizeof(uint32_t),
+                &total);
         LOGI("%s: mem dir children: %llu of %llu ids in vectors (%.0f%%)",
              phase, (unsigned long long)(items_used / 4),
              (unsigned long long)(items_bytes / 4),
@@ -1783,7 +1890,15 @@ void esidx_log_mem(const esidx_t *db, const char *phase)
  * rather than a byte offset into their pool. The column is the same width and the
  * same place in the file, so a v2 snapshot would load without complaint and then
  * resolve extensions to the wrong strings -- the version check is the only thing
- * standing between those two, which is exactly what it is for. */
+ * standing between those two, which is exactly what it is for.
+ *
+ * A child-count column was tried here as v4 and is deliberately *not* here. The
+ * load path rebuilds the children vectors entry by entry, so it recomputes the
+ * count for free -- which means persisting it buys nothing, and persisting it
+ * *and* recomputing it is how the first version of this change answered
+ * `child-count:2` for a directory with four children: the file said 4, the rebuild
+ * added 4, and no test noticed because every child-count assertion read a freshly
+ * built index. One structure, written by one function (D4). */
 #define ESIDX_VERSION 3
 
 static int w64(FILE *f, uint64_t v) { return fwrite(&v, 8, 1, f) == 1 ? 0 : -1; }
@@ -1877,6 +1992,12 @@ int esidx_load(esidx_t *db, const char *path)
     et->name = malloc(et->count * sizeof(strref_t) + 1);
     for (uint32_t i = 0; i < et->count; i++) r32(f, &et->name[i].off);
     for (uint32_t i = 0; i < et->count; i++) r32(f, &et->name[i].len);
+
+    /* §5.5's aggregate, zeroed and left to the children rebuild below to fill --
+     * the same loop that rebuilds the vectors increments it, so persisting it would
+     * buy nothing and reading it *and* incrementing it would double every count. */
+    et->nchild = calloc(et->count ? et->count : 1, sizeof(uint32_t));
+    if (!et->nchild) { fclose(f); return -1; }
     fclose(f);
 
     /* Number the extension names. Not persisted, because walking the pool in order *is*
@@ -1904,7 +2025,7 @@ int esidx_load(esidx_t *db, const char *path)
     for (uint32_t i = 0; i < et->count; i++) {
         if (et->flags[i] & EF_DEAD) continue;   /* a tombstone is nobody's child */
         if (et->parent[i] == EID_NONE) db->root_eid = i;
-        else di_add_child(&db->di, et->parent[i], i);
+        else di_add_child(db, et->parent[i], i);
     }
     TSDONE("load: rebuild children vectors", t1);
 
