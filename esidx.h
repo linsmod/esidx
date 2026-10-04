@@ -247,7 +247,15 @@ typedef struct {
 /* --------------------------------------------------------------- database */
 
 /* Scan counters, kept so build/query reporting can show what the collector
- * actually saw (getdents volume, stat success rate, depth reached). */
+ * actually saw (getdents volume, stat success rate, depth reached).
+ *
+ * The four `_us` fields split the walk into the three syscalls it spends its time
+ * in and the bookkeeping around them. They are accumulated only at LOG_INFO --
+ * three clock reads per entry is a measurable fraction of a 10 us/entry walk, and
+ * a counter nobody asked for should cost nothing (timer.h). The split is what
+ * decides whether "batch stat by inode" (design §7, the note at the top of
+ * scan.c) is worth building: if fstatat is 30% of the walk there is nothing on
+ * the table, and if it is 70% there is. */
 typedef struct {
     uint64_t dirs;            /* directories descended into */
     uint64_t entries;         /* entries appended (files + dirs) */
@@ -259,6 +267,10 @@ typedef struct {
     uint64_t getdents_calls;
     uint64_t getdents_bytes;
     uint64_t depth_max;
+    uint64_t getdents_us;     /* inside SYS_getdents64 */
+    uint64_t stat_us;         /* inside fstatat */
+    uint64_t open_us;         /* inside openat(O_DIRECTORY); close() is in "other" */
+    uint64_t add_us;          /* inside esidx_add: pool intern + the columns */
 } scan_stats_t;
 
 /* What one esidx_update() actually did. The counters a caller has to be able to

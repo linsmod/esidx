@@ -3,14 +3,18 @@
  *   - openat relative descent, O_NOATIME with EPERM fallback (ref A1, A4)
  *   - d_type decides is_dir; stat only for size/mtime        (ref A3)
  *
- * D6 note: P0 is single-threaded. Adaptive parallelism (rotational media ->
- * 1-2 threads, SSD -> ncpu) lands with the work-stealing pool in P2.
+* D6 note: P0 is single-threaded. Adaptive parallelism (rotational media ->
+ *  1-2 threads, SSD -> ncpu) lands with the work-stealing pool in P2.
  * A3 note: unlike plocate we MUST stat every entry, because we index
  * size/mtime (L1). plocate only needs paths, so it can skip stat entirely.
  * That is also why scan stats are tracked here: the stat success rate and the
- * getdents byte volume are the two numbers that tell us whether the planned
- * "batch stat by inode" optimisation (turn random I/O into near-sequential on
- * HDD) is worth building.
+ * getdents byte volume were the two numbers that were going to tell us whether the
+ * planned "batch stat by inode" optimisation (turn random I/O into near-sequential
+ * on HDD) is worth building. Measured, at -v 5 (design 10, "Phase timings"): on ext4
+ * a stat costs 1.81 us and does no I/O at all, because the inode the directory block
+ * just named is already resident -- so there is nothing to batch, and the optimisation
+ * is not worth building. The counters stayed, because they are what would show a tree
+ * where that is not true.
  *
  * getdents buffer: one buffer *per recursion level*, taken from a lazily grown
  * pool. A per-frame local buffer would mean depth * SCAN_BUF_SIZE of stack
@@ -77,7 +81,8 @@ static char *buf_for_depth(char **pool, uint32_t depth)
     return pool[depth];
 }
 
-static void scan_dir(esidx_t *db, int dirfd, eid_t parent, uint16_t depth, char **pool)
+static void scan_dir(esidx_t *db, int dirfd, eid_t parent, uint16_t depth, char **pool,
+                     bool timing)
 {
     scan_stats_t *st = &db->scan;
     char *buf = buf_for_depth(pool, depth);
@@ -89,8 +94,16 @@ static void scan_dir(esidx_t *db, int dirfd, eid_t parent, uint16_t depth, char 
     st->dirs++;
     if (depth > st->depth_max) st->depth_max = depth;
 
+    /* The per-directory trace belongs to debug mode exactly, not to "debug and
+     * above": at LOG_PERF it would be 651 894 lines on /work, and the cost of
+     * writing them lands in the 'other' bucket of the very attribution that asked
+     * for it. */
+    bool trace = (log_level() == LOG_DEBUG);
+
     for (;;) {
+        uint64_t g0 = timing ? ts_us() : 0;
         long n = syscall(SYS_getdents64, dirfd, buf, SCAN_BUF_SIZE);
+        if (timing) st->getdents_us += ts_us() - g0;
         if (n < 0) {
             if (errno == EINTR) continue;
             LOGE("getdents64 failed on eid %u: %s", parent, strerror(errno));
@@ -110,7 +123,9 @@ static void scan_dir(esidx_t *db, int dirfd, eid_t parent, uint16_t depth, char 
                 continue;
 
             struct stat sb;
+            uint64_t s0 = timing ? ts_us() : 0;
             bool have_stat = (fstatat(dirfd, de->d_name, &sb, AT_SYMLINK_NOFOLLOW) == 0);
+            if (timing) st->stat_us += ts_us() - s0;
             if (have_stat) st->stat_ok++; else st->stat_fail++;
 
             bool is_dir = (de->d_type == DT_DIR);
@@ -132,7 +147,9 @@ static void scan_dir(esidx_t *db, int dirfd, eid_t parent, uint16_t depth, char 
                 in.stamp = stamp_of(&sb);
             }
 
+            uint64_t a0 = timing ? ts_us() : 0;
             eid_t id = esidx_add(db, parent, &in);
+            if (timing) st->add_us += ts_us() - a0;
             if (id == EID_NONE) {
                 LOGE("cannot append entry %s (out of memory)", de->d_name);
                 return;
@@ -142,10 +159,13 @@ static void scan_dir(esidx_t *db, int dirfd, eid_t parent, uint16_t depth, char 
             if (is_dir) st->dirs_found++; else st->files++;
 
             if (is_dir && depth < SCAN_MAX_DEPTH) {
+                uint64_t o0 = timing ? ts_us() : 0;
                 int cfd = open_dir(dirfd, de->d_name);
+                if (timing) st->open_us += ts_us() - o0;
                 if (cfd >= 0) {
-                    LOGD("descend eid=%u depth=%u name=%s", id, depth + 1, de->d_name);
-                    scan_dir(db, cfd, id, depth + 1, pool);
+                    if (trace)
+                        LOGD("descend eid=%u depth=%u name=%s", id, depth + 1, de->d_name);
+                    scan_dir(db, cfd, id, depth + 1, pool, timing);
                     close(cfd);
                 } else {
                     st->open_fail++;
@@ -187,7 +207,12 @@ int esidx_scan(esidx_t *db, const char *root)
 
     LOGI("scan: root=%s", root);
     uint64_t t0 = ts_us();
-    scan_dir(db, fd, root_id, 1, pool);
+    /* LOG_PERF, not LOG_INFO: the attribution is four clock reads per entry, which
+     * is noise against a TSC clocksource and ruinous against an HPET one (log.h,
+     * LOG_PERF), and round.sh -- which produces the numbers in design §10 -- builds
+     * at INFO. */
+    bool timing = log_enabled(LOG_PERF);
+    scan_dir(db, fd, root_id, 1, pool, timing);
     close(fd);
 
     TSDONE2("scan: walk", t0,
@@ -197,6 +222,45 @@ int esidx_scan(esidx_t *db, const char *root)
             (unsigned long long)db->scan.files,
             (unsigned long long)db->scan.dirs_found,
             (unsigned long long)db->scan.depth_max);
+
+    if (timing) {
+        const scan_stats_t *st = &db->scan;
+        double walk = (double)(ts_us() - t0);
+        double buckets[4] = { (double)st->getdents_us, (double)st->stat_us,
+                              (double)st->open_us, (double)st->add_us };
+        const char *what[4] = { "getdents64", "fstatat", "openat", "esidx_add" };
+        double sum = 0.0;
+        for (int i = 0; i < 4; i++) sum += buckets[i];
+        char part[256];
+        int n = 0;
+        for (int i = 0; i < 4; i++)
+            n += snprintf(part + n, sizeof(part) - (size_t)n, "%s%s %.1f ms (%.1f%%)",
+                          i ? " | " : "", what[i], buckets[i] / 1000.0,
+                          walk > 0 ? 100.0 * buckets[i] / walk : 0.0);
+        /* "other" is stated rather than left to be inferred: it is the dirent loop,
+         * close(), and the clock reads the attribution itself costs. */
+        double other = walk - sum;
+        snprintf(part + n, sizeof(part) - (size_t)n,
+                 " | other %.1f ms (%.1f%%)", other / 1000.0,
+                 walk > 0 ? 100.0 * other / walk : 0.0);
+        LOGI("scan: split: %s", part);
+
+        /* Price the attribution, or the percentages above are not evidence about the
+         * walk but about this run. One read is measured, not assumed: clock_gettime is
+         * a vDSO call against a TSC clocksource and a syscall against anything else,
+         * and the two differ by two orders of magnitude. */
+        enum { CAL = 20000 };
+        uint64_t c0 = ts_us();
+        for (int i = 0; i < CAL; i++) (void)ts_us();
+        double ns = (double)(ts_us() - c0) * 1000.0 / (double)CAL;
+        double reads = 4.0 * (double)st->entries +
+                       2.0 * (double)(st->getdents_calls + st->dirs_found);
+        double tax_us = reads * ns / 1000.0;    /* ns -> us: walk is in microseconds */
+        LOGI("scan: split: %u reads at %.0f ns -- the attribution cost %.1f ms, "
+             "%.1f%% of the walk above; 'other' is mostly it",
+             (unsigned)reads, ns, tax_us / 1000.0,
+             walk > 0 ? 100.0 * tax_us / walk : 0.0);
+    }
 
     if (log_enabled(LOG_DEBUG)) {
         uint64_t ok = db->scan.stat_ok, bad = db->scan.stat_fail;

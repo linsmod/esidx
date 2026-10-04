@@ -36,7 +36,13 @@ sub() { printf '  %s\n' "$*"; }
 hr "1. scan  ($TEST_ROOT)"
 DB="$TMP/round.idx"
 "$BIN" build "$TEST_ROOT" -o "$DB" 2>&1 >/dev/null | sed 's/^/  /'
-ESIDX_LOG=info "$BIN" build "$TEST_ROOT" -o "$TMP/r2.idx" 2>&1 >/dev/null \
+# The second build is only here for its log, and it is at -v 5: that is the level that
+# splits the walk into getdents64 / fstatat / openat / esidx_add and prints what the
+# attribution itself cost. It is a separate build from the one above precisely so the
+# wall-clock line above is the untimed one -- a split walk is slower than a plain one.
+# -v 5 rather than ESIDX_LOG: a -v N on the command line overwrites the variable
+# (AGENTS.md 2.3), so writing both would only be misleading.
+"$BIN" -v 5 build "$TEST_ROOT" -o "$TMP/r2.idx" 2>&1 >/dev/null \
     | grep -E 'finalize:|scan:' | sed 's/^/  /'
 
 # ---------------------------------------------------------------- 2. serve

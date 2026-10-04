@@ -1383,8 +1383,15 @@ static void live_build(esidx_t *db)
 
 void esidx_finalize(esidx_t *db)
 {
-    uint64_t t0 = ts_us();
+    /* Two totals, not one: `t_all` is the phase, `t0` is the step inside it. The
+     * per-step lines used to start their clock before live_build(), so the live set
+     * -- a bitset over every id, which is a real cost on a multi-million-entry tree --
+     * was silently attributed to the directory hash below it. */
+    uint64_t t_all = ts_us(), t0 = ts_us();
     live_build(db);
+    TSDONE("finalize: live set", t0);
+
+    t0 = ts_us();
     di_hash_build(db);
     TSDONE2("finalize: dir path hash", t0, "(dirs=%u table=%u slots)",
             db->di.ht_count, db->di.ht_mask + 1);
@@ -1424,8 +1431,33 @@ void esidx_finalize(esidx_t *db)
         LOGE("finalize: continuing without the name rank; a name sort falls back "
              "to comparing folded names");
 
+    TSDONE("finalize: total", t_all);
+
     /* From here on esidx_add() has to keep every one of the above in step. */
     db->built = true;
+}
+
+/* Peak resident set, in kB, from /proc/self/status. 0 if it cannot be read.
+ * VmHWM rather than VmSize: an index reserves address space it never touches (the
+ * ext bitmaps in design §5.4 are the extreme case -- 4.2 GB of address space that
+ * measured 213 MB resident), so the size figure overstates the cost by more than an
+ * order of magnitude on some structures and is the number that decides whether an
+ * allocation will fail under a ulimit. Peak rather than current because the peak is
+ * what a build has to fit, and because nothing here frees as it goes. */
+static uint64_t vm_hwm_kb(void)
+{
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return 0;
+    char line[256];
+    uint64_t kb = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "VmHWM:", 6) == 0) {
+            kb = strtoull(line + 6, NULL, 10);
+            break;
+        }
+    }
+    fclose(f);
+    return kb;
 }
 
 void esidx_log_stats(const esidx_t *db, const char *phase)
@@ -1453,6 +1485,10 @@ void esidx_log_stats(const esidx_t *db, const char *phase)
              (unsigned long long)st->open_fail,
              (unsigned long long)st->getdents_calls,
              (unsigned long long)st->getdents_bytes);
+
+    uint64_t hwm = vm_hwm_kb();
+    if (hwm)
+        LOGI("%s: peak rss %.0f MiB", phase, (double)hwm / 1024.0);
 }
 
 /* --------------------------------------------------------------- snapshot */

@@ -20,6 +20,7 @@ const char *log_level_name(log_level_t lvl)
     case LOG_WARN:  return "warn";
     case LOG_INFO:  return "info";
     case LOG_DEBUG: return "debug";
+    case LOG_PERF:  return "perf";
     }
     return "?";
 }
@@ -32,12 +33,13 @@ static int level_from_name(const char *s, log_level_t *out)
         { "warn",  LOG_WARN  }, { "warning", LOG_WARN },
         { "info",  LOG_INFO  },
         { "debug", LOG_DEBUG }, { "trace", LOG_DEBUG },
+        { "perf",  LOG_PERF  }, { "split", LOG_PERF  },
     };
     for (size_t i = 0; i < sizeof(tab) / sizeof(tab[0]); i++) {
         if (!strcasecmp(s, tab[i].n)) { *out = tab[i].l; return 0; }
     }
-    /* bare number: 0..4 */
-    if (s[0] >= '0' && s[0] <= '4' && s[1] == '\0') { *out = (log_level_t)(s[0] - '0'); return 0; }
+    /* bare number: 0..5 */
+    if (s[0] >= '0' && s[0] <= '5' && s[1] == '\0') { *out = (log_level_t)(s[0] - '0'); return 0; }
     return -1;
 }
 
@@ -76,7 +78,7 @@ void log_init(int argc, char **argv)
             w = LOG_DEBUG;
         }
         if (w < 0) w = 0;
-        if (w > LOG_DEBUG) w = LOG_DEBUG;
+        if (w > LOG_PERF) w = LOG_PERF;
         g_level = (log_level_t)w;
     }
 }

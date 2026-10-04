@@ -234,10 +234,23 @@ ext4 NVMe — the `r7000` host, Ubuntu 22.04 x86_64, reachable as the `ssh` alia
 `r7000`. Anything quoted as a *baseline* — the tables in design §10, a "before" in
 a commit — must be re-run there before it is believed. The suites run unchanged on
 it; `make install` puts the binary in `$(PREFIX)/bin` (default `/usr/local`; use
-`PREFIX=$HOME/.local` to install without root). One environment trap on that box:
-its user `umask` is **002**, so files the fixtures create are group-writable —
-anything asserting a mode string must pin it (`test_etp.sh` `chmod 644`s its
-LIST fixture for exactly this reason).
+`PREFIX=$HOME/.local` to install without root).
+
+Two environment traps on that box, both of which have cost an hour:
+
+- its user `umask` is **002**, so files the fixtures create are group-writable —
+  anything asserting a mode string must pin it (`test_etp.sh` `chmod 644`s its
+  LIST fixture for exactly this reason).
+- **its clocksource list is `hpet acpi_pm`** — there is no TSC on offer, so
+  `clock_gettime` is a real syscall costing **1 222 ns**, against 20 ns for the
+  vDSO call it is on WSL2. That is 60x, and it decides where instrumentation may
+  live: a timer on a per-row or per-entry path is free on WSL2 and ruinous here.
+  Phase timings are two reads for a whole phase, so they are unaffected, which is
+  why every number in design §10 still stands; a per-comparison timer would have
+  made every sort number a statement about the clock. Read
+  `/sys/devices/system/clocksource/clocksource0/current_clocksource` before
+  trusting any hot-path timing measured on a new host, and let the code print its
+  own price — `-v 5` does (`scan: split: ... reads at 1222 ns`).
 
 ### 2.1 Compile-check without linking
 
@@ -270,6 +283,14 @@ already load-bearing (`-Wformat-truncation` on a deliberate snprintf).
 
 Debug is the level you want whenever the question is "what did the peer actually
 send" — see §1.4.
+
+**`-v 5` (`LOG_PERF`) is the scan walk's per-syscall split**, and it exists because of
+§2.4's clocksource: four `clock_gettime` calls per entry are free against a TSC and
+ruinous against HPET, where they cost 36 % of the walk they are splitting. It is not
+INFO, because `round.sh` builds at INFO and every published number comes from there;
+it is not DEBUG, because a sanitiser build logs at DEBUG by default and the gate would
+pay for it on every build. The per-directory `descend` trace stays at *exactly* `-v 4`,
+so `-v 5` does not drag 651 894 lines along on a large tree.
 
 ---
 
@@ -438,6 +459,18 @@ Do not re-litigate these; they were measured and the conclusions are recorded:
   match, so intersecting can only drop rows `text_match()` rejects. That is why
   `tri_applies()` lists the shapes it may touch rather than the ones it may not: a
   refused prefilter is only slower, an accepted one that is wrong loses rows.
+- **"Batch stat by inode" is not worth building, and the walk's only lever is D6.**
+  Measured with `-v 5` on `r7000` over `/work` (5 476 485 entries, design §10): the
+  walk is 55.7 s, of which **59 % is `getdents64`** (652 k calls, 392 B each, 50 µs a
+  call — one directory block at a time, latency-bound) and **18 % `fstatat`**, which
+  costs **1.81 µs and does no I/O at all**, because the inode the directory block just
+  named is already resident. Three consecutive walks put `fstatat` at 16.6 / 16.6 /
+  16.5 s while `getdents64` moved 63.1 → 50.6 → 31.9 s, which is what says the inodes
+  were cached throughout. Batching by inode would remove path resolution and leave
+  nothing; the counters that would disprove this on some other tree
+  (`esidx_log_stats()`) stay. For scale: the same build costs 60.8 s against
+  `find`'s 56.75 s on the same tree, so there is no fat left in the walk to trim —
+  only cores to add.
 - **`image:` is no longer the largest cost, and the sort was never the whole story.**
   Every sort key over an unfiltered `/usr` cost 143–240 ms, and the cause was
   `cmp_rec`'s comparator, not the sort's shape: ~6 M `strcasecmp` calls. Measured per

@@ -7,7 +7,7 @@
  *   ESIDX_LOG=debug ./esidx build /etc -o /tmp/etc.idx
  *   ESIDX_LOG=info  ./esidx query /tmp/etc.idx "ext:conf" "size:>1k"
  *
- * CLI: -v / -v N / --verbose=N  (N = 0..4). Log always goes to stderr so that
+ * CLI: -v / -v N / --verbose=N  (N = 0..5). Log always goes to stderr so that
  * stdout stays a clean result stream.
  */
 
@@ -18,7 +18,20 @@ typedef enum {
     LOG_ERROR = 1,
     LOG_WARN  = 2,
     LOG_INFO  = 3,
-    LOG_DEBUG = 4
+    LOG_DEBUG = 4,
+    /* Per-entry attribution of the scan walk, and nothing else. Its own level for
+     * two reasons, both measured:
+     *   - it cannot be LOG_DEBUG, because a sanitiser build logs at 4 by default
+     *     and the gate would pay for it on every build;
+     *   - it cannot be LOG_INFO, because every benchmark script (round.sh) runs at 3
+     *     and the attribution distorts the number it is reporting.
+     * Three clock reads per entry sounds free and is not: clock_gettime is a vDSO
+     * call only when the clocksource is the TSC, and a kernel whose clocksource list
+     * is "hpet acpi_pm" (measured on r7000) makes it a real syscall costing 1.2 us,
+     * which turned a 1.22 s walk of /usr into 3.37 s. The line the level gates
+     * prints what the attribution itself cost, so the buckets are never quoted
+     * without the price of reading them. */
+    LOG_PERF  = 5
 } log_level_t;
 
 /* Parse -v/-v N/--verbose=N out of argv and read ESIDX_LOG. Call once from

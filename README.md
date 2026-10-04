@@ -177,10 +177,18 @@ Logging is on stderr; results are on stdout, so they can be piped safely.
 ESIDX_LOG=info ./esidx build /usr -o /usr.idx  # per-phase timings + scan stats
 ESIDX_LOG=debug ./esidx query /usr.idx count:5 # per-directory trace
 ./esidx -v query /usr.idx count:5              # same as ESIDX_LOG=debug
-./esidx --verbose=2 query /usr.idx count:5     # 0=off 1=error 2=warn 3=info 4=debug
+./esidx --verbose=2 query /usr.idx count:5     # 0=off 1=error 2=warn 3=info 4=debug 5=perf
 
 ./esidx -v 3 serve /usr.idx -p 2121            # per-query timings, served
+./esidx -v 5 build /usr -o /tmp/u.idx          # + the walk split per syscall, and its price
 ```
+
+`-v 5` splits the scan walk into `getdents64` / `fstatat` / `openat` / `esidx_add`, and
+prints what the attribution itself cost. It has a level of its own because that is four
+`clock_gettime` calls per entry: free against a TSC clocksource (20 ns, WSL2), ruinous
+against HPET (1 222 ns, measured on `r7000`, where it made the split cost 36 % of the walk
+it was splitting). The per-directory trace stays at exactly `-v 4`, so `-v 5` does not drag
+651 894 `descend` lines along on a large tree.
 
 ## Architecture
 
@@ -222,10 +230,14 @@ the performance comes from, the last two are where the interoperability risk was
 
 WSL 2, Ubuntu 22.04, ext4, `-O2`, single thread. Reproduce with `./round.sh /usr`.
 
-| Tree | Entries | Scan | Finalize | Load | Snapshot |
-|---|---|---|---|---|---|
-| `/etc` | 1 622 | 5.4 ms | 0.4 ms | 0.3 ms | 95 KB |
-| `/usr` | 116 888 | 4.23 s (27.6 k/s) | 37 ms | 55 ms | 6.9 MB |
+| Tree | Entries | Scan | Finalize | Load | Snapshot | Peak RSS |
+|---|---|---|---|---|---|---|
+| `/etc` | 1 622 | 5.4 ms | 2.3 ms | 2.3 ms | 108 KB | 3 MiB |
+| `/usr` | 116 888 | 4.20 s (27.8 k/s) | 110 ms | 125 ms | 7.8 MB | 33 MiB |
+
+`finalize` is the sum of the nine derived indexes, and two of them are recent: the name
+trigram index and the name rank together are 61 % of it. `./esidx -v 5 build` prints the
+breakdown line by line, and design §10 has it per step.
 
 Query cost on `/usr`, end to end through the protocol:
 
@@ -246,6 +258,28 @@ wildcard scan over 78 296 candidates — the in-memory text scan of design §5.2
 WSL2 is ~10x optimistic (§2.4 of `AGENTS.md`), so the numbers that decide anything
 are from the `r7000` host: Ubuntu 22.04, x86_64, ext4 on NVMe, 16 cores, `-O2`,
 single thread, `/usr` = **372 084 entries**. Reproduce with `./round.sh /usr` there.
+
+Building it, on the same host:
+
+| | `/usr` | `/work` = **5 476 485** entries, 506 GiB |
+|---|---|---|
+| scan (walk) | 1 206 ms | **55 653 ms** (98 k/s) |
+| finalize | 286 ms | 5 194 ms |
+| save | 27 ms | 600 ms |
+| **build, total** | **1 492 ms** | **60 847 ms** |
+| load | 327 ms | 5 664 ms |
+| snapshot | 25.1 MiB | 414 MiB |
+| peak rss | 98 MiB | 1 419 MiB |
+
+`find /work -xdev -printf '%y %b' | awk` — one `lstat` and one `readdir` per entry and
+nothing else — takes **56.75 s** on the same tree, so the walk costs 2 % less than
+`find` and the whole build, every derived index and a 414 MiB snapshot included, costs
+7 % more than `find`'s single pass. Design §10 has the per-syscall split, and it says the
+walk is 59 % `getdents64` (652 k calls, 392 B each, latency-bound) and 18 % `fstatat`
+(1.81 µs a call, and no I/O at all, which is why "batch stat by inode" is not worth
+building); the only lever left on that walk is D6's concurrency.
+
+Query cost on `/usr`:
 
 | Query | Candidates | eval | total |
 |---|---|---|---|

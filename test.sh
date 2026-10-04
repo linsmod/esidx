@@ -1200,6 +1200,26 @@ grep -q '\[info \]' "$TMP/err" \
     && ok "--verbose=N raises the level at runtime" \
     || bad "--verbose=N raises the level at runtime"
 
+# The scan attribution is level 5 and not 4, because a sanitiser build logs at 4 by
+# default and the gate would then pay for it on every build. So it has to be asserted
+# twice: that -v 4 does NOT turn it on, and that -v 5 does.
+"$BIN" -v 4 build "$TEST_ROOT" -o "$TMP/p4.idx" >/dev/null 2>"$TMP/err"
+grep -q 'scan: split' "$TMP/err" \
+    && bad "-v 4 leaves the scan attribution off" \
+    || ok "-v 4 leaves the scan attribution off"
+
+"$BIN" -v 5 build "$TEST_ROOT" -o "$TMP/p5.idx" >/dev/null 2>"$TMP/err"
+grep -q 'scan: split: getdents64 .* | fstatat .* | openat .* | esidx_add ' "$TMP/err" \
+    && ok "-v 5 splits the walk into getdents/fstatat/openat/esidx_add" \
+    || bad "-v 5 splits the walk into getdents/fstatat/openat/esidx_add" "$(cat "$TMP/err")"
+
+# and the price of it, without which the percentages above are not evidence about the
+# walk: on a host whose clocksource is not the TSC the attribution costs more than the
+# thing it attributes.
+grep -qE 'scan: split: [0-9]+ reads at [0-9]+ ns -- the attribution cost [0-9.]+ ms' "$TMP/err" \
+    && ok "-v 5 states what the attribution itself cost" \
+    || bad "-v 5 states what the attribution itself cost" "$(cat "$TMP/err")"
+
 # --------------------------------------------------------------- summary
 
 say "performance (visibility, not assertions)"

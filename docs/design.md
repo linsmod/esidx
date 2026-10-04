@@ -497,10 +497,13 @@ not own [A4]; `d_type` decides `is_dir`, with `fstatat` only on `DT_UNKNOWN`
 [A3].
 
 Unlike plocate we must `stat` every entry, because L1 indexes size and mtime.
-plocate only stores paths and can skip stat entirely — so the stat success rate
-and the getdents byte volume are the two numbers that decide whether the
-planned "batch stat by inode" optimisation is worth building. Both are tracked
-in `scan_stats_t` and logged at DEBUG.
+plocate only stores paths and can skip stat entirely — so the stat success rate and
+the getdents byte volume were tracked in `scan_stats_t` as the two numbers that would
+decide whether the planned "batch stat by inode" optimisation is worth building. Both
+are logged, the walk's time is now split per syscall at `-v 5`, and the answer is
+**no**: on ext4 a stat costs 1.81 µs and no I/O, because the inode the directory block
+just named is already resident — see §10, "Phase timings". The counters stayed, since
+they are what would show a tree where that is not true.
 
 **getdents buffers.** One buffer per recursion level, taken from a lazily grown
 pool (`scan.c:61`). A per-frame local buffer would put
@@ -997,6 +1000,133 @@ distinct names, so the tie-break was unreachable: a bug in one level of a multi-
 sort is invisible until a fixture reaches that level. The assertions added for it also
 check that the fixture *can* discriminate — `find(1)` must not already list the four in
 raw byte order, or the assertion is vacuous and says so.
+
+#### Phase timings, and what the walk spends them on
+
+The phase numbers above (scan / finalize / load / save) were always in the log; what was
+missing was any split *inside* the walk, which is the number that decides two open
+questions: whether "batch stat by inode" (the note at the top of `scan.c`, and §4.4 of
+`AGENTS.md`) is worth building, and whether D6's scan concurrency has anything to win.
+`esidx -v 5 build <tree> -o <db>` now prints it, and what it costs to ask.
+
+**Phase timings**, `r7000`, `-O2`, single thread, one warm run each. The `/work` row is
+the tree the `find(1)` baseline in `AGENTS.md` was taken on:
+
+| | `/usr` = 372 084 | `/work` = 5 476 485 |
+|---|---|---|
+| scan (walk) | 1 206 ms | **55 653 ms** |
+| finalize | 286 ms | **5 194 ms** |
+| save | 27 ms | 600 ms |
+| build, total | 1 492 ms | **60 847 ms** |
+| load | 327 ms | 5 664 ms |
+| snapshot | 25.1 MiB | 414 MiB |
+| peak rss | 98 MiB | 1 419 MiB |
+| entries/s, warm | 308 000 | 98 400 |
+
+The `/usr` figure is the same measurement as the 268 k/s quoted above, run with a warm
+metadata cache; the spread between the two is cache state, not code.
+
+Against the same tree measured the other way — `find /work -xdev -printf '%y %b'`, which
+is one `lstat` and one `readdir` per entry and nothing else: **56.75 s**. So the walk
+costs 2 % less than `find`, and the *whole* build — every derived index and a 414 MiB
+snapshot included — costs 7 % more than `find`'s single pass. The entry count agrees
+exactly (5 476 485 both ways; `esidx` also reports `open_fail=3` for three unreadable
+directories, which the `LOGW` names). The file/directory split does not agree, and
+should not: `find`'s `%y` reports a symlink as `l`, so the `awk` that consumed it counted
+26 240 entries in neither bucket, while esidx counts every non-directory as a file.
+
+`finalize` at this size, from the `-v 5` run — the two indexes added after the original
+design are now the majority of it:
+
+| step | ms | share |
+|---|---|---|
+| name trigrams | 1 883.9 | 35.7 % |
+| name rank | 1 331.6 | 25.2 % |
+| sorted index size | 745.4 | 14.1 % |
+| sorted index mtime | 498.8 | 9.4 % |
+| sorted index ctime | 503.5 | 9.5 % |
+| dir path hash | 232.5 | 4.4 % |
+| ext sets | 51.5 | 1.0 % |
+| type bitmaps | 22.0 | 0.4 % |
+| live set | 9.5 | 0.2 % |
+| **total** | **5 279.1** | |
+
+`load` is 91 % `finalize` (5 167 of 5 664 ms): D4 persists the index to avoid a rescan,
+and at this size the rescan it avoids is 55.7 s while the work it does *not* avoid is
+5.2 s of derived indexes rebuilt on every start. Reading the snapshot itself is 375 ms.
+That is the number to weigh before deciding whether the derived indexes belong in the
+file.
+
+**The walk, split four ways** — `getdents64` / `fstatat` / `openat` / `esidx_add`, with
+the remainder as `other`:
+
+| | walk | getdents64 | fstatat | openat | esidx_add | other |
+|---|---|---|---|---|---|---|
+| `r7000` `/work` | 83 009 ms | 41.5 % | 20.0 % | 2.5 % | 16.0 % | 20.1 % |
+| `r7000` `/usr` | 3 433 ms | 8.8 % | 32.5 % | 4.9 % | 20.5 % | 33.2 % |
+| WSL2 `/usr` | 4 157 ms | 12.7 % | 65.9 % | 13.9 % | 1.8 % | 5.7 % |
+
+Four things fall out of it, and none of them was visible before:
+
+- **The walk is filesystem-call bound, and which call depends on the medium.** On WSL2
+  `fstatat` is 66 % of the walk and costs **23.4 µs a call**; on ext4 the same call is
+  **1.81 µs** and `getdents64` takes over at 59 %. §2.4's "WSL2 is ~10× optimistic" is
+  not one factor — on the two hosts it is a *different syscall* being the expensive one.
+- **"Batch stat by inode" has nothing to batch, so it should not be built.** Three
+  consecutive `/work` walks put `fstatat` at 16.6 / 16.6 / 16.5 s while `getdents64` moved
+  63.1 → 50.6 → 31.9 s: the inode is already resident (the directory block was just read,
+  and `find` had walked the tree minutes earlier), so a stat costs path resolution and
+  `copy_to_user` and no I/O at all. Batching by inode would remove the path resolution and
+  leave nothing. On a genuinely cold tree the split would move — that is the one condition
+  under which the idea becomes worth revisiting, and it is measurable rather than arguable.
+- **`getdents64` is 652 k syscalls returning 392 B each**, 50 µs a call: one directory
+  block at a time, latency-bound, single-threaded. No algorithmic fix exists — every
+  directory must be read — so D6's concurrency is the only lever, and the ledger says it
+  is worth roughly 3× on this tree. `esidx_add` at 1.2 µs an entry (pool intern, eight
+  column stores, one child-vector push, and the page faults of a doubling table) is the
+  only part of the walk that is ours.
+- **Reading the split costs more than most of what it splits, on this host.** Below.
+
+**The price of the instrumentation, and the trap that makes it necessary.** The split is
+four `clock_gettime` calls per entry, so it lives at `-v 5` and not at INFO — `round.sh`,
+which produces every number in this section, builds at INFO, and a split walk is slower
+than a plain one. It is not at DEBUG either, because a sanitiser build logs at DEBUG by
+default and the gate would pay for it. The line the level gates prints what the
+attribution cost, next to the buckets it distorted:
+
+```
+scan: split: 24513642 reads at 1222 ns -- the attribution cost 29963.0 ms, 36.1% of the walk above
+```
+
+`r7000`'s clocksource list is **`hpet acpi_pm`** — there is no TSC on offer, so
+`clock_gettime` is a syscall costing **1 222 ns**, against **20 ns** for the vDSO call it
+is on WSL2. That is 60×, and it is why the split needs a level of its own: at INFO it
+turned a 1.21 s walk of `/usr` into 3.37 s, which makes the percentages a statement about
+the measurement rather than about the walk. Two consequences worth keeping:
+
+- **Phase timings are unaffected; per-row ones would not be.** Every phase number here is
+  two clock reads for a whole phase, so 1.2 µs is nothing. Nothing on a query path calls
+  `ts_us()` per row either — `query.c` takes six readings for an entire query — so the
+  documented query costs stand. Had a timer existed per comparison, every sort number in
+  this section would have been about the clock.
+- **The buckets can be corrected, because the price is printed next to them.**
+  Subtracting each bucket's own reads at the 1222 ns the same run measured — arithmetic,
+  not a second measurement — gives the untimed walk on `/work`: `getdents64`
+  **32.8 s (59 %)**, `fstatat` **9.9 s (18 %)**, `esidx_add` **6.6 s (12 %)**, `openat`
+  0.5 s, `other` 3.3 s. That is 53.1 s against the 55.7 s an untimed walk actually took,
+  so the correction is good to 5 % — which is the error bar to quote with it.
+
+Reproduce, on a host where `/work` exists:
+
+```sh
+./esidx build /work -o /tmp/work.idx          # the wall clock nobody pays for
+./esidx -v 5 build /work -o /tmp/work.idx     # every INFO line, the split, and its price
+./esidx -v 5 query /tmp/work.idx count:5      # load, and the re-run of finalize
+```
+
+`count:5` against that index takes 1 189 ms: the answer is five rows, and the whole table
+is sorted to produce them — §6.2 step 4's problem stated as a number on a real tree rather
+than on a fixture.
 
 ---
 
