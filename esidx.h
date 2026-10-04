@@ -150,6 +150,42 @@ void sidx_erase(sidx_t *s, int64_t v, eid_t id);
  * delta, so a merge never resurrects a retracted value. */
 int  sidx_merge(sidx_t *s);
 
+/* ------------------------------------------------------- name trigram index */
+
+/* design §5.2, the name half of it: byte trigrams over the *display name*, used
+ * only to narrow a candidate set before the matcher runs.
+ *
+ * It is a filter and never a decision. Every trigram of a pattern's longest
+ * literal run has to occur in the name for the pattern to match at all, so the
+ * intersection can only drop rows text_match() would have rejected anyway -- which
+ * is what makes it safe to switch on for one query shape and leave off for
+ * another (see query.c's tri_applies).
+ *
+ * Byte trigrams, not codepoint trigrams (ref A13): it is the only rule that keeps
+ * a CJK filename from producing thousands of postings per name. Built on the
+ * ASCII-folded name, because that is the only folding the matcher it feeds does
+ * in the C locale.
+ *
+ * A posting list is ascending without being sorted: finalize walks ids in order
+ * and esidx_add only ever hands out a larger one (design §11 D8), so the
+ * intersection is a merge. Removals are *not* unpublished -- a dead id is stopped
+ * by the `live` set every query seeds from, and esidx_compact() rebuilds the whole
+ * thing, which is the same bargain ext_index_del() makes. */
+typedef struct {
+    eid_t   *ids;
+    uint32_t n, cap;
+} tri_list_t;
+
+typedef struct {
+    tri_list_t *list;     /* slot -> posting list */
+    uint32_t   *key;      /* slot -> the 24-bit trigram */
+    uint32_t    n_slots, cap_slots;
+    uint32_t   *tab;      /* open addressing, value = slot + 1, 0 = empty */
+    uint32_t    tab_mask;
+    uint32_t    tab_shift;/* hash shift, kept so the probe can take the high bits */
+    uint32_t    n_postings;
+} tri_index_t;
+
 /* ------------------------------------------------------------- enum bitmap */
 
 /* One bitmap per extension (design §5.4). Extensions are few and low
@@ -218,6 +254,7 @@ typedef struct {
     sidx_t        by_ctime;
     ext_index_t   ext;      /* ext: bitmap set, built in finalize */
     type_index_t  type;     /* file:/folder: bitmaps, built in finalize */
+    tri_index_t   tri;      /* name trigrams, built in finalize (design §5.2) */
     /* One bit per entry id: clear for a tombstone (EF_DEAD), set for every live
      * row. Every query seeds its candidate set from here, which is what keeps a
      * removed entry out of every matcher without each matcher having to know
@@ -300,6 +337,24 @@ uint32_t ext_index_count(const ext_index_t *xi, uint16_t ext_id);
 /* incremental maintenance (design §7) */
 int      ext_index_add(ext_index_t *xi, const esidx_t *db, uint16_t ext_id, eid_t id);
 int      ext_index_del(ext_index_t *xi, uint16_t ext_id, eid_t id);
+
+/* -------------------------------------------------------- name trigram index */
+
+/* Index every live display name. Called from esidx_finalize(), so a snapshot load
+ * and a compaction both get it without persisting anything (decision D4: derived
+ * indexes are rebuilt, not stored -- the same bargain the ext bitmaps make). */
+int  tri_index_build(tri_index_t *ti, const esidx_t *db);
+void tri_index_free(tri_index_t *ti);
+/* Index one name under one id. Called from link_new() for a reconcile, so the
+ * posting lists stay ascending across a live index too. */
+int  tri_index_add(tri_index_t *ti, const char *name, eid_t id);
+/* Narrow `out` in place to the ids that can possibly contain `lit` (at least 3
+ * bytes; folded here, so the caller passes the pattern's literal as written).
+ * Returns false when nothing could be narrowed -- too short, no index built, an
+ * allocation failure -- and the caller scans as before. Returns true when it did
+ * narrow, *including* to the empty set, which is a real answer: no name in the
+ * index holds that trigram. */
+bool tri_index_filter(const tri_index_t *ti, const char *lit, bitset_t *out);
 
 /* ---------------------------------------------------------------- helpers */
 

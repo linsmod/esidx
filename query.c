@@ -424,13 +424,18 @@ static int ends_with(const char *s, const char *suf, int nocase)
                   : strcmp(s + (sl - fl), suf) == 0;
 }
 
-static int text_match(const esidx_t *db, eid_t id, const ast_t *t,
-                      const match_opts_t *mo, scratch_t *sc)
+/* The modifiers a leaf is matched with: its own, plus whatever the ETP match
+ * options contribute where the leaf stayed silent.
+ *
+ * One function because the ETP options are *defaults* and this merge is a
+ * judgement call, not a lookup: `CASE 1` makes matching case sensitive but
+ * `nocase:foo` still wins, and the rule for that is "the leaf spoke for itself
+ * anywhere in this group, so the whole group is left alone". Two copies of it --
+ * one for the matcher, one for the trigram prefilter that has to agree with it --
+ * would drift, and the drift would be silent: results would simply lose rows. */
+static mod_t leaf_mods(const ast_t *t, const match_opts_t *mo)
 {
     mod_t m = t->mod;
-    /* The ETP match options are defaults that an explicit modifier overrides:
-     * `CASE 1` makes matching case sensitive, but `nocase:foo` still wins. Only
-     * merge the options the leaf did not speak for itself. */
     const unsigned OVERRIDABLE = MOD_CASE | MOD_WW | MOD_PREFIX | MOD_SUFFIX |
                                  MOD_STARTWITH | MOD_ENDWITH | MOD_REGEX | MOD_PATH;
     if (!(m & OVERRIDABLE)) m |= match_opts_mods(mo) & OVERRIDABLE;
@@ -439,6 +444,13 @@ static int text_match(const esidx_t *db, eid_t id, const ast_t *t,
         if (mo->ignore_whitespace)  m |= MOD_IGNOREWS;
         if (mo->match_diacritics)   m |= MOD_DIACRITICS;
     }
+    return m;
+}
+
+static int text_match(const esidx_t *db, eid_t id, const ast_t *t,
+                      const match_opts_t *mo, scratch_t *sc)
+{
+    mod_t m = leaf_mods(t, mo);
 
     const char *pat = t->val ? t->val : "";
 
@@ -1059,11 +1071,116 @@ static int m_len(qctx_t *c, const ast_t *t, bitset_t *out)
 
 /* -------------------------------------------------------------- SCAN leaves */
 
+/* ------------------------------------------------------- trigram prefilter */
+
+/* NAME_MAX on ext4, so a literal longer than this cannot be a substring of any
+ * display name. Truncating to it is still sound -- a prefix of a necessary
+ * condition is a necessary condition -- and it keeps this off the stack of every
+ * nested eval. */
+#define TRI_LIT_MAX 256
+
+/* Is this leaf one the name trigram index may narrow?
+ *
+ * The test is an allowlist of functions and an allowlist of modifiers, and that is
+ * the whole safety argument. The index is keyed on the folded *display name*, so
+ * every shape below has to be one where text_match() reads that name and compares
+ * it with the C locale's case-insensitive substring:
+ *
+ *   - path: and a separator in the value read the reconstructed path instead, and
+ *     the path index is a separate decision (design §5.2, and the path is O(depth)
+ *     to materialise -- §12 risk 7).
+ *   - stem: reads the name with its extension cut off.
+ *   - case:, ignorepunc:, ignorews: and diacritics: all change what is compared,
+ *     and a normalising term has no literal left to look up.
+ *   - regex: has no literal to extract.
+ *
+ * MOD_PATH and MOD_CASE are absent from the modifier allowlist, which is how the
+ * first and the case rule are enforced without naming them. A modifier nobody has
+ * thought of yet is refused by construction rather than silently accepted, which is
+ * the direction to be wrong in: a refused prefilter is only slower.
+ *
+ * Most of the `fn` names below never arrive here -- `whole:`, `ww:`, `path:` and
+ * the rest are peeled as modifiers and leave fn empty (parser.c peel_mods) -- but
+ * they are listed, because listing what is allowed is the point. */
+static bool tri_applies(const ast_t *t, const match_opts_t *mo)
+{
+    static const char *const ok_fn[] = {
+        "", "name", "name-part", "whole", "ww",
+        "startwith", "endwith", "prefix", "suffix"
+    };
+    const mod_t ALLOWED = MOD_WHOLE | MOD_WW | MOD_PREFIX | MOD_SUFFIX |
+                          MOD_STARTWITH | MOD_ENDWITH;
+
+    if (leaf_mods(t, mo) & ~ALLOWED) return false;
+    const char *fn = t->fn ? t->fn : "";
+    bool known = false;
+    for (size_t i = 0; i < sizeof(ok_fn) / sizeof(ok_fn[0]); i++)
+        if (!strcmp(fn, ok_fn[i])) { known = true; break; }
+    if (!known) return false;
+
+    const char *pat = t->val ? t->val : "";
+    /* a separator in the value widens the term to the path (text_match's
+     * path_scope), which is the same exclusion as MOD_PATH by another route */
+    return strpbrk(pat, "/\\") == NULL;
+}
+
+/* The longest run of literal bytes in a pattern, copied out. ASCII case is left
+ * alone: tri_index_filter() folds it, and folding it here as well would be one
+ * more place for the two to disagree about what the index holds.
+ *
+ * Everything anchors a wildcard to the whole *filename*, so every literal run
+ * between two wildcards has to occur in the name -- which makes the longest one a
+ * necessary condition and therefore a sound thing to prefilter on. A backslash
+ * escape breaks the run too, deliberately: `\x` matches exactly one character, so
+ * stopping short of it yields a run that is still a substring of what the pattern
+ * really means. A run of `#` or a `[...]` class likewise contributes nothing --
+ * `#` is one digit and a class matches one of a set, neither of which is a
+ * literal to look up.
+ *
+ * False means "no run of 3 bytes or more", which is also the shape the index
+ * cannot answer at all: ref A9 -- a name under 3 bytes has no trigram, so a
+ * 2-byte query has nothing to look up and the scan is the only answer. */
+static bool tri_literal(const char *pat, char *out, size_t outsz)
+{
+    const char *best = pat;
+    size_t bestlen = 0, run = 0;
+
+    for (const char *p = pat; *p;) {
+        if (*p == '*' || *p == '?' || *p == '#') { p++; run = 0; continue; }
+        if (*p == '[') {
+            const char *close = strchr(p, ']');
+            p = close ? close + 1 : p + strlen(p);
+            run = 0;
+            continue;
+        }
+        if (*p == '\\' && p[1]) { p += 2; run = 0; continue; }
+        p++;
+        run++;
+        if (run > bestlen) { bestlen = run; best = p - run; }
+    }
+    if (bestlen < 3 || bestlen >= outsz) return false;
+    memcpy(out, best, bestlen);
+    out[bestlen] = '\0';
+    return true;
+}
+
 /* Text leaves walk the incoming candidate set. This is where the driver choice
  * pays off: after `parent:` seeds the bitmap, a substring test costs one
  * strcasestr per child rather than per indexed entry. */
 static int scan_text(qctx_t *c, const ast_t *t, bitset_t *out)
 {
+    /* design §5.2: before the per-row loop, intersect the candidate set with the
+     * trigrams the pattern cannot match without. The loop below still decides
+     * every row that is left -- this can only remove rows it would have rejected,
+     * which is what makes it safe to apply to some shapes and not others. */
+    char lit[TRI_LIT_MAX];
+    if (tri_applies(t, c->mo) && tri_literal(t->val ? t->val : "", lit, sizeof(lit))) {
+        uint32_t before = bs_count(out);
+        if (tri_index_filter(&c->db->tri, lit, out))
+            LOGD("text: trigram prefilter '%s': %u -> %u candidates",
+                 lit, before, bs_count(out));
+    }
+
     for (uint32_t i = bs_next(out, 0); i < c->n; i = bs_next(out, i + 1)) {
         if (!text_match(c->db, i, t, c->mo, &c->sc)) bs_clear_bit(out, i);
     }

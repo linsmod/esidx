@@ -387,6 +387,88 @@ q "nocase:regex:^B"          ; expect "nocase: overrides the default" "$(n "$LAS
 q "ww:conf"                  ; expect "ww:"                       "$(n "$LAST")" "3"
 q "child:b.conf"             ; expect "child:<expr>"              "$(n "$LAST")" "1"
 
+# ------------------------------------------------------- trigram prefilter
+#
+# design §5.2, P4: a name trigram index narrows the candidate set before the
+# matcher pass, and text_match() still decides every row. So this whole block is
+# an invariance check -- every answer must come out identical with the prefilter
+# present and absent -- and the shapes below are the ones where a prefilter that
+# fired anyway would be *faster and wrong*: a literal under the 3-byte threshold
+# (which yields no trigram at all, ref A9), and the modifiers that change the
+# subject (stem:, path:) or the folding (ignorepunc:, ignorews:, diacritics:).
+#
+# Only the last two assertions fail without the index, and that is the point: an
+# optimisation that changes no answer can only be checked by watching it run, so
+# it has to leave a line in the log (AGENTS.md 4.1).
+say "trigram prefilter (design §5.2)"
+
+# the threshold: three bytes is a trigram, two is a full scan
+q "onf"       ; expect "a 3-byte literal"                "$(n "$LAST")" "3"
+q "on"        ; expect "a 2-byte literal falls back"     "$(n "$LAST")" "3"
+q "*nf*"      ; expect "a 2-byte run inside stars, too"  "$(n "$LAST")" "3"
+q "*on*"      ; expect "the same run, unbracketed"       "$(n "$LAST")" "3"
+# a wildcard is anchored to the whole filename, so narrowing must not turn one
+# into a contains test: nothing here is *named* on...
+q "on*"       ; expect "an anchored star is not a substring" "$(n "$LAST")" "0"
+
+# the shapes it has to refuse, each still answering exactly as before
+q "case:conf"       ; expect "case: is left to the matcher"  "$(n "$LAST")" "3"
+q "ignorepunc:conf" ; expect "ignorepunc: is left to the matcher" "$(n "$LAST")" "3"
+q "ignorews:conf"   ; expect "ignorews: is left to the matcher"   "$(n "$LAST")" "3"
+q "diacritics:conf" ; expect "diacritics: is left to the matcher" "$(n "$LAST")" "3"
+q "stem:conf"       ; expect "stem: reads the truncated name" "$(n "$LAST")" "0"
+q "path:sub1"       ; expect "path: reads the path, not the name" "$(n "$LAST")" "4"
+q "regex:^b.*conf\$" ; expect "regex: is left to the engine"   "$(n "$LAST")" "1"
+
+# ...and the shapes it does take: any case-insensitive name term whose longest
+# literal run is 3 bytes or more
+q "CONF"       ; expect "the literal is folded, not the answer" "$(n "$LAST")" "3"
+q "*.conf"     ; expect "a trailing star keeps the run"         "$(n "$LAST")" "3"
+q "*conf*"     ; expect "a leading star keeps the run"          "$(n "$LAST")" "3"
+q "whole:CONF" ; expect "whole: is still a strcmp, so 0"        "$(n "$LAST")" "0"
+q "endwith:onf"; expect "endwith: uses the whole pattern"       "$(n "$LAST")" "3"
+q "name:onf"   ; expect "name: uses the whole pattern"          "$(n "$LAST")" "3"
+
+# Trigrams are bytes, not codepoints (ref A13), so a CJK name yields them too --
+# which is the whole reason for the byte rule. Its own fixture, because the flat
+# one is counted by every assertion above and by the incremental section.
+UNI="$TMP/uni"
+CN=$'\u4e2d\u6587\u6587\u4ef6.txt'      # 中文文件.txt
+UE=$'\u00dcn\u00efc\u00f6d\u00e9.txt'  # Ünïcödé.txt
+mkdir -p "$UNI"
+: >"$UNI/$CN"; : >"$UNI/$UE"; : >"$UNI/plain.txt"; : >"$UNI/short"; : >"$UNI/ab"
+UNI_DB="$TMP/uni.idx"
+build "$UNI" "$UNI_DB" >/dev/null
+expect "the unicode fixture has 6 entries" "$BUILT" "6"
+DB="$UNI_DB"
+q "$CN"                ; expect "a CJK name matches itself"        "$(n "$LAST")" "1"
+q "$(printf '\346\226\207')" ; expect "one CJK char is 3 bytes"        "$(n "$LAST")" "1"
+q "pla"                ; expect "a 3-byte run in an ASCII name"    "$(n "$LAST")" "1"
+q "$(printf '\303\234n\303\257')" ; expect "non-ASCII bytes match verbatim" "$(n "$LAST")" "1"
+q "$(printf '\303\274')" ; expect "but are not case-folded"          "$(n "$LAST")" "0"
+q "ab"                 ; expect "a 2-byte name still matches"       "$(n "$LAST")" "1"
+DB="$FLAT_DB"
+
+# it ran, and it narrowed: 13 candidates in, the 3 rows whose name holds "onf"
+ESIDX_LOG=debug "$BIN" query "$FLAT_DB" "endwith:onf" >/dev/null 2>"$TMP/err"
+cat "$TMP/err" >>"$DIAG"
+if grep -q "trigram prefilter 'onf': 13 -> 3" "$TMP/err"; then
+    ok "the prefilter ran and narrowed the candidate set"
+else
+    bad "the prefilter ran and narrowed the candidate set" \
+        "$(grep -F 'trigram prefilter' "$TMP/err" || echo 'no prefilter line in the log')"
+fi
+
+# and it did NOT run for a shape it must refuse -- otherwise "narrowed" above
+# would only mean it is always on
+ESIDX_LOG=debug "$BIN" query "$FLAT_DB" "path:sub1" >/dev/null 2>"$TMP/err"
+cat "$TMP/err" >>"$DIAG"
+if grep -q 'trigram prefilter' "$TMP/err"; then
+    bad "the prefilter stays off for a path term" "$(grep -F 'trigram prefilter' "$TMP/err")"
+else
+    ok "the prefilter stays off for a path term"
+fi
+
 say "query language: macros and unsupported functions"
 
 q "type:document"   ; expect "type:document"              "$(n "$LAST")" "3"

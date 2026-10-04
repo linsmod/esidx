@@ -239,15 +239,57 @@ if the load factor rises.
 | Hash table | Robin Hood | [A12] |
 | Compression | zstd dictionary trained on the corpus | [A6][A8] |
 
-**Activation threshold**: above 10⁶ entries, or when measured input latency
-exceeds 100 ms. Below that, an in-memory array plus substring scan is enough —
-FSearch demonstrates that at desktop scale.
+**Activation threshold**: ~~above 10⁶ entries~~ — **wrong by an order of
+magnitude, and measured**. At 10⁵ entries the in-memory scan was already 23.8 ms of
+a 24.3 ms query on WSL2 and 27.2 ms of a 32.3 ms one on real hardware, so the
+threshold was never going to be reached before the cost was already felt. The name
+half is built unconditionally now; §10 carries the numbers. The path half is not,
+and §10 says what is left of that query without it.
 
 **Mandatory fallback**: names shorter than 3 bytes produce no trigram [A9], so a
-full-scan path must remain for short queries.
+full-scan path must remain for short queries. Kept, and it is not a corner: a
+two-byte term has no trigram to look up at all, so `on` and `on*` still scan.
 
 **Prefix / suffix** are cheaper as binary searches over sorted name and
-reversed-name arrays than as trigram lookups. Build those alongside.
+reversed-name arrays than as trigram lookups. Not built; §10.
+
+#### 5.2.1 What the name half actually is
+
+Everything in the table above belongs to a *persisted* index: a block of 32
+filenames is the unit of I/O and of compression, `docid` is a block number [A7],
+and the posting encodings exist to make a block cheap to store and to seek. D4 says
+this index is memory-resident, so none of that has anything to do here and adopting
+it would be cost without benefit:
+
+| Kept | Why |
+|---|---|
+| **Byte** trigrams [A13] | the one rule with a correctness reason: it is what keeps a CJK filename from producing thousands of postings, and it is what makes a CJK term searchable at all |
+| The longest literal run of the pattern | Everything anchors a wildcard to the whole filename, so every literal run has to occur in the name. The longest one is a necessary condition, which is all a filter may be |
+| Full scan below 3 bytes [A9] | the fallback the threshold note above is about |
+
+| Dropped | Why |
+|---|---|
+| Blocks of 32 [A5], `docid` = block number [A7], interleaving [A11] | a unit of compression and of I/O; there is no I/O on the query path |
+| delta-1 + PForDelta [A10] | an encoding for a compressed column |
+| zstd dictionary [A6][A8] | deferred to P4 in the original table too, and D4 says why: nothing to decompress |
+| Robin Hood [A12] | the table holds ≤ 34 k keys at 3.7 × 10⁵ entries, so the longest probe is not worth an implementation; linear probing at a load factor of 0.75 keeps it short. The dir hash measures its probe length for the same reason (§5.1) |
+| CRoaring (D7) | a posting list is an ascending id array and the intersection is a merge; roaring accelerates set algebra on dense ids, not a sorted merge |
+
+**It is a filter, never a decision.** That is the whole safety argument, and it is
+why `query.c`'s `tri_applies()` is an allowlist rather than a denylist: the subject
+must be the display name, the folding must be the C locale's, and the trigram must
+be a necessary condition. A shape that cannot prove all three is scanned.
+
+**Posting lists are ascending without being sorted**, because `finalize` walks ids
+in order and `esidx_add` only ever hands out a larger one (D8). The intersection is
+therefore a merge against the candidate bitmap rather than a sort. Removals are not
+unpublished — a dead id is stopped by the `live` set every query seeds from, and
+`esidx_compact()` rebuilds, which is the same bargain `ext_index_del()` makes.
+
+**The path half is a separate index and is not built.** `path:` reads a path
+rebuilt from the parent chain, so materialising one trigram per path per entry is
+O(n · depth) at build time and buys back `path_of()`'s per-row cost only if the
+path term is common. §10 measures what is left without it.
 
 ### 5.3 Numeric sorted arrays
 
@@ -558,14 +600,14 @@ Each row: source → what was taken → how it lands here → why it changed.
 | 4.1 | Columnar table, name pool, ext pool | `store.c` | done, 9 columns (`by_ctime` added for `dc:`); aggregates and `frn` still outstanding |
 | 4.2 | `path_of()` parent-chain rebuild | `store.c` | done; path materialisation pending §4.2 |
 | 5.1 | `dir_id → children`, `path → eid` hash | `store.c` | done |
-| 5.2 | trigram index, sorted/reversed name arrays | — | not started (P4); the in-memory scan is measured below and is the reason |
+| 5.2 | trigram index, sorted/reversed name arrays | `trigram.c` | **name half done** — `trigram.c`, byte trigrams over the display name, 33 727 keys / 4.83 M postings at 3.7 × 10⁵ entries; §5.2.1 for what was deliberately left out and why. **Path half and the sorted/reversed name arrays not started** |
 | 5.3 | sorted array + delta buffer | `store.c` | **done** — `sidx_update`/`sidx_erase` write the delta, D3's 1%/60 s merge is implemented, and the range read honours the retractions |
 | 5.4 | dense bitset | `index.c` | done; CRoaring at P4 (D7). Set algebra lives here, not in the executor |
 | 5.4 | ext bitmaps, file:/folder: bitmaps | `store.c` | done — built in `finalize`, so the snapshot format is unchanged |
 | 5.5 | aggregate columns + bubbling | — | not started; `child-count:` is derived from the children vector instead, and the vector *is* maintained across a removal — which is the part [B6] would have to get right |
 | 5.6-5.8 | content, dupe, sparse metadata | — | not started (P6) |
 | 6.1 | lexer → parser → AST | `lexer.c`, `parser.c` | **done** |
-| 6.2 | optimiser: selectivity estimate, driver selection | `query.c` | **done** for step 1-2 (exact cardinality per leaf, no histogram yet). Step 3 ordering and step 4 TopK not started — see below. The `size:`/`dm:`/`dc:` estimates are now upper bounds once the D3 delta is non-empty, because they count the main array without the retractions |
+| 6.2 | optimiser: selectivity estimate, driver selection | `query.c` | **done** for step 1-2 (exact cardinality per leaf, no histogram yet). Step 3 ordering and step 4 TopK not started — see below. The `size:`/`dm:`/`dc:` estimates are now upper bounds once the D3 delta is non-empty, because they count the main array without the retractions. A text leaf can be costed from its shortest trigram posting list (§5.2) but is **still not a driver**: the filter narrows eval, not the candidate count |
 | 6.3 | execution: candidates → bitmaps → matchers → sort → slice | `query.c` | **done**, including the second-stage FILTER_* pass. The text matcher implements Everything's rule for *what a term reads* — the filename, or the path once the value carries a separator or says `path:` — verified shape by shape against voidtools' server; §12.10 has the table and the two shapes still open |
 | 6.4 | result cache | `etp.c` | **done** — the full sorted set is kept and re-sliced, and invalidated by the index epoch |
 | 7 | full scan | `scan.c` | done; concurrency (D6) not started |
@@ -659,10 +701,58 @@ Two things fall out of that table:
 - The remaining 23.8 ms is a `*.conf` wildcard scan over 78 296 candidates. That
   is §5.2's trigram index, and the measurement is what justifies its activation
   threshold (10⁶ entries) being optimistic: at 10⁵ the in-memory scan is already
-  the dominant cost of a real query. The gate should be revisited at P4 — either
-  lower the threshold or add the name-sorted and reversed-name arrays from §5.2,
-  which are cheaper than a trigram index and would serve `startwith:`/`endwith:`
-  directly.
+  the dominant cost of a real query. **That gate is now gone** — the name half is
+  built unconditionally, and the next block is what it bought. (The alternative
+  this paragraph used to recommend, name-sorted and reversed-name arrays, was the
+  weaker of the two fixes and is not what landed: they serve `startwith:` and
+  `endwith:` and nothing else, while the trigram filter serves every text term
+  there is.)
+
+#### Name trigram index — before and after, on real hardware
+
+`r7000` (Ubuntu 22.04, x86_64, ext4 on NVMe, 16 cores), `/usr` = **372 084
+entries**, `-O2`, single thread. Both columns are the same `./round.sh /usr`
+session against the same tree, one build differing only in this layer — the
+harness is in the repo on purpose (AGENTS.md §1.3), so these are re-measurable
+rather than remembered. Every query returns the identical row count, which is the
+invariant the layer promises: it is a filter, and only the time moves.
+
+| Query | Candidates | eval before | eval after | total before | total after |
+|---|---|---|---|---|---|
+| `conf` (bare word, the client's default search) | 372 084 → **8 625** by the prefilter | 29.9 ms | **6.5 ms** | 32.3 ms | **12.0 ms** |
+| `path:/usr *.conf size:>1k` | 233 021 → **908** for the `*.conf` leaf | 64.7 ms | **33.9 ms** | 66.2 ms | **35.3 ms** |
+| `ext:conf` | 1 206 (ext bitmap, unchanged) | 0.08 ms | 0.06 ms | 1.0–1.4 ms | 1.0–1.2 ms |
+| `image:` | 55 229 (ext bitmaps, unchanged) | 0.94 ms | 1.08 ms | 54.3 ms | 55.7 ms |
+| `parent:"/usr" folder:` | 16 (dir tree, unchanged) | 0.04 ms | 0.04 ms | 0.22 ms | 0.22 ms |
+
+Four things this settles, and one it does not:
+
+- **The bare word was the client's default and nothing measured it.** Every shape
+  already in `round.sh` either reads a path or never reaches a text matcher, which
+  is why the layer had no before-number to quote. `round.sh` now carries it.
+- **`path:` is untouched, and the query it appears in still halved** — from the
+  *other* leaf in the same query. `*.conf` has no separator, so it reads the name
+  and the name index applies; `path:/usr` reads a rebuilt path and is refused. Half
+  of that query's cost was never the part this layer was built for.
+- **Candidates do not move for a text term.** `conf` still seeds all 372 084 rows,
+  because §6.2 step 3 would have to make a text leaf a driver and this layer
+  deliberately does not. What changed is that the matcher pass walks 8 625 rows
+  instead of 372 084. The sort grew correspondingly (2.3 → 5.3 ms) because
+  8 484 rows are now collected where before they were collected too — that one is
+  sampling noise across an 11-drive session, not a cost of the filter.
+- **A word no filename contains costs nothing.** `zzzzqqqqxxxx` narrows to 0
+  candidates and returns without touching a row: the trigram has no posting list.
+- **What is still open:** `image:` is now the largest single cost on this tree
+  (54 ms, of which ~53 ms is the sort over 55 229 rows), which is §6.2 step 4's
+  TopK and not this layer. And a `path:` term is still a full scan — §5.2's path
+  half.
+
+**What it costs.** `finalize` on this tree: **+90.4 ms** (90.4 ms to build 33 727
+keys and 4 834 687 postings; the other six derived indexes together are ~141 ms),
+and `esidx_load` pays the same because it re-runs `finalize` — 276 ms becomes
+~367 ms. Memory: ~20 MB of postings on a 372 k-entry index, against a 6.9 MB
+snapshot for 117 k entries on WSL2. Nothing is persisted (D4), so this is paid at
+startup and at every compaction and never on the query path.
 
 ---
 

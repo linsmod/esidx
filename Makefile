@@ -27,7 +27,7 @@ LDFLAGS += -fsanitize=address,undefined
 endif
 
 # storage + index (design §4, §5) | syntax (§6.1) | execution (§6.3) | protocol (§1)
-OBJS = store.o index.o scan.o lexer.o parser.o regex.o query.o log.o etp.o main.o
+OBJS = store.o index.o scan.o trigram.o lexer.o parser.o regex.o query.o log.o etp.o main.o
 
 all: esidx
 

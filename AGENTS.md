@@ -392,11 +392,26 @@ Do not re-litigate these; they were measured and the conclusions are recorded:
   the whole matched set, so every id is collected and sorted anyway, and keeping
   the sorted array is what makes the protocol result cache free. Recorded in
   design §10.
-- **The in-memory text scan is the remaining cost, and §5.2's 10⁶-entry
-  activation threshold is too optimistic.** A wildcard over 78 296 candidates
-  cost 23.8 ms of a 24.3 ms query at 10⁵ entries. Revisit at P4 — the name-sorted
-  and reversed-name arrays are cheaper than a trigram index and would serve
-  `startwith:`/`endwith:` directly.
+- **The name trigram index is built, and the 10⁶-entry activation threshold it
+  replaced was wrong by an order of magnitude.** A wildcard over 78 296 candidates
+  cost 23.8 ms of a 24.3 ms query at 10⁵ entries, so the gate would never have been
+  reached before the cost was already felt. P4 layer 1 (`trigram.c`) now measures,
+  on `r7000` over 372 084 entries: a bare word 29.9 → 6.5 ms of eval,
+  `path:/usr *.conf size:>1k` 64.7 → 33.9 ms (from its *other* leaf — `path:`
+  itself is still a full scan, that is the unbuilt path half). It costs +90 ms of
+  `finalize` and ~20 MB, and buys back 20 ms per query; `round.sh` carries the
+  bare-word shape precisely because nothing measured it before.
+- **A filter must be provably a superset, and the allowlist is the proof.** The
+  trigram set of a pattern's longest literal run is a *necessary* condition for a
+  match, so intersecting can only drop rows `text_match()` rejects. That is why
+  `tri_applies()` lists the shapes it may touch rather than the ones it may not: a
+  refused prefilter is only slower, an accepted one that is wrong loses rows.
+- **`image:` is now the largest cost on a real tree** — 54 ms on `r7000`, ~53 of it
+  the sort over 55 229 rows. That is §6.2 step 4 (TopK), still not built, and it is
+  the next thing to look at.
+- **The in-memory text scan is no longer the remaining cost, but it is still a cost
+  on paths.** `path:` has no index yet; `path_of()` is O(depth) per call (§12 risk
+  7), which is what the path half of §5.2 would fix.
 - **`path_of()` is O(depth) with an allocation per call** (design §12 risk 7). It
   is fine for display and for the current sort volume; the path-sort cache in
   `query.c` bounds the repeat cost when it is not.

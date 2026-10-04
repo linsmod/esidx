@@ -123,6 +123,10 @@ static int link_new(esidx_t *db, eid_t id)
     uint16_t e = et->ext_id[id];
     if (e && ext_index_add(&db->ext, db, e, id) != 0) return -1;
 
+    /* The trigram posting lists are ascending because ids are, so appending here
+     * keeps the property the intersection merge depends on (design §5.2). */
+    if (tri_index_add(&db->tri, display_name_of(db, id), id) != 0) return -1;
+
     /* A new directory needs a path in the hash, or `parent:` on it misses. */
     if ((et->flags[id] & EF_DIR) && di_hash_insert(db, id) != 0) return -1;
     return 0;
@@ -819,6 +823,7 @@ void esidx_free(esidx_t *db)
     free(db->di.ht_off); free(db->di.ht_val);
     sidx_free(&db->by_size); sidx_free(&db->by_mtime); sidx_free(&db->by_ctime);
     ext_index_free(&db->ext);
+    tri_index_free(&db->tri);
     bs_free(&db->type.all); bs_free(&db->type.dirs); bs_free(&db->type.files);
     bs_free(&db->live);
     memset(db, 0, sizeof(*db));
@@ -940,6 +945,13 @@ void esidx_finalize(esidx_t *db)
     t0 = ts_us();
     type_index_build(&db->type, db);
     TSDONE("finalize: type bitmaps", t0);
+
+    t0 = ts_us();
+    if (tri_index_build(&db->tri, db) != 0)
+        LOGE("finalize: continuing without the name trigram index; text queries "
+             "stay correct and stay slow");
+    TSDONE2("finalize: name trigrams", t0, "(%u distinct, %u postings)",
+            db->tri.n_slots, db->tri.n_postings);
 
     /* From here on esidx_add() has to keep every one of the above in step. */
     db->built = true;

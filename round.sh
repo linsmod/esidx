@@ -177,6 +177,23 @@ sendraw EVERYTHING QUERY
 query
 EOF
 
+# A bare word, which is what a client sends when the user just starts typing and
+# is the shape the name trigram index exists for (design 5.2). It was missing here,
+# which is why the index had no before/after number to quote: every other shape in
+# this script either reads a path or never reaches a text matcher.
+drive "a bare word -- the client's default search, PATH 0 and CASE 0" <<'EOF'
+send EVERYTHING CASE 0
+send EVERYTHING PATH 0
+send EVERYTHING SIZE_COLUMN 1
+send EVERYTHING DATE_MODIFIED_COLUMN 1
+send EVERYTHING PATH_COLUMN 1
+send EVERYTHING SORT date_modified_descending
+send EVERYTHING COUNT 50
+send EVERYTHING SEARCH conf
+sendraw EVERYTHING QUERY
+query
+EOF
+
 drive "a second-stage filter on top of the primary search" <<EOF
 send EVERYTHING COUNT 100
 send EVERYTHING SEARCH ext:conf
@@ -199,13 +216,22 @@ EOF
 # ------------------------------------------------------------- 4. the numbers
 
 hr "4. where the time goes (from the server log above)"
-sub "candidate seeding is visible per query as 'seeded N of M candidates'"
+sub "candidate seeding is visible per query as 'N of M candidates from driver leaf'"
 sub "a browse request seeds from parent:, so the matcher pass walks a directory"
 sub "listing rather than the index; an unfiltered query has no such anchor"
 echo
-grep -oE 'seeded [0-9]+ of [0-9]+ candidates' "$TMP/srv.err" | sort -u | sed 's/^/  /'
+grep -oE '[0-9]+ of [0-9]+ candidates from driver leaf #[0-9]+' "$TMP/srv.err" \
+    | sort -u | sed 's/^/  /'
 echo
 sub "cache hits:"
 grep -c 'cache hit' "$TMP/srv.err" | sed 's/^/  /'
+
+# The prefilter's own line, on the same tree and the same build. Seeded candidates
+# do not move -- a text leaf is still not a driver (design 6.2 step 3 is where that
+# would change), so this is the number that says the text scan itself got cheaper.
+echo
+sub "name trigram prefilter on the same tree (design 5.2):"
+ESIDX_LOG=debug "$BIN" query "$DB" conf 2>&1 >/dev/null \
+    | grep -E 'trigram prefilter|plan: ' | sed 's/^/  /'
 
 hr "round complete"
