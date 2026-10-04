@@ -86,6 +86,20 @@ struct ast {
     ast_t *sub;
 };
 
+/* The longest value one term may carry, NUL excluded.
+ *
+ * Everything's search box takes tens of thousands of characters and `ext:` is the
+ * shape that gets there -- a list of extensions is a single term -- so this is a
+ * protocol-sized number on purpose: it matches the longest control line the ETP layer
+ * will hand over (its 8 KB buffer), which makes truncation here unreachable from the
+ * wire. It was 2048, and a term longer than that was cut *silently*, so the answer was
+ * a query nobody asked: `ext:e1;e2;<2 100 characters of names>;e5` matched e1 and e2
+ * and dropped the e5 at the end, with no error anywhere (AGENTS.md 5.3).
+ *
+ * Nothing above this layer may bound a term below this: a value that arrives cut is a
+ * query that answers something else. */
+#define SYNTAX_VALUE_MAX 8192
+
 /* Parse one query string. Returns NULL and fills `err` on a syntax error.
  * `err` may be NULL. */
 ast_t *syntax_parse(const char *s, char *err, size_t errsz);

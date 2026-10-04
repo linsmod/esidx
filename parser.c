@@ -339,28 +339,34 @@ static ast_t *parse_term(parser_t *p, const char *text)
     ast_t *n = node(AST_TERM);
     if (!n) { perr(p, "out of memory"); return NULL; }
 
-    char raw_fn[64], raw_val[2048];
-    char fn[80], val[2048];
+    char raw_fn[64], fn[80];
+    /* One heap buffer for the value where there were two 2 KB stack ones, because
+     * SYNTAX_VALUE_MAX is 8 KB and parse_term sits under MAX_DEPTH frames of recursion:
+     * 16 KB per frame is a stack overflow waiting for a query with a lot of brackets in
+     * it. peel_value_mods() shifts the string left in place, so one buffer is all the
+     * two were ever needed for. */
+    char *val = malloc(SYNTAX_VALUE_MAX);
+    if (!val) { ast_free(n); perr(p, "out of memory"); return NULL; }
 
-    if (split_function(text, raw_fn, sizeof(raw_fn), raw_val, sizeof(raw_val))) {
+    if (split_function(text, raw_fn, sizeof(raw_fn), val, SYNTAX_VALUE_MAX)) {
         const char *rest = peel_mods(raw_fn, &n->mod);
         snprintf(fn, sizeof(fn), "%s", rest);
-        snprintf(val, sizeof(val), "%s", raw_val);
         /* the name may have been nothing but modifiers; then the value can carry
          * more of them (`path:regex:...`) */
         if (!*fn) peel_value_mods(val, &n->mod);
     } else {
         snprintf(fn, sizeof(fn), "%s", "");
-        snprintf(val, sizeof(val), "%s", text);
+        snprintf(val, SYNTAX_VALUE_MAX, "%s", text);
     }
 
     /* bracketed value list */
     size_t vl = strlen(val);
     if (vl >= 2 && val[0] == '<' && val[vl - 1] == '>') {
         char *inner = malloc(vl - 1);
-        if (!inner) { ast_free(n); perr(p, "out of memory"); return NULL; }
+        if (!inner) { free(val); ast_free(n); perr(p, "out of memory"); return NULL; }
         memcpy(inner, val + 1, vl - 2);
         inner[vl - 2] = '\0';
+        free(val);
         n->list = parse_list(p, inner);
         free(inner);
         if (!n->list) { ast_free(n); return NULL; }
@@ -374,8 +380,9 @@ static ast_t *parse_term(parser_t *p, const char *text)
     if (!strcmp(fn, "child")) {
         n->fn = dupstr(fn);
         n->val = dupstr("");
-        if (!n->fn || !n->val) { ast_free(n); perr(p, "out of memory"); return NULL; }
+        if (!n->fn || !n->val) { free(val); ast_free(n); perr(p, "out of memory"); return NULL; }
         n->sub = parse_expr_str(p, val);
+        free(val);
         if (!n->sub) { ast_free(n); return NULL; }
         return n;
     }
@@ -384,6 +391,7 @@ static ast_t *parse_term(parser_t *p, const char *text)
 
     n->fn = dupstr(fn);
     n->val = dupstr(val);
+    free(val);
     if (!n->fn || !n->val) { ast_free(n); perr(p, "out of memory"); return NULL; }
     return n;
 }

@@ -1254,6 +1254,18 @@ q "ext:${EXTLIST%;}"
 expect "one ext: term naming all 400 of them is not truncated" \
     "$(n "$LAST")" "$(find "$EXTF" -type f | wc -l)"
 
+# The same term again, past every buffer it used to pass through. 400 short names make a
+# 1 892-character value, which fitted inside the parser's old 2048 by 155 bytes -- so the
+# assertion above passed for the wrong reason, and a term's value was being cut at 2047.
+# Padding each name out to 16 characters puts the value at ~6 900, and the one extension
+# that exists goes *last*, so a cut anywhere along the way drops it and the answer is 0
+# rows instead of 1. e5 is carried by 1 + 5 % 5 = 1 file.
+PAD=$(for i in $(seq 1 400); do printf 'zzzzzzzzzzzzzz%s;' "$i"; done)
+q "ext:${PAD}e5"
+expect "a 6 900-character ext: term is answered whole, not cut" "$(n "$LAST")" "1"
+strays=$(printf '%s\n' "$LAST" | grep -vc '\.e5$')
+expect "and the term at its very end is the one that matched" "$strays" "0"
+
 # --------------------------------------------------------------- logging
 
 say "instrumentation"
