@@ -790,6 +790,86 @@ uint32_t sidx_range_to_bitset(const sidx_t *s, int64_t lo, int64_t hi, bitset_t 
  * a small open-addressed map from ext_id to a dense slot; linear probing is fine
  * at a load factor of 0.5 (ref A12 considered and rejected for the trigram table,
  * where the probe distribution matters; here it does not). */
+
+/* What the per-extension cardinality looks like, and what the two candidate
+ * structures would cost with it.
+ *
+ * This is here because the decision it feeds was made without it. design 5.4 argues
+ * from "extensions are few and low cardinality" -- 1 580 of them over 372 084 entries
+ * when it was written -- and each set is sized by the *table*, not by the extension, so
+ * the cost is a product: one bitmap per extension, n bits each. Nothing recorded where
+ * that product stops being affordable, and it grows faster than the tree does, because
+ * the extension count grows with the tree too.
+ *
+ * So this prints the distribution rather than a verdict. The loop that fills
+ * `counts[]` has already produced every number here; before this it discarded them.
+ * Kept at INFO because that is the level a build or load log carries (design 4.4: if
+ * the measurement a decision depends on is not available, collect it first, on its
+ * own). The per-extension numbers are bucketed because a distribution is what decides
+ * a threshold -- a mean would hide that one extension can be a million entries and the
+ * other 6 000 are singletons.
+ *
+ * The two costs are not comparable on memory alone: a bitmap selects in n/64 word
+ * operations whatever the cardinality, while a posting list walks k ids. So the line
+ * that matters is the crossover, k below which the list is also the *smaller*
+ * structure -- an extension that is both broad and above it is the only case where
+ * the bitmap earns its address space.
+ */
+/* A byte count in whichever unit does not print it as "0". A log line whose number is
+ * 0 MB tells a reader nothing on the tree they are looking at. */
+static void fmt_bytes(char *out, size_t outsz, size_t b)
+{
+    if (b >= 1024 * 1024)
+        snprintf(out, outsz, "%llu MB", (unsigned long long)(b / (1024 * 1024)));
+    else if (b >= 1024)
+        snprintf(out, outsz, "%llu kB", (unsigned long long)(b / 1024));
+    else
+        snprintf(out, outsz, "%llu B", (unsigned long long)b);
+}
+
+static void log_ext_cardinality(const ext_index_t *xi, uint32_t entries)
+{
+    /* Buckets: =1, 2-15, 16-255, 256-4095, 4096-65535, >=65536. The last two edges
+     * are where a tree's bulk usually sits, so they are where a threshold would fall.
+     *
+     * Written as an if-chain rather than a bounds table on purpose. The table version
+     * indexed `lo[k + 1]` for k == NB-1, one element past the end: undefined, and the
+     * -O2 build folded the last comparison away, so a cardinality of 694 286 printed
+     * as ">=65536: 0" next to "largest 694286" in the same line. A diagnostic that
+     * cannot be wrong by construction is worth three lines of comparisons. */
+    enum { NB = 6 };
+    uint32_t bn[NB] = {0}, be[NB] = {0};
+    uint32_t with_ext = 0, maxc = 0;
+
+    for (uint32_t s = 0; s < xi->n; s++) {
+        uint32_t c = xi->counts[s];
+        int b = (c == 1) ? 0 : c < 16 ? 1 : c < 256 ? 2
+              : c < 4096 ? 3 : c < 65536 ? 4 : 5;
+        bn[b]++; be[b] += c; with_ext += c;
+        if (c > maxc) maxc = c;
+    }
+
+    size_t bitset_bytes = ((size_t)entries + 63) / 64 * sizeof(uint64_t);
+    size_t as_bitmaps  = (size_t)xi->n * bitset_bytes;
+    size_t as_lists    = (size_t)with_ext * sizeof(eid_t) + (size_t)xi->n * 3 * sizeof(eid_t);
+    char bmb[32], lmb[32];
+    fmt_bytes(bmb, sizeof(bmb), as_bitmaps);
+    fmt_bytes(lmb, sizeof(lmb), as_lists);
+
+    /* `count/entries` per bucket: the extension count alone says how many keys there
+     * are, the entry count says where the rows are, and a threshold needs both -- 57
+     * extensions holding 3 M rows is a different problem from 57 holding 3 000. */
+    LOGI("ext cardinality: %u extensions over %u entries, %u carry one (largest %u,"
+         " mean %.1f) | extensions/entries per extension: =1:%u/%u  2-15:%u/%u"
+         "  16-255:%u/%u  256-4095:%u/%u  4096-65535:%u/%u  >=65536:%u/%u",
+         xi->n, entries, with_ext, maxc,
+         xi->n ? (double)with_ext / (double)xi->n : 0.0,
+         bn[0], be[0], bn[1], be[1], bn[2], be[2], bn[3], be[3], bn[4], be[4], bn[5], be[5]);
+    LOGI("ext cardinality: one bitmap each is %s of address space, a posting list each"
+         " is %s | below %u entries an extension is the smaller structure as a list",
+         bmb, lmb, (uint32_t)(bitset_bytes / sizeof(eid_t)));
+}
+
 int ext_index_build(ext_index_t *xi, const esidx_t *db)
 {
     ext_index_free(xi);
@@ -841,6 +921,7 @@ int ext_index_build(ext_index_t *xi, const esidx_t *db)
     xi->sets = sets;
     xi->tab = tab;
     xi->tab_mask = mask;
+    log_ext_cardinality(xi, et->count);
     LOGD("ext bitmaps: %u distinct extensions over %u entries", n, et->count);
     return 0;
 }

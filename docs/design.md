@@ -316,6 +316,41 @@ operators.
 Dense `uint64_t` words for now, swapped for CRoaring later behind an unchanged
 `bs_init` / `bs_set` / `bs_test` / `bs_clear` ABI — decision D7.
 
+**The extension half of this is measured to be the wrong structure, and the fix is
+known.** `ext_index` gives every extension a bitmap sized by the *table*, so the cost
+is a product — one bitmap per extension, `n` bits each — and the extension count grows
+with the tree, so the product grows faster than the tree does. §5.4's original argument
+was "extensions are few and low cardinality" (1 580 over 372 084 entries when written)
+and never recorded where the product stops being affordable.
+
+`log_ext_cardinality()` in `store.c` prints what it would cost both ways, at INFO, from
+the counts the build already computes. On `r7000`, unfiltered:
+
+| `/usr` = 372 084 entries | `/work` = 5 476 485 entries |
+|---|---|
+| 1 580 extensions, largest 47 504, mean 179 | 6 478 extensions, largest 694 286, mean 651 |
+| 744 singletons, 522 in 2-15, 244 in 16-255, 56 in 256-4095, 14 in 4096-65535 | 1 848 / 3 370 / 904 / 299 / 43 / **14 over 65 536** |
+| bitmaps 70 MB of address space, lists 1 MB | bitmaps **4 229 MB**, lists 16 MB |
+| crossover at 11 628 entries | crossover at 171 142 entries |
+
+Measured resident cost of that 4 229 MB on `/work` is 213 MB, because a `calloc`'d
+bitmap only faults the pages its bits land on — so the cost shows up as *address space*
+(6.1 GB `VmSize` against 1.56 GiB resident) and becomes a hard failure where overcommit
+is refused or `ulimit -v` is set, which is the same failure mode as the path sort in
+§10 that only appeared under a memory cap.
+
+The replacement is the structure §5.2 already uses for names: a posting list, 4 bytes
+per entry, ascending because ids are. The threshold is a select-cost question, not a
+memory one — a bitmap selects in `n/64` word operations whatever its cardinality, a
+list walks `k` ids, so the bitmap earns its place only while `k > n/64` (85 576 on
+`/work`, where exactly **one** extension of 6 478 qualifies). Total 4 229 MB → 17 MB.
+The cardinality is printed rather than assumed because it is the whole decision, and
+because the first version of that print was wrong in a way worth recording: it bucketed
+through a bounds table indexed one element past its end, `-O2` folded the last comparison
+away, and `/work` reported `>=65536: 0` on the same line as `largest 694286`. The
+14 broad extensions it had been hiding hold 3 019 986 rows — 55 % of everything with an
+extension — which is exactly the mass a threshold has to be placed against.
+
 ### 5.5 Aggregate columns
 
 `child_count`, `child_file_count`, `child_folder_count` are stored inline on the
