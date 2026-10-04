@@ -1,8 +1,9 @@
 # esidx -- ext4 search index engine. Refs: ../ext4_index_engine_design.md
 #
-#   make            optimised build, log level = warn
+#   make            optimised build of everything (esidx + etp-probe), warn
 #   make DEBUG=1    -O0 -g -fsanitize=address,undefined, log level = debug
 #   make test       build + ./test.sh
+#   make test-all   build + both suites, index/language first
 #   make install    install the esidx binary to $(BINDIR) (default $(PREFIX)/bin)
 #
 # Logging is switched at runtime with ESIDX_LOG=<level> or -v N; DEBUG=1 only
@@ -29,7 +30,13 @@ endif
 # storage + index (design §4, §5) | syntax (§6.1) | execution (§6.3) | protocol (§1)
 OBJS = store.o index.o scan.o trigram.o lexer.o parser.o regex.o query.o log.o etp.o main.o
 
-all: esidx
+# `all` is etp-probe as well as the server, so one `make` leaves a checkout ready
+# for both suites. It used to be two steps (AGENTS.md 3.1), and the second one was
+# easy to forget: test_etp.sh then stops with "./etp-probe not built", which reads
+# like a broken checkout rather than a missing prerequisite. The probe is one
+# translation unit and ~1000 lines, so building it by default costs nothing next to
+# the server itself.
+all: esidx etp-probe
 
 esidx: $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
@@ -37,7 +44,7 @@ esidx: $(OBJS)
 %.o: %.c esidx.h syntax.h etp.h log.h timer.h lexer.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-test: esidx
+test: all
 	./test.sh
 
 # protocol acceptance, driven over a real socket by tools/etp_probe.c, which
@@ -46,7 +53,7 @@ test: esidx
 etp-probe: tools/etp_probe.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
-test-etp: esidx etp-probe
+test-etp: all
 	./test_etp.sh
 
 # both suites; the index/language one first so a regression there is obvious

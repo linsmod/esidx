@@ -43,12 +43,14 @@ a file, states what is outstanding, and carries the current measurements.
 ## Build
 
 ```sh
-make            # -O2, log level = warn
+make            # -O2, log level = warn: builds esidx and etp-probe
 make DEBUG=1    # -O0 -g + AddressSanitizer/UBSan, log level = debug
 make clean
 ```
 
-Requires a Linux target (ext4), GCC or Clang with C11, and `make`.
+One `make` leaves the tree ready for both test suites — `etp-probe` is the
+acceptance client, not a user-facing tool, so `make install` installs only
+`esidx`. Requires a Linux target (ext4), GCC or Clang with C11, and `make`.
 
 ## Test
 
@@ -297,7 +299,7 @@ etp.c          FTP control + SITE EVERYTHING
 main.c         CLI: build / update / query / serve
 log.c log.h    leveled logging, runtime-switchable
 timer.h        monotonic phase timing helpers
-tools/etp_probe.c   the acceptance client (built by `make etp-probe`)
+tools/etp_probe.c   the acceptance client (built by `make`, and by `make etp-probe`)
 test.sh        index and language suite
 test_etp.sh    protocol acceptance suite
 round.sh       one full round, with timings
