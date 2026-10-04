@@ -43,24 +43,63 @@
 #include "timer.h"
 
 #define TRI_TAB_MIN   1024u
-/* NAME_MAX is 255 on ext4, so a name cannot yield more than 253 trigrams and this
- * holds them all. The overflow path below posts a duplicate rather than skipping
- * the trigram, because a dropped trigram loses a row and a duplicate cannot. */
-#define TRI_SEEN_MAX  256u
+/* How many trigrams one name can contribute, and therefore how big the per-name
+ * key buffer has to be. PATH_MAX is 4096 and the root's stored name is a whole
+ * path (design §12.12), so the bound is PATH_MAX-2, not NAME_MAX-2.
+ *
+ * This used to be NAME_MAX (256), with the overflow path posting a duplicate
+ * instead of skipping the trigram -- which broke the invariant the header states,
+ * that a posting list holds an id at most once, on exactly the names long enough
+ * to reach it. A buffer that cannot overflow removes the choice. 16 KB of stack
+ * in a function that is not recursive, on a path that already carries a 64 KB
+ * path buffer. */
+#define TRI_MAX_KEYS  4096u
 
 /* --------------------------------------------------------------- the keys */
 
-/* ASCII-only on purpose: see the invariant note above. */
+/* ASCII-only on purpose: see the invariant note above.
+ *
+ * A table, because this runs three times per trigram per name and the build walks
+ * every name twice. The two-pass counting build below needs the extraction twice
+ * per name, and three compares per byte is a measurable share of the step: 1.88 s
+ * on /work before this, against the same walk done twice.
+ *
+ * Sixteen rows of sixteen, generated rather than typed. The first version of this
+ * table had seventeen, and the compiler's "excess elements" warnings scrolled past
+ * while the row that folds A-Z was silently dropped -- so every mixed-case
+ * prefilter stopped folding, and three suite assertions failed on it. Which is the
+ * argument both for the assertions and against typing 256 numbers by hand. */
+static const unsigned char tri_fold_tab[256] = {
+      0,   1,   2,   3,   4,   5,   6,   7,   8,   9,  10,  11,  12,  13,  14,  15,
+     16,  17,  18,  19,  20,  21,  22,  23,  24,  25,  26,  27,  28,  29,  30,  31,
+     32,  33,  34,  35,  36,  37,  38,  39,  40,  41,  42,  43,  44,  45,  46,  47,
+     48,  49,  50,  51,  52,  53,  54,  55,  56,  57,  58,  59,  60,  61,  62,  63,
+     64,  97,  98,  99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111,
+    112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122,  91,  92,  93,  94,  95,
+     96,  97,  98,  99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111,
+    112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127,
+    128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143,
+    144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159,
+    160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175,
+    176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191,
+    192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207,
+    208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223,
+    224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239,
+    240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255,
+};
+
 static inline uint32_t tri_fold(unsigned char c)
 {
-    return (c >= 'A' && c <= 'Z') ? (uint32_t)(c - 'A' + 'a') : (uint32_t)c;
+    return tri_fold_tab[c];
 }
 
 static inline uint32_t tri_key(const char *s, size_t i)
 {
-    return (tri_fold((unsigned char)s[i]) << 16) |
-           (tri_fold((unsigned char)s[i + 1]) << 8) |
-            tri_fold((unsigned char)s[i + 2]);
+    /* Three independent loads the compiler can issue together, against three
+     * shifts that each depend on the last. */
+    return ((uint32_t)tri_fold_tab[(unsigned char)s[i]] << 16) |
+           ((uint32_t)tri_fold_tab[(unsigned char)s[i + 1]] << 8) |
+            (uint32_t)tri_fold_tab[(unsigned char)s[i + 2]];
 }
 
 /* Fibonacci hashing on the *high* bits. The low bits of `key * C mod 2^32` depend
@@ -164,22 +203,31 @@ static int tri_post(tri_index_t *ti, uint32_t slot, eid_t id)
 
 /* ------------------------------------------------------------------ build */
 
-int tri_index_add(tri_index_t *ti, const char *name, eid_t id)
+/* The distinct trigrams of one name, folded, in first-occurrence order. Shared by
+ * the two build passes so both see exactly the same keys -- a pass that disagreed
+ * about a duplicate would size a list wrong and then overflow it. Returns the
+ * count, which is 0 for a name shorter than a trigram. */
+static uint32_t tri_keys_of(const char *name, uint32_t *keys)
 {
-    uint32_t seen[TRI_SEEN_MAX];
-    uint32_t nseen = 0;
     size_t len = strlen(name);
-    if (len < 3) return 0;              /* no trigram, ref A9 */
-
+    if (len < 3) return 0;               /* no trigram, ref A9 */
+    uint32_t n = 0;
     for (size_t i = 0; i + 3 <= len; i++) {
         uint32_t k = tri_key(name, i);
-        if (nseen < TRI_SEEN_MAX) {
-            uint32_t j = 0;
-            while (j < nseen && seen[j] != k) j++;
-            if (j < nseen) continue;   /* this name already contributed k */
-            seen[nseen++] = k;
-        }
-        int slot = tri_intern(ti, k);
+        uint32_t j = 0;
+        while (j < n && keys[j] != k) j++;
+        if (j < n) continue;             /* this name already contributed k */
+        keys[n++] = k;
+    }
+    return n;
+}
+
+int tri_index_add(tri_index_t *ti, const char *name, eid_t id)
+{
+    uint32_t keys[TRI_MAX_KEYS];
+    uint32_t n = tri_keys_of(name, keys);
+    for (uint32_t i = 0; i < n; i++) {
+        int slot = tri_intern(ti, keys[i]);
         if (slot < 0) return -1;
         if (tri_post(ti, (uint32_t)slot, id) != 0) return -1;
     }
@@ -192,20 +240,78 @@ int tri_index_build(tri_index_t *ti, const esidx_t *db)
     if (db->et.count == 0) return 0;
 
     uint32_t n = db->et.count;
+    uint32_t *keys = malloc(TRI_MAX_KEYS * sizeof(uint32_t));
+    if (!keys) return -1;
+
+    /* Two passes, and the reason is 131 MiB on /work.
+     *
+     * Posting as we go means every list grows by doubling, so the index ends up
+     * resident at its high-water capacity: 450.4 MiB touched against 318.6 MiB of
+     * ids, 71 % of the list capacity in use. The slack is not a constant factor
+     * that a different growth policy would remove either -- it is whatever each
+     * list's length happened to be modulo its power of two.
+     *
+     * So: count first, allocate exactly, then fill. The counting pass interns the
+     * same keys into the same slots, so pass two can reuse the slot table without
+     * a lookup of its own; only the append is left, and it never has to grow.
+     * ext_index_build() does this in the same function family, for the same
+     * reason, with the comment "sized exactly" already written there. */
+    uint32_t *cnt = NULL;
+    uint32_t cnt_n = 0;                  /* allocated slots, always == cap_slots */
+    for (uint32_t i = 0; i < n; i++) {
+        if (db->et.flags[i] & EF_DEAD) continue;
+        uint32_t nk = tri_keys_of(display_name_of(db, i), keys);
+        for (uint32_t k = 0; k < nk; k++) {
+            int slot = tri_intern(ti, keys[k]);
+            if (slot < 0) { free(keys); free(cnt); tri_index_free(ti); return -1; }
+            /* Grown here rather than sized once up front: the counting pass is what
+             * interns the keys, so `cap_slots` keeps doubling underneath it and a
+             * count array sized before the loop is a heap overflow on any tree with
+             * more distinct trigrams than the first name contributes. */
+            if ((uint32_t)slot >= cnt_n) {
+                uint32_t *nc = realloc(cnt, (size_t)ti->cap_slots * sizeof(uint32_t));
+                if (!nc) { free(keys); free(cnt); tri_index_free(ti); return -1; }
+                memset(nc + cnt_n, 0, (size_t)(ti->cap_slots - cnt_n) * sizeof(uint32_t));
+                cnt = nc;
+                cnt_n = ti->cap_slots;
+            }
+            cnt[slot]++;
+        }
+    }
+
+    if (cnt) {
+        for (uint32_t s = 0; s < ti->n_slots; s++) {
+            tri_list_t *l = &ti->list[s];
+            uint32_t want = cnt[s] ? cnt[s] : 1;
+            l->ids = malloc((size_t)want * sizeof(eid_t));
+            if (!l->ids) { free(keys); free(cnt); tri_index_free(ti); return -1; }
+            l->cap = want;
+            l->n = 0;
+        }
+    }
+    free(cnt);
+
     for (uint32_t i = 0; i < n; i++) {
         if (db->et.flags[i] & EF_DEAD) continue;
         /* display_name_of(), not name_of(): the root's stored name is the absolute
          * path it was indexed from, and the matcher reads the display name
          * (design §12.12). Indexing the stored name would put trigrams in the
          * index that no query ever asks for. */
-        if (tri_index_add(ti, display_name_of(db, i), i) != 0) {
-            LOGE("cannot build the name trigram index at entry %u", i);
-            tri_index_free(ti);
-            return -1;
+        uint32_t nk = tri_keys_of(display_name_of(db, i), keys);
+        for (uint32_t k = 0; k < nk; k++) {
+            /* The slot is where pass one put it, and tri_post() does not have to
+             * grow anything: cap is already the exact count. */
+            int slot = tri_find(ti, keys[k]);
+            if (slot < 0 || tri_post(ti, (uint32_t)slot, i) != 0) {
+                LOGE("cannot build the name trigram index at entry %u", i);
+                tri_index_free(ti);
+                return -1;
+            }
         }
     }
     LOGD("name trigrams: %u distinct over %u live names, %u postings",
          ti->n_slots, n, ti->n_postings);
+    free(keys);
     return 0;
 }
 
