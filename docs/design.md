@@ -595,6 +595,18 @@ with `./round.sh /usr`):
 | `/etc` | 1 622 | 5.4 ms (298 k/s) | 0.4 ms | 0.3 ms | 95 KB |
 | `/usr` | 116 888 | 4.23 s (27.6 k/s) | 37-56 ms | 55 ms | 6.9 MB |
 
+**Also measured on real hardware** (the `r7000` host: Ubuntu 22.04, x86_64, ext4
+on NVMe, 16 cores, gcc 11.4; the same `./round.sh /usr`). This is the check that
+WSL2 was not standing in for the machine: `/usr` there is a full desktop install,
+**372 084 entries** against WSL2's 116 888, and it scans at **268 k entries/s**
+against 27.6 k/s — **~10x** — so WSL2 timings understate throughput and are not
+the baseline to tune against. The tree is bigger, so the absolute query times are
+too: `ext:conf` 1.1 ms over 1 206 hits, `image:` 52.5 ms (**51.2 ms sort** over
+55 229 rows), `path:/usr *.conf size:>1k` 57.7 ms (**56.1 ms eval** over 233 021
+candidates), a `parent:` browse 0.40 ms. The two costs §5.2 and §6.2 name are the
+same two the real machine shows, in the same proportion — so the P4 conclusion
+does not change, only the confidence that it is about the machine and not WSL2.
+
 **Incremental refresh**, same machine, same build, `-O2`, single thread. "Worst
 case" is every writable directory under `/usr` touched, so every stamp moved:
 

@@ -98,6 +98,10 @@ printf 'x%.0s' $(seq 1 500)  >"$TREE/b.conf"
 printf 'x%.0s' $(seq 1 5000) >"$TREE/c.conf"
 : >"$TREE/d.log"
 printf 'y%.0s' $(seq 1 200)  >"$TREE/alpha/one.conf"
+# Pin the mode: the LIST assertion below checks the mode string, and the ambient
+# umask is not ours to assume -- a user with umask 002 (the Ubuntu default) would
+# create -rw-rw-r-- and the test would fail on a correct server.
+chmod 644 "$TREE/alpha/one.conf"
 printf 'z%.0s' $(seq 1 100)  >"$TREE/beta/two.txt"
 printf 'q'                   >"$TREE/gamma/inner/three.txt"
 : >"$TREE/gamma/.dotfile"

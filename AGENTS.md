@@ -215,8 +215,8 @@ refactor.
 
 ## 2. Environment
 
-Development host is Windows; the project builds and runs in WSL2. There is no
-Linux-native setup and none is needed.
+Development host is Windows; day-to-day work builds and runs in WSL2. WSL2 is not
+the target, and its timings are not the machine's — see §2.4.
 
 ```sh
 # from PowerShell
@@ -225,6 +225,19 @@ wsl -u root -e bash -lc "cd /mnt/c/$PWD && make && ./test.sh"
 
 `-u root` is required: `/root` is mode 700 in this image, and the trees the
 upstream survey cites live under it.
+
+### 2.4 WSL2 is not the baseline
+
+WSL2's virtual disk and CPU understate the target. Measured with `./round.sh /usr`
+(the reference run), WSL2 scans at 27.6 k entries/s against **268 k/s** on real
+ext4 NVMe — the `r7000` host, Ubuntu 22.04 x86_64, reachable as the `ssh` alias
+`r7000`. Anything quoted as a *baseline* — the tables in design §10, a "before" in
+a commit — must be re-run there before it is believed. The suites run unchanged on
+it; `make install` puts the binary in `$(PREFIX)/bin` (default `/usr/local`; use
+`PREFIX=$HOME/.local` to install without root). One environment trap on that box:
+its user `umask` is **002**, so files the fixtures create are group-writable —
+anything asserting a mode string must pin it (`test_etp.sh` `chmod 644`s its
+LIST fixture for exactly this reason).
 
 ### 2.1 Compile-check without linking
 
