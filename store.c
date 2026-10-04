@@ -234,20 +234,102 @@ static void et_trim(entry_table_t *et)
 /* from the dir-tree section below */
 int di_add_child(esidx_t *db, eid_t dir, eid_t child);
 
+/* --------------------------------------------------------- extension interning
+ *
+ * Two counters, because "the scan was O(n) and the hash is O(1)" is a claim about a
+ * loop and not a measurement: how many times an extension name was looked up, and how
+ * many string compares that took. They are what makes the before and the after
+ * checkable, and the before was an estimate ("~13 G strcmp calls") that nothing could
+ * confirm -- which is how it stayed in a comment through three commits, and how a number
+ * 6x larger than the truth came to be the one everybody read.
+ *
+ * Per-process, not per-db, for the same reason g_ext_truncated is: one index at a time
+ * in this process, and a server's number is the interesting one. */
+static uint64_t g_ext_calls;      /* ext_intern() calls */
+static uint64_t g_ext_compares;   /* strcmp calls made while probing */
+
+/* The table starts here and doubles. 256 is not a tuned number: it is the smallest
+ * power of two that keeps the 3/4-load growth threshold out of the way for a tree with
+ * a few dozen extensions, and the growth threshold is what decides the rest. */
+#define EXT_TAB_MIN 256
+
+/* Allocate the table if it is not there yet. The only two callers are ext_intern() and
+ * the load path, and both want the same invariant: a non-NULL table with a mask. */
+static int ext_tab_ensure(esidx_t *db)
+{
+    if (db->ext_tab) return 0;
+    db->ext_tab = calloc(EXT_TAB_MIN, sizeof(uint32_t));
+    if (!db->ext_tab) { LOGE("ext: cannot allocate the intern table"); return -1; }
+    db->ext_tab_mask = EXT_TAB_MIN - 1;
+    return 0;
+}
+
+/* (Re)build the table at `ncap` slots from the ids in ext_off. Shared by the growth
+ * path and the load path, so "the table holds every interned extension" is written
+ * once. Each name is hashed again from the pool rather than carried in the slot,
+ * because a slot holds an id and the id holds the offset -- there is no hash to keep. */
+static int ext_tab_fill(esidx_t *db, uint32_t ncap)
+{
+    uint32_t *nt = calloc(ncap, sizeof(uint32_t));
+    if (!nt) {
+        LOGE("ext: cannot allocate the intern table (%u slots)", ncap);
+        return -1;      /* the old table stays: a lookup degrades, it does not lie */
+    }
+    uint32_t mask = ncap - 1;
+    for (uint32_t i = 0; i < db->n_ext; i++) {
+        uint32_t h = hash_bytes(sp_get(&db->exts, db->ext_off[i])) & mask;
+        while (nt[h]) h = (h + 1) & mask;
+        /* i + 2, not i + 1. A slot holds ext_id + 1 and ext_id is 1-based, so the
+         * first id lands in a slot as 2 -- and writing i + 1 here makes every lookup
+         * resolve one id low, which is a wrong extension's rows rather than an
+         * error. It is the same convention as the dir hash, the eid -> ordinal map
+         * and the name rank, and the first version of this line was the fourth
+         * place it had to be written down. */
+        nt[h] = i + 2;
+    }
+    free(db->ext_tab);
+    db->ext_tab = nt;
+    db->ext_tab_mask = mask;
+    return 0;
+}
+
+static int ext_tab_grow(esidx_t *db)
+{
+    return ext_tab_fill(db, (db->ext_tab_mask + 1) * 2);
+}
+
 /* The id of an extension name: dense, 1-based, 0 meaning "none". The name goes into the
- * pool and its *offset* goes into ext_off, so the id cannot outgrow 16 bits the way a
+ * pool and its id goes into ext_off, so the id cannot outgrow 16 bits the way a
  * pool offset did -- see esidx_t for what that cost.
  *
- * The scan is linear over the interned names. That is the same complexity the pool scan
- * it replaced had, so it is not a regression, but on /work it is not free either: 4 217 609
- * calls over 6 508 names is ~13 G strcmp calls, which is a real share of a 100 s build.
- * A hash table on the name would make it O(1); it is not in this commit because the
- * addressing bug it shares a function with had to be fixed on its own. */
+ * The lookup is a hash of the name rather than a scan of every name interned so far.
+ * The scan was the same complexity the pool scan it replaced had, so it was not a
+ * regression -- it was just never cheap, and the cost grew with the number of
+ * extensions rather than with the number of files. */
 uint16_t ext_intern(esidx_t *db, const char *name)
 {
-    for (uint32_t i = 0; i < db->n_ext; i++)
-        if (strcmp(sp_get(&db->exts, db->ext_off[i]), name) == 0)
-            return (uint16_t)(i + 1);
+    g_ext_calls++;
+    if (ext_tab_ensure(db) != 0) return 0;
+
+    /* Grow before the probe, not after the insert: the mask the probe has to use is the
+     * one the insert will land in, and a rehash then only walks ids that already exist.
+     * 3/4 load, so the table cannot fill before the next doubling. */
+    if ((db->n_ext + 1) * 4 > (db->ext_tab_mask + 1) * 3 && ext_tab_grow(db) != 0)
+        return 0;
+
+    uint32_t h = hash_bytes(name) & db->ext_tab_mask;
+    while (db->ext_tab[h]) {
+        uint16_t id = (uint16_t)(db->ext_tab[h] - 1);   /* the ext id, 1-based */
+        g_ext_compares++;
+        /* ext_off[id - 1], not ext_off[id]: the slot holds id + 1 and ext_off is
+         * indexed from 0. It is the same arithmetic ext_str() does, and the first
+         * version of this line indexed from 1 -- which never matched, so every lookup
+         * of an extension that was already interned appended a second copy of it and
+         * handed the row a second id. 1 181 distinct extensions over 1 200 files on a
+         * fixture with 400 of them, and `ext:e1` matching nothing. */
+        if (strcmp(sp_get(&db->exts, db->ext_off[id - 1]), name) == 0) return id;
+        h = (h + 1) & db->ext_tab_mask;
+    }
 
     if (db->n_ext == UINT16_MAX - 1) {      /* 0 and the wrap guard are both reserved */
         LOGE("ext: more than %u distinct extensions; ids are 16-bit", UINT16_MAX - 1);
@@ -262,9 +344,11 @@ uint16_t ext_intern(esidx_t *db, const char *name)
         db->ext_off = no;
         db->ext_off_cap = ncap;
     }
+    uint16_t id = (uint16_t)(db->n_ext + 1);
     db->ext_off[db->n_ext] = noff;
+    db->ext_tab[h] = (uint32_t)id + 1;
     db->n_ext++;
-    return (uint16_t)db->n_ext;
+    return id;
 }
 
 /* The name behind an id, or "" for 0 and for anything out of range -- an id that does not
@@ -1460,6 +1544,7 @@ void esidx_init(esidx_t *db)
 void esidx_free(esidx_t *db)
 {
     free(db->names.buf); free(db->exts.buf); free(db->dpaths.buf); free(db->ext_off);
+    free(db->ext_tab);
     free(db->et.parent); free(db->et.depth); free(db->et.flags);
     free(db->et.size); free(db->et.mtime); free(db->et.ctime); free(db->et.stamp);
     free(db->et.ext_id); free(db->et.name); free(db->et.nchild);
@@ -1656,6 +1741,11 @@ void esidx_log_stats(const esidx_t *db, const char *phase)
     uint64_t cols = (uint64_t)et->cap * (sizeof(eid_t) + 1 + 2 + 8 * 4 + 2 + sizeof(strref_t));
     LOGI("%s: entries=%u names_pool=%zu bytes ext_pool=%zu bytes columns~%llu bytes",
          phase, et->count, db->names.len, db->exts.len, (unsigned long long)cols);
+    LOGI("%s: ext intern: %llu calls, %llu name compares (%.2f per call), "
+         "%u distinct, table %u slots",
+         phase, (unsigned long long)g_ext_calls, (unsigned long long)g_ext_compares,
+         g_ext_calls ? (double)g_ext_compares / (double)g_ext_calls : 0.0,
+         db->n_ext, db->ext_tab_mask + 1);
     if (db->built) {
         uint32_t live = bs_count(&db->live);
         LOGI("%s: live=%u tombstones=%u (%.1f%%) epoch=%llu",
@@ -2016,6 +2106,13 @@ int esidx_load(esidx_t *db, const char *path)
     }
     db->n_ext = next;
     db->ext_off_cap = next;
+
+    /* The intern table for those ids, filled from the ids themselves -- there is no
+     * other source for it, and it is not persisted (D4). Sized from the count, so the
+     * rehashes the build paid on the way up are not paid again on the way in. */
+    uint32_t ncap = EXT_TAB_MIN;
+    while (ncap * 3 < db->n_ext * 4) ncap *= 2;
+    if (ext_tab_fill(db, ncap) != 0) return -1;
 
     TSDONE2("load: read snapshot", t0, "(%u entries)", et->count);
 

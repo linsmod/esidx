@@ -66,7 +66,7 @@ Suites and harnesses, all runnable from a clean checkout:
 ```sh
 make check             # the gate: both suites x both builds, ~30 s
 
-./test.sh              # index and query correctness   (238 assertions)
+./test.sh              # index and query correctness   (273 assertions)
 ./test_etp.sh          # protocol acceptance           (213 assertions)
 make test-all          # both, in that order, optimised build only
 ESIDX_BUILD=dbg ./test.sh        # the sanitiser build
@@ -75,13 +75,14 @@ ESIDX_BUILD=dbg ./test.sh        # the sanitiser build
 ./round.sh /usr        # ...on a bigger one
 
 ./cmp_ref.sh           # re-measure every value quoted against the :21 server
+./ledger.sh /work      # the memory ledger + phase timings + the query shapes
 ./sortcmp.sh -n 3 base=/path/to/old/esidx mine=./esidx -t /usr
                       # per-sort-key cost for several builds at once
 ```
 
 - **`test.sh`** pins the *index*, with the expected numbers taken from `find(1)`
   rather than hand-written, so it detects regressions in the index rather than in
-  the test. It also carries a 106-assertion *language* suite against a flat
+  the test. It also carries a language suite against a flat
   fixture, because a syntax regression and an index regression look identical from
   the outside.
   `./test.sh -v` echoes every query; `TEST_ROOT=/usr ./test.sh` indexes a bigger
@@ -100,6 +101,11 @@ ESIDX_BUILD=dbg ./test.sh        # the sanitiser build
   key for as many builds as you hand it on one tree. Both exist because the
   alternative is a number produced by a throwaway script — which is exactly how the
   sort numbers in design §10 were first produced.
+- **`ledger.sh`** is the same idea for memory: one command that builds a tree at
+  `-v 3` and prints the per-structure ledger, the snapshot size and the query
+  shapes, so every "MiB touched" figure below has a command that reproduces it. It
+  found its own reason to exist the moment a `/work` number was quoted from a
+  script in `/tmp` that the next reader could not re-run.
 
 `make check` runs both suites against both builds, and the sanitiser build is part
 of the gate rather than an extra step: it is the only thing that catches a
@@ -283,7 +289,9 @@ building); the only lever left on that walk is D6's concurrency.
 
 `esidx -v 3 build <tree>` prints a per-structure ledger — allocated against used, one line
 each — and it is the only way to tell a structure that is too big from one that is merely
-sized by the wrong number. On `/work` (1 223 MiB peak, 1 092 MiB accounted):
+sized by the wrong number. `./ledger.sh <tree>` prints it together with the snapshot size
+and the query shapes, so a figure quoted from it can be re-measured with one command. On
+`/work` (1 223 MiB peak, 1 092 MiB accounted):
 
 | | touched | address | |
 |---|---|---|---|
@@ -300,7 +308,9 @@ sized by the wrong number. On `/work` (1 223 MiB peak, 1 092 MiB accounted):
 
 What is left, largest first: the names pool holds 3.65 copies of every name, the three
 sorted arrays spend 62.7 MiB on `sidx_ent_t` padding, and the children vectors are at 53 %
-occupancy.
+occupancy. The extension pool's own lookup was a scan of every extension interned so far
+until this release: 519 string compares per intern on `/work`, 2.19 G of them per build,
+now 1.16 per intern — 5.8 s of user time on a build that is otherwise I/O-bound.
 
 Query cost on `/usr`:
 
@@ -392,6 +402,7 @@ test.sh        index and language suite
 test_etp.sh    protocol acceptance suite
 round.sh       one full round, with timings
 cmp_ref.sh     re-measures every number quoted against the reference server
+ledger.sh      the memory ledger, the snapshot size and the query shapes
 sortcmp.sh     per-sort-key cost for several builds at once (design §10)
 ```
 

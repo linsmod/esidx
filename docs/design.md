@@ -192,6 +192,36 @@ chain, the way FSearch does. For *display* that is acceptable and saves the
 storage. For `path:` queries at scale it becomes the bottleneck and the path
 column will have to be materialised — see §2 L2.
 
+**Extension names are interned through a hash, not found by a scan.** The numbering is
+a position in interning order, which is a position in the append-only pool, so a lookup
+only has to answer "have I seen this name before" — and until now it answered that by
+`strcmp`-ing every name interned so far. The cost therefore grew with the number of
+*distinct extensions* rather than with the number of files, which is the wrong axis for
+a scan that runs once per file. Measured on `/work` (`r7000`, `-O2`, the run
+`./ledger.sh /work` prints): **4 217 609 interning calls, 2 189 959 017 string
+compares — 519 per call — and now 4 895 892, 1.16 per call.** The estimate this
+replaces said "~13 G strcmp"; the measurement is 2.19 G, so the number that had been
+carried in a comment for three commits was 6x out, in the direction that made the fix
+look more urgent than it was. `esidx_log_stats()` prints both counters, because a claim
+about a loop should be re-measurable rather than remembered.
+
+Two off-by-ones live in that function and both were written here first, which is why
+the counters are in the log rather than only in this paragraph:
+
+- the slot holds `ext_id + 1` and `ext_id` is 1-based, so the rehash writes `i + 2` for
+  the `i`-th offset. Writing `i + 1` makes every lookup resolve one id low, which is
+  *another extension's rows*, not an error.
+- the lookup reads `ext_off[id - 1]`, because the slot is `id + 1` and the array is
+  indexed from 0. Reading `ext_off[id]` never matches, so every lookup of a name that
+  was already interned appended a second copy of it and gave the rows a second id:
+  1 181 distinct extensions over 1 200 files on a fixture with 400 of them, and
+  `ext:e1` matching nothing at all.
+
+The table is derived and not persisted (D4): a load refills it from `ext_off`, which is
+already the numbering, sized from the extension count so the rehashes the build paid on
+the way up are not paid again on the way in. `ext:`'s id list is a separate matter and
+has its own entry in §10.
+
 **Extension names are addressed by a dense id, not by their offset.** They were
 addressed by offset, as a `uint16_t`, and a pool past 64 KB wrapped one extension's
 offset onto another's: two extensions shared an id, so `ext:` answered with rows
@@ -678,6 +708,7 @@ Each row: source → what was taken → how it lands here → why it changed.
 |---|---|---|---|
 | 4.1 | Columnar table, name pool, ext pool | `store.c` | done, 9 columns (`by_ctime` added for `dc:`); aggregates and `frn` still outstanding |
 | 4.2 | `path_of()` parent-chain rebuild | `store.c` | done; path materialisation pending §4.2 |
+| 4.2 | extension-name interning | `store.c` | **done** — an open-addressed table over the name, so `ext_intern()` is O(1) instead of a scan of every name interned so far: 519 string compares per call down to 1.16 on /work, which is 5.8 s of user time on a build that is otherwise I/O-bound. Derived, so no snapshot mentions it (§4.2 for the two off-by-ones it took to get right) |
 | 5.1 | `dir_id → children`, `path → eid` hash | `store.c` | done |
 | 5.2 | trigram index, sorted/reversed name arrays | `trigram.c` | **name half done** — `trigram.c`, byte trigrams over the display name, 33 727 keys / 4.83 M postings at 3.7 × 10⁵ entries; §5.2.1 for what was deliberately left out and why. **Path half and the sorted/reversed name arrays not started** |
 | 5.3 | sorted array + delta buffer | `store.c` | **done** — `sidx_update`/`sidx_erase` write the delta, D3's 1%/60 s merge is implemented, and the range read honours the retractions |
@@ -1179,9 +1210,12 @@ Six things it says that no document recorded, and what has been done about each:
   children**, which on /work is 630 472 of 651 897: a childless directory needs no vector, and
   not giving it one costs nothing.
 - **The names pool holds 3.65 copies of every name** — 1 499 994 distinct basenames against
-  5 476 485 entries, and `sp_intern()` only appends despite the name. Interning is a hash
-  table, which is also what `ext_intern()`'s linear scan over the interned names wants; that
-  scan is 4 217 609 calls over 6 765 names on /work and is a real share of the walk.
+  5 476 485 entries, and `sp_intern()` only appends despite the name. This one is not a
+  ledger row but a waste of the same kind, and it is the largest item still open: the pool
+  is 96.0 MiB where the distinct names need about 26. Interning it means a hash table over
+  the entry names, which is the same structure the extension pool has just been given
+  (§4.2) — that one turned out to be worth **5.8 s of user time on a /work build**, so the
+  same shape on the names pool is a memory win and a per-entry cost at the same time.
 
 `sidx_ent_t`'s 62.7 MiB of padding and the 56.6 MiB of directory paths copied into the pool are
 in the same category and equally unfixed; the paths are derived data (D4) and should not be in

@@ -1194,6 +1194,56 @@ DB="$TREE_DB"
 q "ext:conf"
 expect "the original fixture is untouched by the incremental work" "$(n "$LAST")" "3"
 
+# -------------------------------------------------------- extension interning
+#
+# `ext:` resolves an extension to an id, and the id is what the column stores, so the
+# two things that can go wrong are an id that resolves to the *wrong string* and an id
+# that two strings share. Both are invisible to a row count whenever the two strings
+# happen to carry the same number of rows -- which is most of them -- so the assertions
+# below check the names that come back, not only how many.
+#
+# 400 distinct extensions is the fixture's whole job: the intern table starts at 256
+# slots and grows at 3/4 load, so 192 extensions force one rehash and 384 force a
+# second. A rehash that drops or double-counts a key is invisible below 192.
+#
+# Every query here reads the *snapshot*, so the ids are the ones a server would use --
+# which is the state the last storage bug lived in (see the reload assertions above).
+
+say "extension interning"
+
+EXTF="$TMP/extf"
+mkdir -p "$EXTF"
+# extension eN is carried by 1 + (N mod 5) files, so a pair of extensions almost never
+# agrees on its row count and a swapped id shows up even where the count is checked
+for i in $(seq 1 400); do
+    for j in $(seq 1 $((1 + i % 5))); do : >"$EXTF/e${i}_${j}.e$i"; done
+done
+
+EXT_DB="$TMP/extf.idx"
+build "$EXTF" "$EXT_DB" >/dev/null
+DB="$EXT_DB"
+
+# Every file is a row, and every file carries an extension the index can name. An id of
+# 0 means "no extension", and a file whose interning fell into that hole would be in no
+# extension's set at all -- which the per-extension counts below cannot see, because
+# they only look at ids that resolve.
+q "!folder:"
+expect "every file is a row" "$(n "$LAST")" "$(find "$EXTF" -type f | wc -l)"
+
+# the sample spans both growth boundaries and both ends of the id space
+for i in 1 2 3 4 5 191 192 193 383 384 385 399 400; do
+    q "ext:e$i"
+    want=$((1 + i % 5))
+    expect "ext:e$i carries $want file(s)" "$(n "$LAST")" "$want"
+    # the stronger half: whatever came back must be *this* extension's rows. Two
+    # extensions with the same row count are the case a count cannot see.
+    strays=$(printf '%s\n' "$LAST" | grep -vc "\.e$i\$")
+    expect "ext:e$i resolves to no other extension's rows" "$strays" "0"
+done
+
+q "ext:e999"
+expect "an extension nothing carries matches nothing" "$(n "$LAST")" "0"
+
 # --------------------------------------------------------------- logging
 
 say "instrumentation"
