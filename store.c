@@ -487,10 +487,20 @@ eid_t di_lookup_name(const esidx_t *db, eid_t dir, const char *name)
     return EID_NONE;
 }
 
-/* HT_TOMB marks a slot whose directory is gone. It cannot be 0 (an empty slot)
- * because a linear probe has to walk *through* a removed entry to reach the
- * entries behind it -- treating it as empty would make every lookup for a
- * directory that hashed after the removed one miss. */
+/* A slot holds its key's offset into `dpaths` **plus one**, because 0 means
+ * "empty" and offset 0 is a legal offset. It did not have to be plus one while
+ * the keys lived in the *names* pool: that pool already held every entry's name,
+ * so a directory path could never land on offset 0 and the sentinel was safe by
+ * accident. Giving the derived keys their own pool -- which is what stopped the
+ * snapshot growing on every refresh -- made the first interned path offset 0,
+ * which is the indexed root's, and `parent:` on the root stopped resolving while
+ * every subdirectory kept working. The other three open-addressed tables in this
+ * codebase already store value+1 for exactly this reason (ext_index.tab,
+ * tri_index.tab, rk_tab).
+ *
+ * HT_TOMB marks a slot whose directory is gone. It cannot be 0 for the same
+ * reason, and it cannot be treated as empty: a linear probe has to walk *through*
+ * a removed entry to reach the entries behind it. */
 #define HT_TOMB 0xFFFFFFFFu
 
 eid_t di_lookup(const esidx_t *db, const char *path)
@@ -500,7 +510,7 @@ eid_t di_lookup(const esidx_t *db, const char *path)
     uint32_t i = hash_str(path) & di->ht_mask;
     while (di->ht_off[i] != 0) {
         if (di->ht_off[i] != HT_TOMB &&
-            strcmp(sp_get(&db->names, di->ht_off[i]), path) == 0)
+            strcmp(sp_get(&db->dpaths, di->ht_off[i] - 1), path) == 0)
             return di->ht_val[i];
         i = (i + 1) & di->ht_mask;
     }
@@ -523,14 +533,16 @@ int di_hash_insert(esidx_t *db, eid_t dir)
 
     char buf[65536];
     path_of(db, dir, buf, sizeof(buf));
-    uint32_t off = sp_intern(&db->names, buf, strlen(buf));
 
-    uint32_t i = hash_str(sp_get(&db->names, off)) & di->ht_mask;
+    /* Hashed off `buf` rather than off an interned copy of it: a directory whose
+     * path is already in the table returns below, and interning first would
+     * strand those bytes in the pool. */
+    uint32_t i = hash_str(buf) & di->ht_mask;
     uint32_t reuse = UINT32_MAX;
     while (di->ht_off[i] != 0) {
         if (di->ht_off[i] == HT_TOMB) {
             if (reuse == UINT32_MAX) reuse = i;
-        } else if (strcmp(sp_get(&db->names, di->ht_off[i]), buf) == 0) {
+        } else if (strcmp(sp_get(&db->dpaths, di->ht_off[i] - 1), buf) == 0) {
             di->ht_val[i] = dir;      /* same path, new id */
             return 0;
         }
@@ -538,7 +550,7 @@ int di_hash_insert(esidx_t *db, eid_t dir)
     }
     if (reuse != UINT32_MAX) i = reuse;
     else di->ht_count++;
-    di->ht_off[i] = off;
+    di->ht_off[i] = sp_intern(&db->dpaths, buf, strlen(buf)) + 1;
     di->ht_val[i] = dir;
     return 0;
 }
@@ -557,7 +569,7 @@ int di_hash_erase(esidx_t *db, eid_t dir)
     while (di->ht_off[i] != 0) {
         if (di->ht_off[i] != HT_TOMB &&
             di->ht_val[i] == dir &&
-            strcmp(sp_get(&db->names, di->ht_off[i]), buf) == 0) {
+            strcmp(sp_get(&db->dpaths, di->ht_off[i] - 1), buf) == 0) {
             di->ht_off[i] = HT_TOMB;
             di->ht_count--;
             return 0;
@@ -1278,7 +1290,7 @@ void esidx_init(esidx_t *db)
 
 void esidx_free(esidx_t *db)
 {
-    free(db->names.buf); free(db->exts.buf); free(db->ext_off);
+    free(db->names.buf); free(db->exts.buf); free(db->dpaths.buf); free(db->ext_off);
     free(db->et.parent); free(db->et.depth); free(db->et.flags);
     free(db->et.size); free(db->et.mtime); free(db->et.ctime); free(db->et.stamp);
     free(db->et.ext_id); free(db->et.name);
@@ -1330,12 +1342,11 @@ static void di_hash_build(esidx_t *db)
     for (uint32_t i = 0; i < db->et.count; i++) {
         if (!(db->et.flags[i] & EF_DIR) || (db->et.flags[i] & EF_DEAD)) continue;
         path_of(db, i, buf, 65536);
-        uint32_t off = sp_intern(&db->names, buf, strlen(buf));
-        uint32_t h = hash_str(sp_get(&db->names, off)) & db->di.ht_mask;
+        uint32_t h = hash_str(buf) & db->di.ht_mask;
         uint32_t probe = 0;
         while (db->di.ht_off[h] != 0) { h = (h + 1) & db->di.ht_mask; probe++; }
         if (probe > max_probe) max_probe = probe;
-        db->di.ht_off[h] = off;
+        db->di.ht_off[h] = sp_intern(&db->dpaths, buf, strlen(buf)) + 1;
         db->di.ht_val[h] = i;
         db->di.ht_count++;
     }
@@ -1593,7 +1604,7 @@ void esidx_log_mem(const esidx_t *db, const char *phase)
         uint64_t stored = 0;
         for (uint64_t s = 0; s < slots; s++)
             if (db->di.ht_off[s] && db->di.ht_off[s] != HT_TOMB)
-                stored += strlen(sp_get(&db->names, db->di.ht_off[s])) + 1;
+                stored += strlen(sp_get(&db->dpaths, db->di.ht_off[s] - 1)) + 1;
         /* calloc: only the occupied slots are ever written, so the rest is address
          * space and not memory -- until something runs under a ulimit -v. */
         mem_row(phase, "dir path hash table", (uint64_t)db->di.ht_count * 8,

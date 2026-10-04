@@ -292,6 +292,17 @@ typedef struct {
 typedef struct {
     strpool_t     names;
     strpool_t     exts;
+    /* The dir hash's keys: one full path per directory, in interning order, and
+     * deliberately NOT in `names`. A hash slot has to hold something stable to
+     * compare a lookup against, and a path rebuilt from the parent chain is not
+     * stable -- but a pool offset into the persisted pool is *too* stable: loading
+     * a snapshot re-interned every path and an `esidx update` wrote them back, so
+     * the file grew by 92 bytes per pass on a 7-entry fixture and 56.6 MiB per
+     * pass on /work, without bound. This is derived data (D4 says derived indexes
+     * are rebuilt, not stored), so it gets a pool of its own that no snapshot
+     * mentions. Same 56.6 MiB resident -- a hash of the path instead of the path
+     * would cost a rebuild per lookup and this is not that commit. */
+    strpool_t     dpaths;
     /* An entry names its extension by *dense id*, not by a position in `exts`. It used
      * to be the byte offset, returned as uint16_t, and a pool past 64 KB wrapped one
      * extension's offset onto another's: two extensions shared an id and `ext:` answered

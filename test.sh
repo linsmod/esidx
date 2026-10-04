@@ -1123,6 +1123,19 @@ expect "and the same extension bitmap" "$(n "$LAST")" \
     "$(find "$INC" -type f -name '*.txt' | wc -l)"
 DB="$INC_DB"
 
+# 13b. the snapshot must not grow just because it was refreshed. di_hash_build()
+# interns every directory's whole path into the *names* pool to have a stable key
+# for the dir hash, and esidx_save() writes names.len -- so a load re-interns all
+# of them and an update writes them back. Measured: 92 bytes per pass on this
+# fixture, 56.6 MiB per pass on /work, unbounded. It is derived data (D4) in the
+# one pool the snapshot persists.
+s1=$(wc -c <"$INC_DB")
+u; u
+s2=$(wc -c <"$INC_DB")
+expect "two refreshes leave the snapshot the same size" "$s2" "$s1"
+
+DB="$INC_DB"
+
 # 14. an unbuilt index is not refreshable
 if "$BIN" update "$TMP/junk.idx" >/dev/null 2>&1; then
     bad "update rejects a non-snapshot"
