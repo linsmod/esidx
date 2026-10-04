@@ -208,13 +208,13 @@ typedef struct {
 
 /* ------------------------------------------------------------- enum bitmap */
 
-/* One bitmap per extension (design §5.4). Extensions are few and low
- * cardinality, so a dense set per interned ext is the whole index -- there is
- * no need for a compressed structure until the ext count explodes.
+/* One bitmap per extension (design §5.4) -- a structure §5.4 now records as measured to
+ * be the wrong one, with the replacement and the numbers that say so.
  *
- * ext_id is the byte offset of the extension inside the exts pool plus one, so
- * it is sparse and cannot index an array directly; `tab` maps ext_id to a
- * dense slot. */
+ * `tab` maps ext_id to a dense slot. ext_id used to be a byte offset, so it was sparse;
+ * it is dense now (see esidx_t), but the slot table stays rather than indexing by id
+ * directly because the slots are renumbered by ext_index_build() and a term can name up
+ * to 256 extensions at once, which is a set union either way. */
 typedef struct {
     uint32_t   n;        /* distinct extensions */
     uint32_t  *ids;      /* slot -> ext_id */
@@ -267,6 +267,21 @@ typedef struct {
 typedef struct {
     strpool_t     names;
     strpool_t     exts;
+    /* An entry names its extension by *dense id*, not by a position in `exts`. It used
+     * to be the byte offset, returned as uint16_t, and a pool past 64 KB wrapped one
+     * extension's offset onto another's: two extensions shared an id and `ext:` answered
+     * with rows carrying neither. Measured on /work (a 68 KB pool) as ~30 extensions, and
+     * on a 2 200-extension fixture as 152. The offset lives here instead, in 32 bits,
+     * where it cannot wrap; a dense id cannot realistically reach 65 535 distinct
+     * extensions, so the entry column stays 16 bits wide and the snapshot's ext column
+     * does not move -- only what an id *means* changed, hence ESIDX_VERSION 3.
+     *
+     * Rebuilt on load by walking `exts` in order, which is interning order, so the ids a
+     * snapshot's entries carry are reproduced exactly. Nothing derived from the ids is
+     * persisted (D4). */
+    uint32_t     *ext_off;     /* ext_id (1-based) -> byte offset into `exts` */
+    uint32_t      n_ext;       /* distinct extensions interned so far */
+    uint32_t      ext_off_cap;
     entry_table_t et;
     dir_index_t   di;
     sidx_t        by_size;
@@ -414,7 +429,10 @@ const char *name_of(const esidx_t *db, eid_t id);
 /* the name as the reference reports it: basename(name_of()). Differs for a
  * parentless entry, whose stored name is the path it was indexed from. store.c */
 const char *display_name_of(const esidx_t *db, eid_t id);
+/* The extension of an entry, or "" when it has none. Reads through the id table rather
+ * than the pool, because an id is dense and an offset is 32-bit (see esidx_t). */
 const char *ext_of_str(const esidx_t *db, eid_t id);
+const char *ext_str(const esidx_t *db, uint16_t ext_id);
 /* full path of the directory containing `id` -- dirname(path_of()), so it is defined
  * for the root too (the directory above it), and empty only when the path has no
  * separator in it at all */

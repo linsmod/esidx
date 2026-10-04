@@ -199,18 +199,46 @@ static int et_grow(entry_table_t *et, uint32_t ncap)
 /* from the dir-tree section below */
 int di_add_child(dir_index_t *di, eid_t dir, eid_t child);
 
+/* The id of an extension name: dense, 1-based, 0 meaning "none". The name goes into the
+ * pool and its *offset* goes into ext_off, so the id cannot outgrow 16 bits the way a
+ * pool offset did -- see esidx_t for what that cost.
+ *
+ * The scan is linear over the interned names. That is the same complexity the pool scan
+ * it replaced had, so it is not a regression, but on /work it is not free either: 4 217 609
+ * calls over 6 508 names is ~13 G strcmp calls, which is a real share of a 100 s build.
+ * A hash table on the name would make it O(1); it is not in this commit because the
+ * addressing bug it shares a function with had to be fixed on its own. */
 uint16_t ext_intern(esidx_t *db, const char *name)
 {
-    /* extensions are few; linear scan is fine */
-    const strpool_t *sp = &db->exts;
-    uint32_t off = 0;
-    while (off < sp->len) {
-        const char *s = sp->buf + off;
-        if (strcmp(s, name) == 0) return (uint16_t)(off + 1);
-        off += (uint32_t)strlen(s) + 1;
+    for (uint32_t i = 0; i < db->n_ext; i++)
+        if (strcmp(sp_get(&db->exts, db->ext_off[i]), name) == 0)
+            return (uint16_t)(i + 1);
+
+    if (db->n_ext == UINT16_MAX - 1) {      /* 0 and the wrap guard are both reserved */
+        LOGE("ext: more than %u distinct extensions; ids are 16-bit", UINT16_MAX - 1);
+        return 0;
     }
     uint32_t noff = sp_intern(&db->exts, name, strlen(name));
-    return (uint16_t)(noff + 1);   /* 0 reserved for "none" */
+    uint32_t cap = db->n_ext + 1;
+    if (cap > db->ext_off_cap) {
+        uint32_t ncap = db->ext_off_cap ? db->ext_off_cap * 2 : 256;
+        uint32_t *no = realloc(db->ext_off, (size_t)ncap * sizeof(uint32_t));
+        if (!no) { LOGE("ext: cannot grow the id table"); return 0; }
+        db->ext_off = no;
+        db->ext_off_cap = ncap;
+    }
+    db->ext_off[db->n_ext] = noff;
+    db->n_ext++;
+    return (uint16_t)db->n_ext;
+}
+
+/* The name behind an id, or "" for 0 and for anything out of range -- an id that does not
+ * resolve must not read past the table, because that is how the wrap it replaced turned
+ * into a wrong answer rather than a wrong count. */
+const char *ext_str(const esidx_t *db, uint16_t ext_id)
+{
+    if (!ext_id || ext_id > db->n_ext) return "";
+    return sp_get(&db->exts, db->ext_off[ext_id - 1]);
 }
 
 /* Extensions longer than EXT_MAX are cut to it, which loses the tail: two extensions
@@ -573,8 +601,7 @@ const char *display_name_of(const esidx_t *db, eid_t id)
 const char *ext_of_str(const esidx_t *db, eid_t id)
 {
     if (id >= db->et.count) return "";
-    uint16_t e = db->et.ext_id[id];
-    return e ? sp_get(&db->exts, e - 1) : "";
+    return ext_str(db, db->et.ext_id[id]);
 }
 
 uint32_t di_child_count(const esidx_t *db, eid_t dir)
@@ -1113,7 +1140,7 @@ void esidx_init(esidx_t *db)
 
 void esidx_free(esidx_t *db)
 {
-    free(db->names.buf); free(db->exts.buf);
+    free(db->names.buf); free(db->exts.buf); free(db->ext_off);
     free(db->et.parent); free(db->et.depth); free(db->et.flags);
     free(db->et.size); free(db->et.mtime); free(db->et.ctime); free(db->et.stamp);
     free(db->et.ext_id); free(db->et.name);
@@ -1296,8 +1323,14 @@ void esidx_log_stats(const esidx_t *db, const char *phase)
 /* v2 adds the directory `stamp` column, which the reconcile compares against the
  * filesystem (ref A2). A v1 snapshot has no stamps, so every update would treat
  * every directory as changed -- correct, but it silently degrades the feature to
- * a full rescan, which is not something a version check should let through. */
-#define ESIDX_VERSION 2
+ * a full rescan, which is not something a version check should let through.
+ *
+ * v3 changes what an ext_id *is*: a dense 1-based index into the extension names
+ * rather than a byte offset into their pool. The column is the same width and the
+ * same place in the file, so a v2 snapshot would load without complaint and then
+ * resolve extensions to the wrong strings -- the version check is the only thing
+ * standing between those two, which is exactly what it is for. */
+#define ESIDX_VERSION 3
 
 static int w64(FILE *f, uint64_t v) { return fwrite(&v, 8, 1, f) == 1 ? 0 : -1; }
 static int w32(FILE *f, uint32_t v) { return fwrite(&v, 4, 1, f) == 1 ? 0 : -1; }
@@ -1357,7 +1390,9 @@ int esidx_load(esidx_t *db, const char *path)
     if (r32(f, &ver) != 0) { fclose(f); return -1; }
     if (ver != ESIDX_VERSION) {
         LOGE("%s: snapshot version %u, this build writes %u -- rebuild it"
-             " (version 1 has no directory stamps, so every refresh would rescan)",
+             " (v1 has no directory stamps, so every refresh would rescan;"
+             " v2 numbers extensions by pool offset, which wraps past a 64 KB"
+             " pool and matches the wrong rows)",
              path, ver, ESIDX_VERSION);
         fclose(f);
         return -1;
@@ -1389,6 +1424,23 @@ int esidx_load(esidx_t *db, const char *path)
     for (uint32_t i = 0; i < et->count; i++) r32(f, &et->name[i].off);
     for (uint32_t i = 0; i < et->count; i++) r32(f, &et->name[i].len);
     fclose(f);
+
+    /* Number the extension names. Not persisted, because walking the pool in order *is*
+     * the numbering: a name's id is its position in the order it was interned, and the
+     * pool is append-only, so the ids the entries carry are reproduced exactly. A load
+     * therefore lands on the same ids the build did, which is what lets the ext column
+     * stay 16 bits wide in the snapshot. */
+    uint32_t next = 0;
+    for (uint32_t off = 0; off < db->exts.len; ) {
+        uint32_t len = (uint32_t)strlen(db->exts.buf + off) + 1;
+        uint32_t *no = realloc(db->ext_off, (size_t)(next + 1) * sizeof(uint32_t));
+        if (!no) { LOGE("load: cannot allocate the extension id table"); return -1; }
+        db->ext_off = no;
+        db->ext_off[next++] = off;
+        off += len;
+    }
+    db->n_ext = next;
+    db->ext_off_cap = next;
 
     TSDONE2("load: read snapshot", t0, "(%u entries)", et->count);
 

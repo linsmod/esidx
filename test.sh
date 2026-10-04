@@ -144,6 +144,52 @@ expect "ext: is case-insensitive"             "$(n "$LAST")" "3"
 q "ext:conf" "sort:size:desc"
 expect "ext:conf sorted by size desc"         "$(col2 "$LAST")" "5000 500 200 "
 
+# An extension id is a byte offset into the pool of extension names, and it is 16-bit.
+# A pool past 64 KB wraps those offsets onto *other* extensions, so `ext:` answers with
+# rows that do not carry the extension: on a 2 500-extension fixture, 904 of the 2 500
+# returned the wrong row count, in 452 aliased pairs, and ext:e...005 matched both
+# f5.e...005 and f1477.e...001477. Nothing above could see it -- the flat fixture has 3
+# extensions -- so the fixture here exists to overflow the pool: 2 200 x 32 bytes = 70 KB.
+#
+# Two assertions, because they answer different questions. The build's own invariant is
+# the mechanism (every string in the pool was interned by an entry, so the pool's string
+# count and the number of extensions in use must be equal); the sample is the answer.
+EXTD="$TMP/exts"
+mkdir -p "$EXTD"
+seq 1 2200 | awk '{printf "f%d.e%030d\n", $1, $1}' | ( cd "$EXTD" && xargs touch )
+EXT_DB="$TMP/exts.idx"
+build "$EXTD" "$EXT_DB" >/dev/null
+if grep -q 'ext pool holds' "$TMP/be"; then
+    bad "an extension pool past 64 KB does not alias ids" \
+        "$(grep -m1 'ext pool holds' "$TMP/be" | sed 's/^\[error \] //')"
+else
+    ok "an extension pool past 64 KB does not alias ids"
+fi
+
+# Each of these extensions is on exactly one file, so each must match exactly that file.
+# Every 55th, 40 of them. The sample cannot miss the bug by luck: aliased pairs were 904
+# of 2 500 when it was measured, so 40 draws miss with probability (1 - 0.36)^40, i.e.
+# never in practice -- and the fixture above makes it deterministic anyway.
+DB="$EXT_DB"
+extbad=0; extfirst=""
+i=0
+while [ "$i" -lt 2200 ]; do
+    i=$((i + 55))
+    e="e$(printf '%030d' "$i")"
+    q "ext:$e" "count:0"
+    if [ "$(n "$LAST")" != "1" ] || [ "$(paths "$LAST")" != "$EXTD/f$i.$e " ]; then
+        extbad=$((extbad + 1))
+        [ -z "$extfirst" ] && extfirst="$e -> [$(paths "$LAST")]"
+    fi
+done
+DB="$TREE_DB"
+if [ "$extbad" = 0 ]; then
+    ok "40 sampled extensions each match only their own file"
+else
+    bad "40 sampled extensions each match only their own file" \
+        "$extbad of 40 wrong, first: $extfirst"
+fi
+
 say "size filter (sorted index -> bitmap)"
 
 # NOTE: size: also matches folders -- on ext4 a directory's st_size is typically

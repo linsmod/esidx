@@ -192,6 +192,23 @@ chain, the way FSearch does. For *display* that is acceptable and saves the
 storage. For `path:` queries at scale it becomes the bottleneck and the path
 column will have to be materialised — see §2 L2.
 
+**Extension names are addressed by a dense id, not by their offset.** They were
+addressed by offset, as a `uint16_t`, and a pool past 64 KB wrapped one extension's
+offset onto another's: two extensions shared an id, so `ext:` answered with rows
+carrying neither, and `ext_index_count()` — the exact cost design §6.2 ranks leaves
+by — was wrong for the affected ids. Measured on `/work` (a 68 KB pool) as ~30
+extensions, and on a 2 200-extension fixture as 152, where `ext:e…005` matched both
+`f5.e…005` and `f1477.e…001477`. `ext_off[]` now holds the 32-bit offsets and an id is
+its position in interning order, so it cannot wrap; a dense id cannot realistically
+exceed 65 535 distinct extensions, so the entry column stays 16 bits. The id table is
+rebuilt on load by walking the pool, which *is* the numbering — a name's id is where it
+sits in an append-only pool — so nothing derived from ids is persisted (D4).
+
+Snapshot **version 3**. The ext column is the same width in the same place, so a
+version-2 snapshot would load without complaint and then resolve extensions to the
+wrong strings; the version check is the only thing separating the two, which is what
+it is for.
+
 ### 4.3 Sparse metadata table
 
 Media metadata and content-index offsets live in a K/V table keyed by
