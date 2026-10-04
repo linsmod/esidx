@@ -152,7 +152,7 @@ for i in $(seq 1 "$NSORT"); do
     ESIDX_LOG=info "$bn" query "$TMP/probe.idx" '' 'count:1' 2>&1 >/dev/null \
         | sed -nE 's/.*load: total: ([0-9.]+) ms/\1 ms/p' | tr -d '\n'
     printf '  | '
-    sed -nE 's/.*(finalize: (name rank|name trigrams|ext bitmaps|type bitmaps)[^|]*)/\1/p' \
+    sed -nE 's/.*(finalize: (name rank|name trigrams|ext sets|type bitmaps)[^|]*)/\1/p' \
         "$TMP/b.log" | sed 's/^/ /' | tr '\n' ' '
     printf '\n'
 done

@@ -822,7 +822,7 @@ uint32_t sidx_range_to_bitset(const sidx_t *s, int64_t lo, int64_t hi, bitset_t 
     return cnt;
 }
 
-/* -------------------------------------------------------------- ext bitmaps */
+/* --------------------------------------------------------------- ext sets */
 
 /* ext_id is the byte offset in the exts pool plus one, so it is sparse. `tab` is
  * a small open-addressed map from ext_id to a dense slot; linear probing is fine
@@ -974,6 +974,31 @@ static void log_ext_lengths(const esidx_t *db, uint32_t ext_in_use)
              n, ext_in_use, n - ext_in_use);
 }
 
+/* A bitmap is kept only when the extension is broad enough that *selecting* it as a
+ * bitmap beats walking its ids, and when a bitmap is worth allocating at all. Both
+ * halves matter:
+ *
+ *   - select cost. A bitmap is n/64 word operations whatever the extension's cardinality;
+ *     a list is one call plus two bit operations per id, so by op count the bitmap should
+ *     win above n/128. Measured, it wins later than that: the widest list-backed extension
+ *     on /work is `sha1` at 39 087 rows against a 5 476 485-row table, and its select
+ *     costs 0.467 ms as a list against 0.428 ms as a bitmap -- 9 % worse, consistently
+ *     over three interleaved runs. So the true crossover is nearer n/64, the list walk
+ *     loses to a word loop it was supposed to win against, and the threshold is left at
+ *     n/128 anyway: the absolute difference is 0.04 ms on one term, and the memory the
+ *     lower half of the range gives up is 4.4 GB. Moving the constant needs a sweep over
+ *     it, not one point.
+ *   - the floor. A bitmap smaller than a page is not worth having, and the floor is also
+ *     what keeps a small tree on the list path -- without it every fixture in the suite
+ *     would take the bitmap path and the list path would ship untested, which is the
+ *     failure mode AGENTS.md 3.4 keeps producing.
+ *
+ * The consequence to be honest about: a narrow extension that grows past the threshold
+ * keeps its list until the next build. Correct either way, just not optimal, and the same
+ * bargain esidx_update() makes for the name rank (a rename cannot re-sort 5 M rows).
+ */
+#define EXT_BITMAP_MIN_BYTES 512
+
 int ext_index_build(ext_index_t *xi, const esidx_t *db)
 {
     ext_index_free(xi);
@@ -997,42 +1022,107 @@ int ext_index_build(ext_index_t *xi, const esidx_t *db)
         ids[n++] = e;
     }
 
+    /* Three passes, where it used to be two: the structure of a slot depends on how many
+     * entries carry it, and the count is only known once every entry has been visited. */
     bitset_t *sets = calloc(n ? n : 1, sizeof(bitset_t));
+    ext_post_t *posts = calloc(n ? n : 1, sizeof(ext_post_t));
     uint32_t *counts = calloc(n ? n : 1, sizeof(uint32_t));
-    if (!sets || !counts) {
-        free(sets); free(counts); free(tab); free(ids);
+    if (!sets || !posts || !counts) {
+        free(sets); free(posts); free(counts); free(tab); free(ids);
         return -1;
     }
-    for (uint32_t s = 0; s < n; s++) {
-        if (bs_init(&sets[s], et->count + 1) != 0) {
-            for (uint32_t k = 0; k < s; k++) bs_free(&sets[k]);
-            free(sets); free(counts); free(tab); free(ids);
-            return -1;
-        }
-    }
+
     for (uint32_t i = 0; i < et->count; i++) {
         uint16_t e = et->ext_id[i];
         if (!e || (et->flags[i] & EF_DEAD)) continue;
         uint32_t h = (e * 2654435761u) & mask;
         while (ids[tab[h] - 1] != e) h = (h + 1) & mask;
-        bs_set(&sets[tab[h] - 1], i);
         counts[tab[h] - 1]++;
+    }
+
+    /* The choice, and the memory it comes to. Reported whether or not anyone looks,
+     * because it is the number that says whether this index is 20 MB or 4 GB. */
+    uint32_t n_bitmap = 0, n_list = 0;
+    size_t mem_bitmap = 0, mem_list = 0;
+    size_t set_bytes = ((size_t)et->count + 63) / 64 * sizeof(uint64_t);
+    uint32_t k_min = (uint32_t)(et->count / 128);
+    for (uint32_t s = 0; s < n; s++) {
+        if (counts[s] > k_min && set_bytes >= EXT_BITMAP_MIN_BYTES) {
+            if (bs_init(&sets[s], et->count + 1) != 0) goto fail;
+            n_bitmap++;
+            mem_bitmap += set_bytes;
+        } else {
+            /* Sized exactly: a build reads every entry once, so there is no append to
+             * grow for, and over-allocating 6 765 lists to make room for a reconcile
+             * would cost more than the lists do. */
+            posts[s].ids = malloc((counts[s] ? counts[s] : 1) * sizeof(eid_t));
+            if (!posts[s].ids) goto fail;
+            posts[s].n = 0;
+            posts[s].cap = counts[s];
+            n_list++;
+            mem_list += (size_t)counts[s] * sizeof(eid_t);
+        }
+    }
+
+    for (uint32_t i = 0; i < et->count; i++) {
+        uint16_t e = et->ext_id[i];
+        if (!e || (et->flags[i] & EF_DEAD)) continue;
+        uint32_t h = (e * 2654435761u) & mask;
+        while (ids[tab[h] - 1] != e) h = (h + 1) & mask;
+        uint32_t s = tab[h] - 1;
+        if (posts[s].ids) posts[s].ids[posts[s].n++] = i;   /* ascending: i ascends */
+        else bs_set(&sets[s], i);
     }
 
     xi->n = n;
     xi->ids = ids;
     xi->counts = counts;
+    xi->posts = posts;
     xi->sets = sets;
     xi->tab = tab;
     xi->tab_mask = mask;
     log_ext_cardinality(xi, et->count);
     log_ext_lengths(db, xi->n);
-    LOGD("ext bitmaps: %u distinct extensions over %u entries", n, et->count);
+    char bmb[32], lmb[32];
+    fmt_bytes(bmb, sizeof(bmb), mem_bitmap);
+    fmt_bytes(lmb, sizeof(lmb), mem_list);
+    /* The widest extension of each kind, named. Their cardinalities are what decide
+     * whether the two paths are worth having, and naming them makes the measurement
+     * re-runnable: sortcmp.sh and cmp_ref.sh both take a term, and "the widest extension"
+     * is not a term anyone can paste. Both are reported because the risk is asymmetric --
+     * a bitmap path that got slower is a regression, a list path that got slower only
+     * shows up on the extensions closest to the threshold. */
+    uint32_t widest_b = 0, widest_l = 0;
+    int have_l = 0;
+    for (uint32_t s = 0; s < n; s++) {
+        if (posts[s].ids) {
+            if (!have_l || counts[s] > counts[widest_l]) { widest_l = s; have_l = 1; }
+        } else if (counts[s] > counts[widest_b]) {
+            widest_b = s;
+        }
+    }
+    LOGI("ext structure: %u bitmaps (%s), %u posting lists (%s) | a bitmap is kept"
+         " above %u entries and only when it is at least %d bytes | widest bitmap: %s (%u),"
+         " widest list: %s (%u)",
+         n_bitmap, bmb, n_list, lmb, k_min, EXT_BITMAP_MIN_BYTES,
+         n_bitmap ? ext_str(db, (uint16_t)ids[widest_b]) : "-",
+         n_bitmap ? counts[widest_b] : 0,
+         have_l ? ext_str(db, (uint16_t)ids[widest_l]) : "-",
+         have_l ? counts[widest_l] : 0);
     return 0;
+
+fail:
+    for (uint32_t k = 0; k < n; k++) { free(posts[k].ids); bs_free(&sets[k]); }
+    free(sets); free(posts); free(counts); free(tab); free(ids);
+    return -1;
 }
 
 void ext_index_free(ext_index_t *xi)
 {
+    if (xi->posts) {
+        for (uint32_t i = 0; i < xi->n; i++) free(xi->posts[i].ids);
+        free(xi->posts);
+    }
     if (xi->sets) {
         for (uint32_t i = 0; i < xi->n; i++) bs_free(&xi->sets[i]);
         free(xi->sets);
@@ -1054,6 +1144,10 @@ static int ext_slot(const ext_index_t *xi, uint16_t ext_id)
     return -1;
 }
 
+/* A bitmap is kept only when the extension is broad enough that *selecting* it as a
+ * bitmap beats walking its ids -- see EXT_BITMAP_MIN_BYTES above. A list slot is filled
+ * by walking the ids in order, so the list comes out ascending without being sorted,
+ * which is the invariant every merge over it depends on (the same one tri_index has). */
 uint32_t ext_index_select(const ext_index_t *xi, const uint16_t *ids, uint32_t n,
                           bitset_t *out)
 {
@@ -1062,7 +1156,12 @@ uint32_t ext_index_select(const ext_index_t *xi, const uint16_t *ids, uint32_t n
     for (uint32_t i = 0; i < n; i++) {
         int s = ext_slot(xi, ids[i]);
         if (s < 0) continue;             /* extension not present in this index */
-        bs_or(out, &xi->sets[s]);
+        const eid_t *list = xi->posts[s].ids;
+        if (list) {
+            for (uint32_t k = 0; k < xi->posts[s].n; k++) bs_set(out, list[k]);
+        } else {
+            bs_or(out, &xi->sets[s]);
+        }
         cnt++;
     }
     return cnt;
@@ -1093,9 +1192,24 @@ int ext_index_add(ext_index_t *xi, const esidx_t *db, uint16_t ext_id, eid_t id)
         uint32_t *nids = realloc(xi->ids, (xi->n + 1) * sizeof(uint32_t));
         uint32_t *ncounts = realloc(xi->counts, (xi->n + 1) * sizeof(uint32_t));
         bitset_t *nsets = realloc(xi->sets, (xi->n + 1) * sizeof(bitset_t));
-        if (!nids || !ncounts || !nsets) return -1;
-        xi->ids = nids; xi->counts = ncounts; xi->sets = nsets;
-        if (bs_init(&xi->sets[xi->n], db->et.count + 1) != 0) return -1;
+        ext_post_t *nposts = realloc(xi->posts, (xi->n + 1) * sizeof(ext_post_t));
+        if (!nids || !ncounts || !nsets || !nposts) return -1;
+        xi->ids = nids; xi->counts = ncounts; xi->sets = nsets; xi->posts = nposts;
+        /* A new extension starts as a list: it has one entry, so a bitmap for it would be
+         * a page of address space to hold a single bit. It graduates on the next build if
+         * it ever earns one.
+         *
+         * Both halves of the new slot are zeroed, and that is load-bearing rather than
+         * tidiness. realloc leaves the grown tail uninitialised, and these two arrays are
+         * grown by realloc, so without this the slot's `nbits` is whatever was in that
+         * heap block: bs_reserve() then reads it as "already big enough", allocates
+         * nothing, and bs_test() dereferences an `w` that is not a pointer. -O2 hid it
+         * completely -- fresh pages from the OS read as zero, so the garbage happened to
+         * be a valid empty bitset -- and the DEBUG build caught it as a SEGV on
+         * 0xbebebebe (AGENTS.md 3.1). The invariant from here on: a slot is a list iff
+         * posts[slot].ids is non-NULL, and otherwise sets[slot] is a live bitmap. */
+        memset(&xi->sets[xi->n], 0, sizeof(bitset_t));
+        memset(&xi->posts[xi->n], 0, sizeof(ext_post_t));
         xi->ids[xi->n] = ext_id;
         xi->counts[xi->n] = 0;
         xi->n++;
@@ -1104,16 +1218,39 @@ int ext_index_add(ext_index_t *xi, const esidx_t *db, uint16_t ext_id, eid_t id)
         xi->tab[h] = xi->n;
         slot = (int)xi->n - 1;
     }
+    if (xi->posts[slot].ids) {
+        ext_post_t *p = &xi->posts[slot];
+        if (p->n == p->cap) {
+            uint32_t ncap = p->cap ? p->cap * 2 : 8;
+            eid_t *ni = realloc(p->ids, (size_t)ncap * sizeof(eid_t));
+            if (!ni) return -1;
+            p->ids = ni;
+            p->cap = ncap;
+        }
+        p->ids[p->n++] = id;      /* ascending: a reconcile only ever hands out larger ids */
+        xi->counts[slot]++;
+        return 0;
+    }
     if (bs_reserve(&xi->sets[slot], db->et.count) != 0) return -1;
     if (!bs_test(&xi->sets[slot], id)) xi->counts[slot]++;
     bs_set(&xi->sets[slot], id);
     return 0;
 }
 
+/* A list slot keeps the id of a removed entry. Nothing has to unpublish it: every query
+ * seeds its candidate set from `live`, a removed id is not in it, and the intersection
+ * that follows drops the id again. This is the bargain tri_index already makes, and the
+ * reason a removal here is a count decrement and nothing else -- the count has to stay
+ * exact because design §6.2 costs a driver leaf with it. Ids are never reused (D8), so a
+ * stale id cannot be mistaken for a live one either; esidx_compact() rebuilds the lot. */
 int ext_index_del(ext_index_t *xi, uint16_t ext_id, eid_t id)
 {
     int slot = ext_slot(xi, ext_id);
     if (slot < 0) return 0;
+    if (xi->posts[slot].ids) {
+        if (xi->counts[slot]) xi->counts[slot]--;
+        return 0;
+    }
     if (bs_test(&xi->sets[slot], id)) {
         bs_clear_bit(&xi->sets[slot], id);
         xi->counts[slot]--;
@@ -1268,7 +1405,7 @@ void esidx_finalize(esidx_t *db)
 
     t0 = ts_us();
     ext_index_build(&db->ext, db);
-    TSDONE2("finalize: ext bitmaps", t0, "(%u extensions)", db->ext.n);
+    TSDONE2("finalize: ext sets", t0, "(%u extensions)", db->ext.n);
 
     t0 = ts_us();
     type_index_build(&db->type, db);

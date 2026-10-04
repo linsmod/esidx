@@ -208,20 +208,33 @@ typedef struct {
 
 /* ------------------------------------------------------------- enum bitmap */
 
-/* One bitmap per extension (design §5.4) -- a structure §5.4 now records as measured to
- * be the wrong one, with the replacement and the numbers that say so.
+/* One bitmap per extension (design §5.4) -- except that a *narrow* extension is a posting
+ * list, because the bitmap's cost is set by the table rather than by the extension and
+ * the product does not scale: /work reserved 4 416 MB of address space for 6 765
+ * extensions, of which 6 248 hold fewer than 4 096 rows. design §5.4 records the
+ * measurements and the threshold.
+ *
+ * Which structure a slot has is `posts[s].ids`: non-NULL is a list, NULL is a bitmap.
+ * One array rather than two, so the two kinds sit side by side in memory and a select
+ * over a term naming several extensions touches one cache line per slot.
  *
  * `tab` maps ext_id to a dense slot. ext_id used to be a byte offset, so it was sparse;
  * it is dense now (see esidx_t), but the slot table stays rather than indexing by id
  * directly because the slots are renumbered by ext_index_build() and a term can name up
  * to 256 extensions at once, which is a set union either way. */
 typedef struct {
+    eid_t   *ids;
+    uint32_t n, cap;
+} ext_post_t;
+
+typedef struct {
     uint32_t   n;        /* distinct extensions */
     uint32_t  *ids;      /* slot -> ext_id */
     uint32_t  *counts;   /* slot -> entries carrying it, for the selectivity
                           * estimate in design §6.2 -- computing it here is what
                           * lets the optimiser cost ext: without a scan */
-    bitset_t  *sets;     /* slot -> entries carrying it */
+    ext_post_t *posts;   /* slot -> posting list, or {NULL} when it has a bitmap */
+    bitset_t  *sets;     /* slot -> entries carrying it, when it is broad enough */
     uint32_t  *tab;      /* open addressing, value = slot + 1, 0 = empty */
     uint32_t   tab_mask;
 } ext_index_t;

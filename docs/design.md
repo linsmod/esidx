@@ -343,40 +343,54 @@ operators.
 Dense `uint64_t` words for now, swapped for CRoaring later behind an unchanged
 `bs_init` / `bs_set` / `bs_test` / `bs_clear` ABI — decision D7.
 
-**The extension half of this is measured to be the wrong structure, and the fix is
-known.** `ext_index` gives every extension a bitmap sized by the *table*, so the cost
-is a product — one bitmap per extension, `n` bits each — and the extension count grows
-with the tree, so the product grows faster than the tree does. §5.4's original argument
-was "extensions are few and low cardinality" (1 580 over 372 084 entries when written)
-and never recorded where the product stops being affordable.
+**The extension half of this is a posting list, not a bitmap, and only the broad
+extensions kept one.** `ext_index` used to give every extension a bitmap sized by the
+*table*, so the cost was a product — one bitmap per extension, `n` bits each — and the
+extension count grows with the tree, so the product grows faster than the tree does. The
+original argument was "extensions are few and low cardinality" (1 580 over 372 084 entries
+when written) and never recorded where the product stops being affordable.
 
-`log_ext_cardinality()` in `store.c` prints what it would cost both ways, at INFO, from
-the counts the build already computes. On `r7000`, unfiltered:
+A slot is a posting list — 4 bytes per entry, ascending because ids are, the structure
+§5.2 already uses for names — unless the extension is broad enough that *selecting* it as
+a bitmap beats walking its ids. Two conditions, and both matter: `k > n/128` (a bitmap is
+`n/64` word operations whatever the cardinality, a list is a call plus two bit operations
+per id) and a bitmap of at least 512 bytes (a sub-page bitmap is not worth having, and the
+floor is also what keeps a small tree on the list path — without it every fixture in the
+suite would take the bitmap path and the list path would ship untested).
 
-| `/usr` = 372 084 entries | `/work` = 5 476 485 entries |
-|---|---|
-| 1 580 extensions, largest 47 504, mean 179 | 6 478 extensions, largest 694 286, mean 651 |
-| 744 singletons, 522 in 2-15, 244 in 16-255, 56 in 256-4095, 14 in 4096-65535 | 1 848 / 3 370 / 904 / 299 / 43 / **14 over 65 536** |
-| bitmaps 70 MB of address space, lists 1 MB | bitmaps **4 229 MB**, lists 16 MB |
-| crossover at 11 628 entries | crossover at 171 142 entries |
+Measured on `r7000`, the tree both servers index, `VmSize` after `serve`:
 
-Measured resident cost of that 4 229 MB on `/work` is 213 MB, because a `calloc`'d
-bitmap only faults the pages its bits land on — so the cost shows up as *address space*
-(6.1 GB `VmSize` against 1.56 GiB resident) and becomes a hard failure where overcommit
-is refused or `ulimit -v` is set, which is the same failure mode as the path sort in
-§10 that only appeared under a memory cap.
+| | `/usr` = 372 084 entries | `/work` = 5 476 485 entries |
+|---|---|---|
+| bitmaps | 16, 726 kB | 17, 11 MB |
+| posting lists | 1 564, 272 kB | 6 748, 3 MB |
+| `finalize: ext` | 2.6 ms | 51.6 ms (was 114.5) |
+| `VmSize` serving | — | **1.77 GB, was 6.11 GB** |
+| widest bitmap | `h`, 47 504 rows | `h`, 694 286 rows |
+| widest list | `cmake`, 2 520 rows | `sha1`, 39 087 rows |
 
-The replacement is the structure §5.2 already uses for names: a posting list, 4 bytes
-per entry, ascending because ids are. The threshold is a select-cost question, not a
-memory one — a bitmap selects in `n/64` word operations whatever its cardinality, a
-list walks `k` ids, so the bitmap earns its place only while `k > n/64` (85 576 on
-`/work`, where exactly **one** extension of 6 478 qualifies). Total 4 229 MB → 17 MB.
+Select cost, both structures, three interleaved runs on `/work`: `ext:h` 2.389 → 2.391 ms
+(it keeps its bitmap, so nothing moves) and `ext:sha1`, the widest list, 0.428 → 0.467 ms —
+**9 % slower**, consistently, which says the true crossover is nearer `n/64` than `n/128`.
+The threshold stays at `n/128` anyway: 0.04 ms on one term against 4.4 GB of address space,
+and moving the constant needs a sweep over it rather than one point.
+
+The old cost was never resident: a `calloc`'d bitmap only faults the pages its bits land on,
+so 4 229 MB of bitmaps measured 213 MB resident against 6.1 GB of address space. It failed
+where overcommit is refused or `ulimit -v` is set, which is the same failure mode as the
+path sort in §10 that only appeared under a memory cap.
+
 The cardinality is printed rather than assumed because it is the whole decision, and
 because the first version of that print was wrong in a way worth recording: it bucketed
 through a bounds table indexed one element past its end, `-O2` folded the last comparison
-away, and `/work` reported `>=65536: 0` on the same line as `largest 694286`. The
-14 broad extensions it had been hiding hold 3 019 986 rows — 55 % of everything with an
-extension — which is exactly the mass a threshold has to be placed against.
+away, and `/work` reported `>=65536: 0` on the same line as `largest 694286`. The broad
+extensions it had been hiding hold 3 019 986 rows — 55 % of everything with an extension —
+which is exactly the mass a threshold has to be placed against.
+
+A removal from a list slot is a count decrement and nothing else: the id stays in the list
+because every query seeds from `live`, a removed id is not in it, and the intersection that
+follows drops it. That is the bargain `tri_index` already makes, and the count has to stay
+exact because §6.2 costs a driver leaf with it.
 
 ### 5.5 Aggregate columns
 

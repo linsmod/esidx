@@ -233,6 +233,52 @@ fi
 
 say "size filter (sorted index -> bitmap)"
 
+# One bitmap per extension, each sized by the whole table, is what §5.4 used to build:
+# a product of extensions x n bits, so /work reserved 4 416 MB of address space for
+# 6 765 extensions. Narrow extensions are now posting lists instead, which is what the
+# name trigram index has always used (design §5.2) and what the cardinality distribution
+# said should happen -- 6 248 of /work's 6 765 extensions hold under 4 096 rows.
+#
+# Two cardinalities in one fixture, because the point of the change is that both paths
+# exist and both have to be right. 5 000 rows crosses the threshold and gets a bitmap;
+# 2 rows cannot and gets a list; and the union has to be neither's rows alone.
+EXTM="$TMP/extmix"
+mkdir -p "$EXTM"
+seq 1 5000 | sed 's/$/.broad/' | ( cd "$EXTM" && xargs touch )
+: >"$EXTM/one.narrow"; : >"$EXTM/two.narrow"
+EXTM_DB="$TMP/extmix.idx"
+# ESIDX_LOG=info because the structure line is INFO and the assertion below reads it: the
+# default level prints nothing, which would make the assertion pass on any build (this is
+# the second time in two commits that a log-reading assertion needed the level raised --
+# the truncation counter is now a warning for the same reason).
+ESIDX_LOG=info "$BIN" build "$EXTM" -o "$EXTM_DB" >/dev/null 2>"$TMP/be"
+
+DB="$EXTM_DB"
+q "ext:broad" "count:0"
+expect "a broad extension matches exactly its own rows"     "$(n "$LAST")" "5000"
+q "ext:narrow" "count:0"
+expect "a narrow extension matches exactly its own rows"    "$(paths "$LAST")" \
+       "$EXTM/one.narrow $EXTM/two.narrow "
+q "ext:broad;narrow" "count:0"
+expect "a union of a bitmap and a list is both of them"      "$(n "$LAST")" "5002"
+# the same extension as a filter rather than the driver: pick_driver takes the most
+# selective indexed leaf, so `size:` above wins and ext: is applied to what it seeded
+q "ext:broad" "size:0" "count:0"
+expect "the same extension as a filter gives the same rows"  "$(n "$LAST")" "5000"
+q "ext:narrow" "size:0" "count:0"
+expect "...for a list-backed one too"                       "$(n "$LAST")" "2"
+DB="$TREE_DB"
+
+# Which structure each slot got, so the fixture above is known to have exercised both.
+# A guard against the day the threshold moves and this quietly stops testing the list
+# path -- every row count here would still pass.
+if grep -qE "ext structure: [1-9][0-9]* bitmaps .*, [1-9][0-9]* posting lists" "$TMP/be"; then
+    ok "a mixed fixture gets both a bitmap and a posting list"
+else
+    bad "a mixed fixture gets both a bitmap and a posting list" \
+        "$(grep -m1 'bitmaps' "$TMP/be" | sed 's/^\[[a-z]* \] //')"
+fi
+
 # NOTE: size: also matches folders -- on ext4 a directory's st_size is typically
 # 4096, so every dir in the fixture passes size:>1000. That matches Everything's
 # behaviour, so the assertions below pin files explicitly with file:.
