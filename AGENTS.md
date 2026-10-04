@@ -278,13 +278,18 @@ send" — see §1.4.
 ### 3.1 Both suites, both builds, every time
 
 ```sh
-make clean && make && make etp-probe
+make clean && make
 ./test.sh && ./test_etp.sh
 
-make clean && make DEBUG=1 && make etp-probe
+make clean && make DEBUG=1
 ASAN_OPTIONS=detect_leaks=1 ./test.sh
 ASAN_OPTIONS=detect_leaks=1 ./test_etp.sh
 ```
+
+One `make` builds both binaries (`all: esidx etp-probe`), so there is no second
+step to forget. It used to be `make && make etp-probe`, and forgetting it cost an
+hour's confusion: `test_etp.sh` stops with `./etp-probe not built`, which reads
+like a broken checkout rather than a missing prerequisite.
 
 The ASan build is not optional. It is the only thing that catches:
 
@@ -406,15 +411,22 @@ Do not re-litigate these; they were measured and the conclusions are recorded:
   match, so intersecting can only drop rows `text_match()` rejects. That is why
   `tri_applies()` lists the shapes it may touch rather than the ones it may not: a
   refused prefilter is only slower, an accepted one that is wrong loses rows.
-- **`image:` is now the largest cost on a real tree** — 54 ms on `r7000`, ~53 of it
-  the sort over 55 229 rows. That is §6.2 step 4 (TopK), still not built, and it is
-  the next thing to look at.
+- **`image:` is the largest cost on a real tree** — 55.7 ms on `r7000`, 54 of it the
+  sort over 55 229 rows. And the same sort over an unfiltered `/usr` is 169 ms over
+  372 084 rows, so it is not `image:` that is expensive: it is ~6 M `strcasecmp`
+  calls in `cmp_rec`, at ~28 ns each. An unfiltered path sort went from 1 310 ms to
+  169 ms of sort when the per-row buffer was fixed, which is what made the rest
+  legible. Both remaining costs are this one cost.
 - **The in-memory text scan is no longer the remaining cost, but it is still a cost
   on paths.** `path:` has no index yet; `path_of()` is O(depth) per call (§12 risk
-  7), which is what the path half of §5.2 would fix.
-- **`path_of()` is O(depth) with an allocation per call** (design §12 risk 7). It
-  is fine for display and for the current sort volume; the path-sort cache in
-  `query.c` bounds the repeat cost when it is not.
+  7), which is what the path half of §5.2 would fix. Measured first: a prefilter can
+  only narrow a path term that is *not* an ancestor of the index root, so on the
+  tree every §10 measurement uses — rooted at `/usr` — `path:/usr` matches every row
+  and a path trigram index would save nothing. The narrowing it does buy is on a
+  term strictly inside the tree (`path:/etc/ssh`: 13 of 3 838).
+- **`path_of()` is O(depth) and does not allocate** (§12 risk 7, corrected). It was
+  the *sort* that allocated per row; there is no path-sort cache left, because there
+  was never a second call to cache.
 
 ### 4.4 Do not optimise on a guess
 

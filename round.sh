@@ -194,6 +194,21 @@ sendraw EVERYTHING QUERY
 query
 EOF
 
+# Every sort name the client offers is on its column header, and path_ascending is
+# the one that materialises a string per row. An unfiltered SEARCH is the shape that
+# mattered: it asks for a path per matched entry, which on /usr is one per entry in
+# the tree. This drive is here because nothing measured it before the fix.
+drive "sort by path over an unfiltered search -- the shape that used to break" <<'EOF'
+send EVERYTHING CASE 0
+send EVERYTHING PATH 1
+send EVERYTHING SORT path_ascending
+send EVERYTHING OFFSET 0
+send EVERYTHING COUNT 50
+send EVERYTHING SEARCH
+sendraw EVERYTHING QUERY
+query
+EOF
+
 drive "a second-stage filter on top of the primary search" <<EOF
 send EVERYTHING COUNT 100
 send EVERYTHING SEARCH ext:conf

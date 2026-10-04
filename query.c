@@ -1592,9 +1592,11 @@ static void apply_filter(qctx_t *c, bitset_t *set)
 
 /* ------------------------------------------------------------------ sorting */
 
-/* One row of the sort. `s` points into the string pool for name/ext -- no copy
- * -- while a path sort materialises into the cache below, because path_of() is
- * O(depth) with an allocation per call (design §12, risk 7). */
+/* One row of the sort. `s` points into the string pool for name/ext -- no copy --
+ * while a path sort owns a copy per row, because path_of() rebuilds the path from
+ * the parent chain (design §12, risk 7) and the comparator needs it to outlive the
+ * extraction loop. Those copies are exactly as long as the path and nothing more;
+ * see sort_string(). */
 typedef struct {
     eid_t       id;
     int64_t     num;
@@ -1605,10 +1607,10 @@ typedef struct {
     const esidx_t *db;
     sort_key_t     key;
     int            desc;
-    /* path materialisation cache, open addressed on eid+1 */
-    uint32_t *ck_key;
-    char    **ck_val;
-    uint32_t  ck_mask;
+    /* One scratch buffer, reused for every row, so path_of() writes into the same
+     * 64 KiB all the way down the column instead of allocating per row. */
+    char          *pathbuf;
+    size_t         pathcap;
 } sort_ctx_t;
 
 static const char *sort_string(sort_ctx_t *sc, eid_t id)
@@ -1619,17 +1621,25 @@ static const char *sort_string(sort_ctx_t *sc, eid_t id)
         return ext_of_str(db, id);
     case SORT_PATH:
     case SORT_FILE_LIST_FILENAME: {
-        uint32_t h = (id * 2654435761u) & sc->ck_mask;
-        while (sc->ck_key[h]) {
-            if (sc->ck_key[h] == id + 1) return sc->ck_val[h];
-            h = (h + 1) & sc->ck_mask;
+        if (!sc->pathbuf) {
+            sc->pathbuf = malloc(65536);
+            sc->pathcap = 65536;
         }
-        char *buf = malloc(65536);
-        if (!buf) return "";
-        path_of(db, id, buf, 65536);
-        sc->ck_key[h] = id + 1;
-        sc->ck_val[h] = buf;
-        return buf;
+        if (!sc->pathbuf) return "";
+        path_of(db, id, sc->pathbuf, sc->pathcap);
+        /* Sized to the path, not to the buffer. The obvious version -- one 64 KiB
+         * malloc per row, kept until the sort ends -- asks for 64 KiB x rows of
+         * *address space*, which is 23 GB over an unfiltered /usr. It looks like it
+         * works because only the first page of each buffer is ever touched, and it
+         * does not: where malloc refuses, this used to return "", every comparison
+         * tied, and cmp_rec's tie-break turned the path sort into a name sort with no
+         * error anywhere. A path is tens of bytes, so the whole column is now tens of
+         * bytes x rows. */
+        size_t n = strlen(sc->pathbuf) + 1;
+        char *out = malloc(n);
+        if (!out) return "";
+        memcpy(out, sc->pathbuf, n);
+        return out;
     }
     case SORT_ATTRIBUTES:
     case SORT_RECENTLY_CHANGED:
@@ -1684,22 +1694,13 @@ static int cmp_plain(const void *pa, const void *pb, void *arg)
     return cmp_rec(pa, pb, arg);
 }
 
-static void scache_init(sort_ctx_t *sc, uint32_t hint)
+/* The scratch buffer is the only thing the context owns; the per-row path copies
+ * belong to the rows array and are released with it. */
+static void sc_done(sort_ctx_t *sc)
 {
-    uint32_t cap = 1024;
-    while (cap < hint * 2 && cap < (1u << 22)) cap <<= 1;
-    sc->ck_mask = cap - 1;
-    sc->ck_key = calloc(cap, sizeof(uint32_t));
-    sc->ck_val = calloc(cap, sizeof(char *));
-}
-
-static void scache_free(sort_ctx_t *sc)
-{
-    if (!sc->ck_key) return;
-    for (uint32_t i = 0; i <= sc->ck_mask; i++) free(sc->ck_val[i]);
-    free(sc->ck_key);
-    free(sc->ck_val);
-    sc->ck_key = NULL; sc->ck_val = NULL;
+    free(sc->pathbuf);
+    sc->pathbuf = NULL;
+    sc->pathcap = 0;
 }
 
 /* --------------------------------------------------------------- the driver */
@@ -1832,13 +1833,11 @@ int qexec(const esidx_t *db, const ast_t *ast_in, const match_opts_t *mo,
     sc.db = db;
     sc.key = sort.key;
     sc.desc = sort.desc;
-    if (sc.key == SORT_PATH || sc.key == SORT_FILE_LIST_FILENAME)
-        scache_init(&sc, total);
     if (sc.key == SORT_RECENTLY_CHANGED)
         LOGD("sort: no date_recently_changed column; ordering by mtime instead");
 
     srec_t *rows = malloc((size_t)total * sizeof(srec_t));
-    if (!rows) { bs_free(&set); qctx_done(&c); scache_free(&sc); return -1; }
+    if (!rows) { bs_free(&set); qctx_done(&c); sc_done(&sc); return -1; }
     uint32_t ri = 0;
     for (uint32_t i = bs_next(&set, 0); i < c.n; i = bs_next(&set, i + 1)) {
         rows[ri].id  = i;
@@ -1854,10 +1853,14 @@ int qexec(const esidx_t *db, const ast_t *ast_in, const match_opts_t *mo,
     out->n_dir = ndir;
     out->n_file = nfile;
 
+    /* Only the path key owns its strings; for every other key `s` points into the
+     * pool and freeing it would be freeing the index. */
+    if (sc.key == SORT_PATH || sc.key == SORT_FILE_LIST_FILENAME)
+        for (uint32_t i = 0; i < total; i++) free((char *)rows[i].s);
     free(rows);
     bs_free(&set);
     qctx_done(&c);
-    scache_free(&sc);
+    sc_done(&sc);
 
     LOGD("exec: matched=%u (dirs=%u files=%u) of %u | plan=%.3f eval=%.3f sort=%.3f ms",
          total, ndir, nfile, c.n,

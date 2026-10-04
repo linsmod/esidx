@@ -754,6 +754,42 @@ and `esidx_load` pays the same because it re-runs `finalize` — 276 ms becomes
 snapshot for 117 k entries on WSL2. Nothing is persisted (D4), so this is paid at
 startup and at every compaction and never on the query path.
 
+#### A path sort was allocating 64 KiB per row, and failing silently
+
+Found while measuring the above, and the more useful of the two findings.
+
+`sort_string()` gave a path sort a fresh `malloc(65536)` per row and held every one
+of them until the sort ended. It looked like it worked, because only the first page
+of each buffer is ever touched: an unfiltered `path_ascending` over `/usr` cost
+**1.7 GB of RSS** but still returned the right order. Where malloc *did* refuse —
+23 GB of address space is beyond what a default overcommit heuristic grants, and a
+`ulimit -v` reaches that instantly — it returned `""`, every comparison tied, and
+`cmp_rec`'s tie-break quietly turned the **path sort into a name sort**, with no
+error anywhere. Reachable from the wire: `path` is one of the 22 sort names, so it is
+one click on a column header in the client.
+
+| `./round.sh /usr`, unfiltered `SEARCH`, `SORT path_ascending`, 372 084 rows | sort | total | peak RSS (CLI) |
+|---|---|---|---|
+| before | 1 310.9 ms | 1 564.7 ms | 1 705 368 kB |
+| after | **169.0 ms** | **196.3 ms** | **207 644 kB** |
+
+The rows on the wire and their order are the same on both sides; only the cost
+changed. The residual 27 MB is 372 084 copies of a ~70-byte path, and the residual
+169 ms of sort is ~6 M `strcasecmp` calls — which is the same cost `image:` is
+made of, so §10's two remaining line items are one line item.
+
+The cache that wrapped this (`scache_init`/`ck_*`) could never hit: `sort_string()`
+has exactly one call site, once per row, inside the extraction loop, and the
+comparator only reads `srec_t.s`. It was a hash lookup per row and nothing else, so
+it is deleted rather than fixed.
+
+Why no test caught it: every path-sort assertion sorted a *filtered* result set —
+the largest was three rows. On WSL2's `/etc` (1 622 entries) the allocations total
+104 MB and succeed. It only bites above ~26 000 rows in the result set, which is
+exactly the regime AGENTS.md §2.4 says WSL2 is not. The assertion added for it runs
+the sort under `ulimit -v` so the old allocation path cannot be satisfied at all,
+and compares against `sort -f` — an independent implementation of the same order.
+
 ---
 
 ## 11. Decisions
@@ -888,9 +924,18 @@ answer anyway.
 6. **D1 port size** — the Windows socket init and the
    `everything_plugin_utf8_*` string API must each be replaced site by site.
    Estimate 300-500 sites; do the `everything_plugin.h` shim first.
-7. **`path_of()` is O(depth) with an allocation per call** [upstream-notes §3.4].
-   Fine for display; will need the materialised path column once `path:`
-   queries or deep trees make it a hotspot.
+7. ~~**`path_of()` is O(depth) with an allocation per call.**~~ The allocation
+   was never in `path_of()` — it fills a caller's buffer out of a `strref_t
+   stack[256]` and returns; the 64 KiB buffer is allocated once per query, in
+   `text_match`, and reused down the candidate set. What *was* per-row was in the
+   **sort**: `sort_string()` handed a path sort a fresh 64 KiB buffer per row and
+   held every one until the sort ended, so an unfiltered `/usr` asked for 23 GB of
+   address space and, where malloc refused, silently sorted by name instead. Fixed
+   by sizing each copy to its path and dropping the cache, which existed but could
+   never hit (one `sort_string()` call per row, in the extraction loop). So the
+   remaining cost really is just the O(depth) walk, per row, for display and for a
+   path sort — and a materialised path column is still what would fix `path:`
+   (design §2, L2).
 8. **A periodic pass cannot see a change that happened *and was reverted*
    between two passes** — or, more practically, a file whose attributes moved
    while its parent's mtime did not is invisible to the names pass until the next

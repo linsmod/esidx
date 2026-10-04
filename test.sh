@@ -207,6 +207,62 @@ expect "sort:path:asc keeps every row"        "$(n "$LAST")" "3"
 q "ext:conf" "sort:ext:asc"
 expect "sort:ext:asc keeps every row"         "$(n "$LAST")" "3"
 
+# A path sort over a large result set. The bug this pins is not an ordering rule
+# but an allocation: sort_string() handed a path sort a fresh 64 KiB buffer per row
+# and held every one of them until the sort ended, so the *address space* a query
+# asked for was 64 KiB x rows -- 23 GB over an unfiltered /usr. Where malloc then
+# refused, sort_string() returned "", every comparison tied, and cmp_rec's tie-break
+# silently turned the path sort into a name sort. So the assertion has to run under
+# a virtual-memory cap small enough that the old path cannot allocate at all, and
+# the expectation comes from `sort -f` -- an independent implementation of the same
+# order (case-insensitive byte order, which is what strcasecmp does in the C locale).
+# Without the cap the old code passed, which is why it shipped.
+#
+# The names are chosen so that path order and name order disagree in the first few
+# rows: scan order is a_dir, a_dir/z.txt, b.txt, ...; name order is a_dir, b.txt,
+# z.txt, ...; path order is $SORT/a_dir, $SORT/a_dir/z.txt, $SORT/b.txt. A tie
+# therefore cannot produce the right answer by accident.
+SORT="$TMP/sortbig"
+mkdir -p "$SORT/a_dir"
+( cd "$SORT" && seq 1 5000 | sed 's/^/f/' | xargs touch )
+: >"$SORT/a_dir/z.txt"
+: >"$SORT/b.txt"
+SORT_DB="$TMP/sortbig.idx"
+build "$SORT" "$SORT_DB" >/dev/null
+
+# 5000 rows x 64 KiB is 320 MB of address space; the cap leaves room for the index
+# itself (~1 MB) and nothing else. Under a sanitiser build the cap cannot be used at
+# all -- AddressSanitizer reserves terabytes of address space before main() -- so
+# the ordering assertion below runs unconditionally and only the cap is skipped.
+SORT_CAP_KB=65536
+if ldd "$BIN" 2>/dev/null | grep -q 'libasan\|libubsan'; then
+    printf '   \033[33mskip\033[0m the memory-capped path sort under the sanitiser build\n'
+else
+    "$BIN" query "$SORT_DB" "sort:path:asc" "count:0" 2>/dev/null \
+        | awk '{print $NF}' | LC_ALL=C sort -f >"$TMP/sort.want"
+    ( ulimit -v "$SORT_CAP_KB" 2>/dev/null
+      "$BIN" query "$SORT_DB" "sort:path:asc" "count:0" 2>/dev/null ) \
+        | awk '{print $NF}' >"$TMP/sort.got"
+    if diff -q "$TMP/sort.want" "$TMP/sort.got" >/dev/null 2>&1; then
+        ok "a path sort of 5003 rows keeps path order under a 64 MiB cap"
+    else
+        bad "a path sort of 5003 rows keeps path order under a 64 MiB cap" \
+            "got $(head -1 "$TMP/sort.got") want $(head -1 "$TMP/sort.want")"
+    fi
+fi
+
+# ...and the same order without the cap, which is the invariant rather than the bug
+"$BIN" query "$SORT_DB" "sort:path:asc" "count:0" 2>/dev/null \
+    | awk '{print $NF}' | LC_ALL=C sort -f >"$TMP/sort.want"
+"$BIN" query "$SORT_DB" "sort:path:asc" "count:0" 2>/dev/null \
+    | awk '{print $NF}' >"$TMP/sort.got"
+if diff -q "$TMP/sort.want" "$TMP/sort.got" >/dev/null 2>&1; then
+    ok "a path sort agrees with sort -f on the full result set"
+else
+    bad "a path sort agrees with sort -f on the full result set" \
+        "$(diff "$TMP/sort.want" "$TMP/sort.got" | head -3)"
+fi
+
 say "offset / count"
 
 q "ext:conf" "count:1"
