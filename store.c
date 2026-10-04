@@ -179,21 +179,46 @@ uint32_t esidx_name_rank(const esidx_t *db, eid_t id)
 
 static int et_grow(entry_table_t *et, uint32_t ncap)
 {
-    eid_t    *p = realloc(et->parent, ncap * sizeof(eid_t));
-    uint16_t *d = realloc(et->depth,  ncap * sizeof(uint16_t));
-    uint16_t *f = realloc(et->flags,  ncap * sizeof(uint16_t));
-    int64_t  *s = realloc(et->size,   ncap * sizeof(int64_t));
-    int64_t  *m = realloc(et->mtime,  ncap * sizeof(int64_t));
-    int64_t  *c = realloc(et->ctime,  ncap * sizeof(int64_t));
-    int64_t  *k = realloc(et->stamp,  ncap * sizeof(int64_t));
-    uint16_t *e = realloc(et->ext_id, ncap * sizeof(uint16_t));
-    strref_t *r = realloc(et->name,   ncap * sizeof(strref_t));
-    if (!p || !d || !f || !s || !m || !c || !k || !e || !r) return -1;
-    et->parent = p; et->depth = d; et->flags = f; et->size = s;
-    et->mtime = m;  et->ctime = c; et->stamp = k;
-    et->ext_id = e; et->name = r;
+    /* Each pointer is stored as soon as it is reallocated rather than at the end.
+     * The originals are all live, so a failure half way through would otherwise
+     * leave the table holding pointers that realloc has already freed -- and the
+     * caller has no way to tell, because the return value is the only signal. */
+    eid_t    *p = realloc(et->parent, ncap * sizeof(eid_t));      if (!p) return -1; et->parent = p;
+    uint16_t *d = realloc(et->depth,  ncap * sizeof(uint16_t));   if (!d) return -1; et->depth = d;
+    uint16_t *f = realloc(et->flags,  ncap * sizeof(uint16_t));   if (!f) return -1; et->flags = f;
+    int64_t  *s = realloc(et->size,   ncap * sizeof(int64_t));    if (!s) return -1; et->size = s;
+    int64_t  *m = realloc(et->mtime,  ncap * sizeof(int64_t));    if (!m) return -1; et->mtime = m;
+    int64_t  *c = realloc(et->ctime,  ncap * sizeof(int64_t));    if (!c) return -1; et->ctime = c;
+    int64_t  *k = realloc(et->stamp,  ncap * sizeof(int64_t));    if (!k) return -1; et->stamp = k;
+    uint16_t *e = realloc(et->ext_id, ncap * sizeof(uint16_t));   if (!e) return -1; et->ext_id = e;
+    strref_t *r = realloc(et->name,   ncap * sizeof(strref_t));   if (!r) return -1; et->name = r;
     et->cap = ncap;
     return 0;
+}
+
+/* The scan appends by doubling, so `cap` is the next power of two above the entry
+ * count: /work ends at 8 388 608 for 5 476 485 entries, 35 % of the columns'
+ * address space reserved for rows that do not exist. realloc never writes past
+ * `count`, so the slack costs nothing resident -- it is the ext-bitmap failure
+ * mode (design §5.4: 4.2 GB of address space, 213 MB of it resident) rather than
+ * a memory one, and it is what fails under a refused overcommit or a `ulimit -v`.
+ *
+ * Trimming once here rather than growing by less is the deliberate trade: a
+ * growth factor of 1.25 would copy the columns five times over the life of a
+ * build instead of twice, and the copy lands in esidx_add() -- 6.6 s of a 55.7 s
+ * /work walk -- on a path that is already the slowest non-syscall part of it.
+ * mremap shrinks a large block in place, so this costs a walk of the pages, not a
+ * copy of them, and it happens before finalize builds anything, which is why the
+ * transient peak does not move. */
+static void et_trim(entry_table_t *et)
+{
+    if (et->count == 0 || et->count >= et->cap) return;
+    uint64_t t0 = ts_us();
+    uint32_t was = et->cap;
+    if (et_grow(et, et->count) == 0)
+        TSDONE2("finalize: columns trimmed", t0, "%u -> %u rows of address space", was, et->count);
+    else
+        LOGW("finalize: cannot trim the columns to %u rows; the slack stays", et->count);
 }
 
 /* from the dir-tree section below */
@@ -1017,6 +1042,18 @@ int ext_index_build(ext_index_t *xi, const esidx_t *db)
     const entry_table_t *et = &db->et;
     if (et->count == 0) return 0;
 
+    /* The table is sized for the *extension* count, which the first loop below
+     * discovers -- not for the entry count. It used to be the entry count, and on
+     * /work that reserved 8 388 608 slots to hold 6 765 extensions (load factor
+     * 0.0008) and a second 32 MiB for `ids` malloc'd at the same capacity to hold
+     * 27 KB of them. Two passes cannot know n before the first one has run, so the
+     * table is filled at the provisional sizing and rehashed once the count is
+     * known; from then on the growth in ext_index_add() doubles it, which is
+     * correct because it grows with n and not with the table.
+     *
+     * The growth threshold is 3/4 load, so 2x the count is not just "some headroom":
+     * it is the smallest power of two that cannot reach the threshold before the
+     * next doubling. */
     uint32_t cap = 64;
     while (cap < et->count) cap <<= 1;
     uint32_t *tab = calloc(cap, sizeof(uint32_t));
@@ -1032,6 +1069,33 @@ int ext_index_build(ext_index_t *xi, const esidx_t *db)
         if (tab[h]) continue;
         tab[h] = n + 1;
         ids[n++] = e;
+    }
+
+    /* Rehash once, now that n is known: a 6 765-entry table does not need 32 MiB
+     * to look things up in, and the load factor the probe length depends on is
+     * the one the growth threshold assumes. */
+    uint32_t want = 64;
+    while (want < n * 2) want <<= 1;
+    if (want < cap) {
+        uint32_t *nt = calloc(want, sizeof(uint32_t));
+        if (!nt) { free(tab); free(ids); return -1; }
+        uint32_t nmask = want - 1;
+        for (uint32_t s = 0; s < n; s++) {
+            uint32_t h = (ids[s] * 2654435761u) & nmask;
+            while (nt[h]) h = (h + 1) & nmask;
+            nt[h] = s + 1;
+        }
+        free(tab);
+        tab = nt;
+        mask = nmask;
+        cap = want;
+    }
+    /* Same for `ids`, which outlives the build as xi->ids: it holds the interned
+     * ids in slot order and nothing appends to it here. */
+    if (n < cap) {
+        uint32_t *ni = realloc(ids, (n ? n : 1) * sizeof(uint32_t));
+        if (!ni) { free(tab); free(ids); return -1; }
+        ids = ni;
     }
 
     /* Three passes, where it used to be two: the structure of a slot depends on how many
@@ -1327,13 +1391,17 @@ static void di_hash_rehash(esidx_t *db, uint32_t ncap)
 
 static void di_hash_build(esidx_t *db)
 {
-    /* size table to ~2x entry count (dirs only) */
     uint32_t ndirs = 0;
     for (uint32_t i = 0; i < db->et.count; i++)
         if ((db->et.flags[i] & EF_DIR) && !(db->et.flags[i] & EF_DEAD)) ndirs++;
 
+    /* 2x the directory count, and the growth threshold in di_hash_insert() is 3/4
+     * load, so this is the smallest power of two that cannot reach it before the
+     * next doubling. It used to be 4x, which put /work at load factor 0.16 and 32
+     * MiB of address space for 5 MiB of table; the comment above this function
+     * said "2x entry count", which the code has never done. */
     uint32_t ncap = 1024;
-    while (ncap < ndirs * 4) ncap *= 2;
+    while (ncap < ndirs * 2) ncap *= 2;
     di_hash_rehash(db, ncap);
     if (!db->di.ht_off) return;
 
@@ -1399,6 +1467,9 @@ void esidx_finalize(esidx_t *db)
      * -- a bitset over every id, which is a real cost on a multi-million-entry tree --
      * was silently attributed to the directory hash below it. */
     uint64_t t_all = ts_us(), t0 = ts_us();
+    et_trim(&db->et);
+
+    t0 = ts_us();
     live_build(db);
     TSDONE("finalize: live set", t0);
 
