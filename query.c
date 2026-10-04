@@ -679,7 +679,13 @@ static const char *const type_names[] = {
 #define TYPE_N (sizeof(type_names) / sizeof(type_names[0]))
 
 /* Resolve a `;`- or space-separated extension list into interned ext ids. A
- * leading `*.` or `.` is accepted because both spellings occur in the wild. */
+ * leading `*.` or `.` is accepted because both spellings occur in the wild.
+ *
+ * `max` is a bound and not a policy: callers size the array with ext_ids_alloc(),
+ * which derives it from the term, so nothing is dropped here. The array used to be a
+ * uint16_t[256] on the stack and this loop simply stopped at 256 -- an `ext:` term
+ * naming more than 256 extensions answered with the first 256 of them and said
+ * nothing, which is a wrong subset rather than an error (AGENTS.md 5.3). */
 static uint32_t ext_list_ids(const esidx_t *db, const char *v, uint16_t *out, uint32_t max)
 {
     uint32_t n = 0;
@@ -706,6 +712,21 @@ static uint32_t ext_list_ids(const esidx_t *db, const char *v, uint16_t *out, ui
         p = e;
     }
     return n;
+}
+
+/* The ids one `ext:` term resolves to, in an array the caller must free. Sized by the
+ * term: a `;`/`,`/space-separated value holds at most one name per separator plus one,
+ * so the bound needs no pass of its own and is 2 bytes per name against a value the
+ * parser already bounds at 2 KB. Returns 0 with *out NULL only when the allocation
+ * failed, which the callers report rather than answer with a subset (AGENTS.md 6.1). */
+static uint32_t ext_ids_alloc(const esidx_t *db, const char *v, uint16_t **out)
+{
+    size_t bound = 1;
+    for (const char *p = v; *p; p++)
+        if (*p == ';' || *p == ',' || *p == ' ') bound++;
+    *out = malloc(bound * sizeof(uint16_t));
+    if (!*out) return 0;
+    return ext_list_ids(db, v, *out, (uint32_t)bound);
 }
 
 /* ------------------------------------------------------------- the matchers */
@@ -864,31 +885,39 @@ static int m_file(qctx_t *c, const ast_t *t, bitset_t *out)
 
 static int m_ext(qctx_t *c, const ast_t *t, bitset_t *out)
 {
-    uint16_t ids[256];
-    uint32_t n = ext_list_ids(c->db, t->val, ids, 256);
-    if (!n) { bs_clear(out); return 0; }
+    uint16_t *ids;
+    uint32_t n = ext_ids_alloc(c->db, t->val, &ids);
+    if (!ids) return -1;
+    if (!n) { free(ids); bs_clear(out); return 0; }
 
     bitset_t sel;
-    if (bs_alloc(c, &sel) != 0) return -1;
+    if (bs_alloc(c, &sel) != 0) { free(ids); return -1; }
     ext_index_select(&c->db->ext, ids, n, &sel);
     bs_and(out, &sel);
     bs_free(&sel);
+    free(ids);
     return 0;
 }
 
 static int m_macro(qctx_t *c, const ast_t *t, bitset_t *out, const char *const *exts)
 {
     (void)t;
-    uint16_t ids[256];
-    uint32_t n = 0;
-    for (size_t i = 0; exts[i] && n < 256; i++)
-        ids[n++] = ext_intern((esidx_t *)c->db, (char *)exts[i]);
-    if (!n) { bs_clear(out); return 0; }
+    /* Counted rather than bounded: these lists are compile-time constants, so the 256
+     * this replaced could not be reached -- but a cap that cannot be hit is still a
+     * number a reader has to check, and the count is the same three lines. */
+    size_t want = 0;
+    while (exts[want]) want++;
+    if (!want) { bs_clear(out); return 0; }
+    uint16_t *ids = malloc(want * sizeof(uint16_t));
+    if (!ids) return -1;
+    for (size_t i = 0; i < want; i++) ids[i] = ext_intern((esidx_t *)c->db, (char *)exts[i]);
+
     bitset_t sel;
-    if (bs_alloc(c, &sel) != 0) return -1;
-    ext_index_select(&c->db->ext, ids, n, &sel);
+    if (bs_alloc(c, &sel) != 0) { free(ids); return -1; }
+    ext_index_select(&c->db->ext, ids, (uint32_t)want, &sel);
     bs_and(out, &sel);
     bs_free(&sel);
+    free(ids);
     return 0;
 }
 
@@ -1377,27 +1406,36 @@ static uint32_t est_leaf(qctx_t *c, const ast_t *t)
             uint32_t acc = (t->list->kind == AST_AND) ? UINT32_MAX : 0;
             for (const ast_t *l = t->list->a; l; l = l->b) {
                 if (!l->val) continue;
-                uint16_t ids[256];
-                uint32_t k = ext_list_ids(c->db, l->val, ids, 256);
-                uint32_t sum = 0;
+                uint16_t *ids;
+                uint32_t k = ext_ids_alloc(c->db, l->val, &ids);
+                if (!ids) return c->n / 8;      /* cannot cost it; fall back to a guess */
+                uint32_t sum = 0, unknown = 0;
                 for (uint32_t i = 0; i < k; i++) {
                     uint32_t one = ext_index_count(&c->db->ext, ids[i]);
-                    if (one == UINT32_MAX) return UINT32_MAX;
+                    if (one == UINT32_MAX) unknown = 1;
                     sum += one;
                 }
+                free(ids);
+                if (unknown) return UINT32_MAX;
                 if (t->list->kind == AST_AND) { if (sum < acc) acc = sum; }
                 else acc += sum;
             }
             return acc;
         }
-        uint16_t ids[256];
-        uint32_t k = ext_list_ids(c->db, t->val, ids, 256);
-        uint32_t sum = 0;
+        /* Sized like m_ext() sizes it, so the estimate is over the ids the matcher
+         * will really union -- a 256-cap here and a larger one there would make the
+         * driver choice depend on which of the two the term happened to use. */
+        uint16_t *ids;
+        uint32_t k = ext_ids_alloc(c->db, t->val, &ids);
+        if (!ids) return c->n / 8;
+        uint32_t sum = 0, unknown = 0;
         for (uint32_t i = 0; i < k; i++) {
             uint32_t one = ext_index_count(&c->db->ext, ids[i]);
-            if (one == UINT32_MAX) return UINT32_MAX;   /* unknown ext -> give up */
+            if (one == UINT32_MAX) unknown = 1;
             sum += one;
         }
+        free(ids);
+        if (unknown) return UINT32_MAX;   /* unknown ext -> give up */
         return sum;
     }
     if (!strcmp(t->fn, "size") || !strcmp(t->fn, "dm") || !strcmp(t->fn, "dc")) {

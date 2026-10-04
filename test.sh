@@ -1244,6 +1244,16 @@ done
 q "ext:e999"
 expect "an extension nothing carries matches nothing" "$(n "$LAST")" "0"
 
+# All 400 in one term. This is where the 256-id cap the term used to carry showed up:
+# the list was resolved into a uint16_t[256] on the stack, so everything past the 256th
+# name was dropped without a word -- 767 rows where 1 200 were asked for, and no way for
+# a client to tell a subset from the answer. The counts above cannot see it: each of them
+# names one extension.
+EXTLIST=$(for i in $(seq 1 400); do printf 'e%s;' "$i"; done)
+q "ext:${EXTLIST%;}"
+expect "one ext: term naming all 400 of them is not truncated" \
+    "$(n "$LAST")" "$(find "$EXTF" -type f | wc -l)"
+
 # --------------------------------------------------------------- logging
 
 say "instrumentation"
