@@ -353,6 +353,7 @@ Record that in the commit message. Examples from this codebase:
 | the sort's folded-key arena was one realloc-doubling buffer, so every pointer already handed to an earlier row dangled | **`-O2` hid it and the DEBUG build caught it** — the freed block still holds its bytes, so the order assertions passed at `-O2` and failed under ASan (§3.1). Fixed by never moving a block. Worth recording as a rule: an arena that hands out pointers must not grow by `realloc`, because the caller has already stored the old addresses |
 | `sort:attributes:` and `sort:inverse_size:` on the CLI silently sorted by **name** | `main.c` carried its own list of sort keys beside the 22-name table the ETP path uses, and the two drifted. The ETP wire was always right, so `test_etp.sh` could not see it; and a name sort and an attribute sort return the same *rows*, so a row count could not either. What found it was a measurement that made no sense — a numeric key 2.4x faster than the same key with an integer compare. The CLI now goes through `sort_from_etp_name()` and **refuses** an unknown key |
 | `sort -f` is not a case-insensitive byte order, and neither is `tr A-Z a-z \| sort` | GNU sort folds for *equality* but orders by the original bytes; under `LC_ALL=C` it compares bytes **signed** while `strcasecmp` compares unsigned, so any byte >= 0x80 lands in the other half of the order. Both agree with `strcasecmp` on a lower-case fixture, so an assertion written against them passes for the wrong reason — which is how a `sort -f` oracle survived a commit. The oracle is `tools/order_ref.c`, which *is* `strcasecmp` |
+| a name sort ordered two names that differ only in case by their raw bytes, not by id | the ranked path never copies the display name into the arena — that is what the rank is for — so `dn` stayed a pointer to the **unfolded** name and `cmp_folded` `memcmp`-ed the bytes as stored, which is not `strcasecmp`. Every order fixture had distinct names, so the tie-break was unreachable, and the no-rank fallback (which *does* fold `dn`) silently disagreed with the ordinary path about the same rows. A bug in one level of a multi-level sort is invisible until a fixture reaches that level — and `order-ref -c` cannot express it either, since it sorts the file it is given, so the case assertion compares against `find(1)`'s order (the id order) with `cmp` |
 
 ### 3.5 A test that cannot fail is worse than no test
 
@@ -429,7 +430,10 @@ Do not re-litigate these; they were measured and the conclusions are recorded:
     1.14×) — there it is amortised over ~17 comparisons per row.
   - `path` is **9 % slower** and recorded as such; both alternatives measured worse.
   - The comparison count is unchanged, so §6.2 step 4 (TopK) is not the lever here.
-    What would be is a rank per *numeric* column, which is not built.
+    What was, and is built: the **tie-break reads the name rank too**, so the four
+    numeric keys stop reaching a string at all — 1.61–2.58× on `r7000`, at 10.3 ns
+    per comparison against the 9.9 ns floor a name sort already had (design §10).
+    `extension` is the one left, because its *primary* key is a string.
 - **The in-memory text scan is no longer the remaining cost, but it is still a cost
   on paths.** `path:` has no index yet; `path_of()` is O(depth) per call (§12 risk
   7), which is what the path half of §5.2 would fix. Measured first: a prefilter can

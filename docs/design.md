@@ -834,9 +834,8 @@ Four things this settles, and one it does not:
   never reaches that tie-break, which makes the `strrchr` pure overhead.
 - **The comparison count is the same in all three builds** (5.9–6.4 M), so every
   number above is a per-comparison improvement and none of it is TopK. §6.2 step 4
-  would attack the *count*; the count was never the problem. What would attack it —
-  and has not been built — is a rank per numeric column, which would make the four
-  integer keys integer-only too.
+  would attack the *count*; the count was never the problem. What attacks it is the
+  *cost* of a comparison, and the next subsection is what that cost was made of.
 
 **What it costs.** `finalize: name rank: 75 ms` (179 786 distinct names of 372 084),
 paid again on every load: 276.6 ms → 352.7 ms. Memory ~1.4 MB of rank plus ~8 MB of
@@ -844,6 +843,84 @@ folded names. Nothing is persisted (D4). A *name* sort is what the ETP client as
 for by default — `SORT name_ascending` is in the trace in AGENTS.md §1.4 — so the
 trade is 75 ms of startup for 97 ms on every name-sorted query, which breaks even on
 a single page of an unfiltered search.
+
+#### The tie-break was the rest of it: a rank per comparison, not per column
+
+The table above reads as though the only key a rank could help is `name`. It helps
+every key, because a rank is not a per-column structure — it is a per-*comparison*
+one, and `cmp_rec` reaches the display-name tie-break on nearly every comparison of
+a non-name key. Over an unfiltered `/usr`, a `size` or `date_modified` sort lands
+there constantly: a whole directory shares one size and a whole minute shares one
+mtime, so after the integer compare ties, the ~7 ns that follows is `cmp_folded` over
+two ~20-byte folded names, and it is amortised over ~17 comparisons per row.
+
+So the tie-break reads `name_rank` too, which is the same order by construction: the
+rank is dense over sorted position, and two names `strcasecmp` calls equal share a
+rank and therefore still fall through to the id. Nothing was added to build — the
+rank already existed — and no row needs a folded name any more, so the numeric keys
+stop copying 372 084 names into an arena per query as well.
+
+| `./sortcmp.sh -n 3`, unfiltered `/usr` = 372 084 rows, `r7000`, `-O2` | base `abd1584` | tie-break by rank | gain | ns/comparison base → after |
+|---|---|---|---|---|
+| `name:ascending` | 73.1 ms | **63.3 ms** | 1.15× | 11.4 → **9.9** |
+| `name:descending` | 71.8 ms | **62.3 ms** | 1.15× | 11.3 → **9.8** |
+| `attributes:ascending` | 182.5 ms | **70.7 ms** | **2.58×** | 28.6 → **11.1** |
+| `date_created:descending` | 137.8 ms | **64.0 ms** | 2.15× | 22.1 → **10.3** |
+| `date_modified:descending` | 136.6 ms | **64.5 ms** | 2.12× | 21.8 → **10.3** |
+| `extension:ascending` | 210.0 ms | **120.6 ms** | 1.74× | 33.1 → **19.0** |
+| `size:descending` | 123.8 ms | **76.7 ms** | 1.61× | 19.5 → **12.1** |
+| `path:ascending` | 157.2 ms | **154.8 ms** | 1.02× | 26.7 → **26.2** |
+| `path:descending` | 158.4 ms | **155.4 ms** | 1.02× | 27.0 → **26.5** |
+
+Both columns are from one interleaved run, which is the only way they are comparable.
+The absolute numbers are ~20 % below the table above for the same keys and the same
+comparison counts to the digit — a quieter or differently-clocked `r7000` than the run
+that produced it — so the *gains* are what this subsection claims and the absolute
+milliseconds are not a new baseline.
+
+Three things it settles:
+
+- **The four integer keys are now integer all the way down**, at 10.3–12.1 ns against
+  the 9.9 ns floor a name sort already had. There is nothing left to win by making a
+  numeric compare cheaper: what remains is `qsort`'s own memory traffic, and §6.2
+  step 4 (TopK), which attacks the *count* — still untouched at 5.9–6.4 M.
+- **`extension` is the one key a name rank does not finish.** Its *primary* key is a
+  string, so 19.0 ns is a string compare over ~6 bytes plus the per-row extraction of
+  the extension; the tie-break below it is already an integer. An extension rank would
+  finish it, from the slot table `ext_index` already keeps — ~40 lines, and the last
+  per-comparison win this shape of fix can give.
+- **`path` did not move, and the `strrchr` is gone anyway.** The tie-break no longer
+  reads a string, so the per-row `strrchr` that produced `dn` is not computed at all —
+  1.02× is that, plus noise. The remaining 26 ns is `strcasecmp` over ~70-byte paths,
+  which is the primary key and inherent to it.
+
+**What it cost:** nothing to build. `finalize` is unchanged (name rank 83.1 ms base,
+74.1 ms after — run-to-run spread, not an effect), `load` 359.9 → 338.8 ms for the same
+reason, and no new memory: `srec_t` grew a `uint32_t` into the padding the `eid_t`
+left, so a row is still 32 bytes.
+
+#### A name sort's tie-break was comparing raw bytes
+
+Found by making the tie-break an integer compare and asking what it had been doing.
+
+On the ranked path a name sort never copied the display name into the arena — that is
+the whole point of the rank — so `dn` was left as a pointer to the *unfolded* name,
+and the tie-break ran `cmp_folded()` over it: `memcmp` on the bytes as stored. For two
+names that `strcasecmp` calls equal that is a different rule from the one every other
+key applies. On a fixture of `Foo`/`foo`/`FOO`/`fOo`:
+
+| `sort:name:ascending`, four case-variants of one name | order |
+|---|---|
+| before | `FOO, Foo, fOo, foo` — raw byte order |
+| after | id order — they tie, as `strcasecmp` says they do |
+
+The no-rank fallback path folds `dn` like every other key, so the ordinary path and the
+fallback disagreed about the same four rows, and the documented order — `strcasecmp`,
+then the id (D3) — was neither. Nothing caught it because every order fixture had
+distinct names, so the tie-break was unreachable: a bug in one level of a multi-level
+sort is invisible until a fixture reaches that level. The assertions added for it also
+check that the fixture *can* discriminate — `find(1)` must not already list the four in
+raw byte order, or the assertion is vacuous and says so.
 
 ---
 

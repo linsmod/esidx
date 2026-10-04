@@ -235,6 +235,16 @@ mkdir -p "$SORT/a_dir" "$SORT/zdir"
 # told apart.
 UNAME=$'\u00dcnicode.txt'
 : >"$SORT/Apple.txt"; : >"$SORT/banana.txt"; : >"$SORT/Cherry.txt"; : >"$SORT/$UNAME"
+
+# One mtime for every row in this fixture. It is what lets the date sort below be a
+# pure tie-break assertion: without it a date sort is ordered by when the shell got
+# round to creating each file, which is not a property of the code. `touch -d @`
+# rather than "they were all just created", because 5000 files can straddle a second
+# boundary on a loaded machine and an assertion that depends on that is a coin flip.
+# ctime cannot be pinned this way at all -- it is inode-change time -- which is why
+# date_created is absent from this group and not because it behaves differently.
+find "$SORT" -exec touch -d @1600000000 {} +
+
 SORT_DB="$TMP/sortbig.idx"
 build "$SORT" "$SORT_DB" >/dev/null
 
@@ -318,6 +328,106 @@ if ./order-ref -c "$TMP/nm.rev" "$TMP/nm.want" >"$TMP/ord.msg" 2>&1; then
 else
     bad "sort:name:desc is the exact reverse of ascending" "$(cat "$TMP/ord.msg")"
 fi
+
+# Every sort that is not a name sort ends in the same place: cmp_rec's display-name
+# tie-break. It orders the rows the primary key cannot separate, and on a real tree
+# that is most of them -- over an unfiltered /usr a whole directory shares one size
+# and a whole minute shares one mtime, so the four numeric keys land in it on nearly
+# every comparison (design §10). It is part of the order contract, so it is pinned.
+#
+# Each case is built so the *primary* key is constant on every row, which makes the
+# tie-break the entire order and lets find(1) supply the expectation (AGENTS.md 3.2):
+# every file in $SORT is 0 bytes, every row's mtime was pinned above, and the
+# extension case drops the only files that have one. A case with a varying primary
+# would want a two-column oracle, and the column under test here is the constant one.
+find "$SORT" -type f         | awk -F/ '{print $NF}' >"$TMP/tb_files.want"
+find "$SORT" ! -name '*.txt' | awk -F/ '{print $NF}' >"$TMP/tb_noext.want"
+
+# tie_ok <label> <sort key> <want> <terms...>: nothing but the tie-break decides the
+# order, so order_ref over the same set of names is the expectation.
+tie_ok() {
+    _tl=$1; _tk=$2; _tw=$3; shift 3
+    q "$@" "sort:$_tk" "count:0"
+    printf '%s\n' "$LAST" | awk -F/ '{print $NF}' >"$TMP/tb.got"
+    if ./order-ref -c "$TMP/tb.got" "$_tw" >"$TMP/ord.msg" 2>&1; then
+        ok "$_tl"
+    else
+        bad "$_tl" "$(cat "$TMP/ord.msg")"
+    fi
+}
+
+DB="$SORT_DB"      # every case below reads $SORT_DB; the name assertions above named
+                   # it explicitly because they run with DB pointing at $TREE_DB
+tie_ok "a size sort breaks its ties on the display name" \
+       size:ascending "$TMP/tb_files.want" file:
+tie_ok "an attribute sort breaks its ties on the display name" \
+       attributes:ascending "$TMP/tb_files.want" file:
+tie_ok "an extension sort breaks its ties on the display name" \
+       ext:ascending "$TMP/tb_noext.want" '!ext:txt'
+tie_ok "a date_modified sort breaks its ties on the display name" \
+       date_modified:ascending "$TMP/nm.want"
+
+# ...and through the other direction, which is a different line of cmp_rec. Expectation
+# is the reverse of the *ascending answer*, compared byte for byte rather than through
+# order-ref: -c sorts the file it is given, so it cannot express "descending" at all.
+q "file:" "sort:size:ascending" "count:0"
+printf '%s\n' "$LAST" | awk -F/ '{print $NF}' >"$TMP/tb_asc.got"
+tac "$TMP/tb_asc.got" >"$TMP/tb_asc.rev"
+q "file:" "sort:size:descending" "count:0"
+printf '%s\n' "$LAST" | awk -F/ '{print $NF}' >"$TMP/tb.got"
+if cmp -s "$TMP/tb.got" "$TMP/tb_asc.rev"; then
+    ok "sort:size:descending is the exact reverse of ascending, tie-break included"
+else
+    bad "sort:size:descending is the exact reverse of ascending, tie-break included" \
+        "$(cmp "$TMP/tb.got" "$TMP/tb_asc.rev" 2>&1 | head -3)"
+fi
+
+# Four names that strcasecmp calls equal, which is the case the tie-break exists for.
+#
+# This was a real order bug, not a hypothetical one. A name sort compares ranks, so it
+# reaches the tie-break on exactly these rows -- and the tie-break was reading the
+# *unfolded* display name, because the ranked path skipped the copy that every other
+# key folds into the arena. memcmp over those raw bytes is not strcasecmp, so
+# "README" and "readme" came out in byte order instead of tying and falling to the id,
+# and the no-rank fallback path (which folds `dn` like every other key) disagreed with
+# the ordinary one about the same four rows.
+#
+# Nothing caught it because every order fixture had distinct names, so the tie-break
+# was unreachable, and a bug in a level of a multi-level sort is invisible until a
+# fixture reaches it.
+#
+# The expectation is id order, read through find(1): the scanner hands out ids in
+# getdents order and find lists the same directory in the same order. That is the only
+# place the id is observable from outside the process.
+CASE="$TMP/case"
+mkdir -p "$CASE"
+: >"$CASE/Foo"; : >"$CASE/foo"; : >"$CASE/FOO"; : >"$CASE/fOo"
+CASE_DB="$TMP/case.idx"
+build "$CASE" "$CASE_DB" >/dev/null
+find "$CASE" -mindepth 1 -maxdepth 1 | awk -F/ '{print $NF}' \
+    | grep -E '^[Ff][Oo][Oo]$' >"$TMP/ids.want"
+"$BIN" query "$CASE_DB" "" "sort:name:ascending" "count:0" 2>/dev/null \
+    | awk -F/ '{print $NF}' | grep -E '^[Ff][Oo][Oo]$' >"$TMP/nmcase.got"
+if cmp -s "$TMP/nmcase.got" "$TMP/ids.want"; then
+    ok "names differing only in case tie, and the id decides"
+else
+    bad "names differing only in case tie, and the id decides" \
+        "$(cmp "$TMP/nmcase.got" "$TMP/ids.want" 2>&1 | head -3)"
+fi
+
+# ...and the fixture is only worth anything if the two rules actually disagree on it.
+# When the filesystem happens to hand these four out in raw byte order the assertion
+# above cannot fail, so that is checked rather than assumed -- a guard that silently
+# stops guarding is worse than no assertion (AGENTS.md 3.5). LC_ALL=C sort *is* the old
+# rule: strcmp semantics on the bytes as stored, which is what cmp_folded() saw.
+LC_ALL=C sort "$TMP/ids.want" >"$TMP/bytes.want"
+if cmp -s "$TMP/ids.want" "$TMP/bytes.want"; then
+    bad "the case fixture separates byte order from id order" \
+        "find(1) lists these four in raw byte order, so the assertion above is vacuous"
+else
+    ok "the case fixture separates byte order from id order"
+fi
+DB="$TREE_DB"
 
 
 say "offset / count"

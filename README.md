@@ -237,11 +237,16 @@ single thread, `/usr` = **372 084 entries**. Reproduce with `./round.sh /usr` th
 
 | Query | Candidates | eval | total |
 |---|---|---|---|
-| `parent:"/usr" folder:` — browse | 16 | 0.04 ms | 0.22 ms |
-| `ext:conf` — search | 1 206 | 0.06 ms | 1.1 ms |
-| `conf` — a bare word, the client's default | 372 084 → **8 625** | 6.5 ms | 12.0 ms |
-| `path:/usr *.conf size:>1k` | 233 021 → **908** | 33.9 ms | 35.3 ms |
-| `image:` — category | 55 229 | 1.1 ms | 55.7 ms |
+| `parent:"/usr" folder:` — browse | 16 | 0.04 ms | 0.39 ms |
+| `ext:conf` — search | 1 206 | 0.10 ms | 0.73 ms |
+| `conf` — a bare word, the client's default | 372 084 → **8 484** | 2.7 ms | 3.8 ms |
+| `path:/usr *.conf size:>1k` | 233 021 → **466** | 41.3 ms | 43.1 ms |
+| `image:` — category | 55 229 | 0.71 ms | 21.6 ms |
+
+One run of `./round.sh /usr` on `r7000`, so the counts are that host's `/usr` as it
+stands: they move as packages come and go, and a count that differs from an older
+table is the tree, not the code — `esidx`'s own candidate counts are cross-checked
+against `find(1)` in `test.sh`.
 
 The two arrows are the name trigram index (`trigram.c`, design §5.2): a *filter*,
 not a decision — the trigram set of a pattern's longest literal run is a necessary
@@ -249,9 +254,13 @@ condition for a match, so intersecting the candidate set can only drop rows the
 matcher was going to reject. It costs +90 ms of `finalize` (paid again at load and
 at compaction, never on the query path) and ~20 MB.
 
-`image:` is now the largest cost on a real tree and ~53 of its 55.7 ms is the sort
-over 55 229 rows — design §6.2's TopK, still not built. A `path:` term is still a
-full scan; that is the unbuilt path half of §5.2.
+The largest cost on a real tree is now the wildcard scan: `path:/usr *.conf size:>1k`
+spends 41 of its 43 ms in `eval` over 233 021 candidates, which is the in-memory text
+scan of design §5.2 and the reason the *path* half of that section is worth building.
+`image:` is second, and 20.4 of its 21.6 ms is the sort over 55 229 rows — the client's
+default `name_ascending`, an integer compare on the rank `finalize` builds. Design
+§6.2's TopK is still not built; what it would attack is the comparison *count*, which
+none of the sort work has touched.
 
 Staying current costs this, measured on the same tree:
 

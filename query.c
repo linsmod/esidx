@@ -1592,17 +1592,23 @@ static void apply_filter(qctx_t *c, bitset_t *set)
 
 /* ------------------------------------------------------------------ sorting */
 
-/* One row of the sort. Both strings are ASCII-folded already (design §10, and the
- * note on ascii_fold below): `s` is the primary key, `dn` is the display name the
- * tie-break reads. Folding once per row here is the whole point -- a sort performs
+/* One row of the sort. `s` is the primary key, ASCII-folded unless the key is numeric
+ * or a path (see fa_put_x), and `dn` is the display name the tie-break falls back on.
+ * `nrank` is that same name's rank, which is what the tie-break reads when the index
+ * has one -- so the two fields are alternatives, not a pair.
+ *
+ * Folding once per row here is what lets the comparator use memcmp: a sort performs
  * ~log2(n) comparisons per row, so paying the fold once and memcmp-ing many times is
- * the difference between 169 ms and rather less.
+ * the difference between 169 ms and rather less. The rank is better still, because it
+ * removes the comparison instead of making it cheaper.
  *
  * `dn` is not a second copy where it can be a pointer into the first: for a name sort
  * it is `s`, and for a path sort it is the tail of `s` after the last separator. Only
- * the extension and numeric keys need a copy of their own. */
+ * the extension and numeric keys need a copy of their own -- and only when the rank is
+ * missing, which is the fallback path rather than the ordinary one. */
 typedef struct {
     eid_t       id;
+    uint32_t    nrank;
     int64_t     num;
     const char *s;
     const char *dn;
@@ -1618,6 +1624,7 @@ typedef struct {
     size_t         pathcap;
     uint64_t       ncmp;      /* comparisons performed, for the sort breakdown */
     int            ranked;    /* SORT_NAME reads name_rank, so `num` holds the rank */
+    int            tie_rank;  /* the tie-break compares nrank instead of `dn` */
 } sort_ctx_t;
 
 /* Everything sorts a name case-insensitively, and the sort was 6 M `strcasecmp`
@@ -1816,13 +1823,23 @@ static bool sort_key_is_path(sort_key_t k)
  * makes the order total, so two runs of the same query always cut their pages at
  * the same boundary (ref D3).
  *
- * Three comparators, one per kind of key, and all three produce strcasecmp's order:
+ * Three comparators for the primary key, and all three produce strcasecmp's order:
  *
  *   name + rank   an integer compare. Equal names share a rank on purpose, so they
  *                 fall through to the name tie-break and then the id exactly as they
  *                 did when the name itself was compared (design §10).
  *   path          strcasecmp, because the path is not folded (fa_put_x).
  *   everything    memcmp over names folded once per row on the way in.
+ *
+ * The tie-break is an integer compare too, on the display name's rank, which is the
+ * same order by construction: the rank is dense over sorted position, and two names
+ * that strcasecmp calls equal share a rank and so fall through to the id. It is worth
+ * as much as the primary key on the four numeric keys, which is where the comparisons
+ * actually go -- measured over an unfiltered /usr, they spent 19.5-28.6 ns per
+ * comparison with a string tie-break and 10.3-12.1 ns with an integer one, against the
+ * 9.9 ns floor a name sort already had (design §10, ./sortcmp.sh). The fallback is
+ * there because the rank is built, and a build that could not allocate one has to
+ * answer correctly anyway.
  *
  * The order is the contract, not an implementation detail: a client pages by OFFSET
  * and cmp_ref.sh compares ordered result sets, so a different order is a different
@@ -1844,9 +1861,13 @@ static int cmp_rec(const void *pa, const void *pb, void *arg)
     } else {
         r = cmp_folded(a->s, b->s);
     }
-    if (r == 0)
-        r = sort_key_is_path(sc->key) ? strcasecmp(a->dn, b->dn)
-                                      : cmp_folded(a->dn, b->dn);
+    if (r == 0) {
+        if (sc->tie_rank)
+            r = (a->nrank < b->nrank) ? -1 : (a->nrank > b->nrank);
+        else
+            r = sort_key_is_path(sc->key) ? strcasecmp(a->dn, b->dn)
+                                          : cmp_folded(a->dn, b->dn);
+    }
     if (r == 0) r = (a->id < b->id) ? -1 : (a->id > b->id);
     return sc->desc ? -r : r;
 }
@@ -2010,22 +2031,23 @@ int qexec(const esidx_t *db, const ast_t *ast_in, const match_opts_t *mo,
 
     /* Extract and fold, once per row. `dn` is a pointer into `s` wherever the key
      * already contains the name, so only the extension and numeric keys pay for a
-     * second copy -- and a name sort pays for neither, because the rank is already
-     * in the index. */
+     * second copy -- and nothing pays for one at all while the rank exists, because
+     * the tie-break is an integer compare then and never reads a string. A name sort
+     * pays for neither copy: the rank is already in the index. */
     const int numeric = sort_key_is_numeric(sc.key);
     const bool key_is_path = sort_key_is_path(sc.key);
     sc.ranked = (sc.key == SORT_NAME && db->name_rank != NULL);
+    sc.tie_rank = (db->name_rank != NULL);
     uint64_t t_key0 = ts_us();
     uint32_t ri = 0;
     for (uint32_t i = bs_next(&set, 0); i < c.n; i = bs_next(&set, i + 1)) {
         const char *name = display_name_of(db, i);
         rows[ri].id = i;
-        rows[ri].dn = name;
         rows[ri].s  = "";
-        if (sc.ranked) {
-            rows[ri].num = (int64_t)esidx_name_rank(db, i);
-        } else {
-            rows[ri].num = sort_number(&sc, i);
+        rows[ri].dn = "";
+        rows[ri].nrank = sc.tie_rank ? esidx_name_rank(db, i) : 0;
+        rows[ri].num = sc.ranked ? (int64_t)rows[ri].nrank : sort_number(&sc, i);
+        if (!sc.ranked) {
             if (key_is_path) {
                 /* A path gets its own exact-sized copy and nothing else: no arena, no
                  * fold. Both were tried and both measured worse over an unfiltered
@@ -2039,13 +2061,13 @@ int qexec(const esidx_t *db, const ast_t *ast_in, const match_opts_t *mo,
                 size_t n = strlen(key) + 1;
                 char *own = malloc(n);
                 if (own) { memcpy(own, key, n); rows[ri].s = own; }
-                const char *tail = strrchr(rows[ri].s, '/');
-                rows[ri].dn = tail ? tail + 1 : rows[ri].s;
-            } else if (!numeric) {
-                rows[ri].s = fa_put(&fa, sort_string(&sc, i));
-                rows[ri].dn = fa_put(&fa, name);
+                if (!sc.tie_rank) {
+                    const char *tail = strrchr(rows[ri].s, '/');
+                    rows[ri].dn = tail ? tail + 1 : rows[ri].s;
+                }
             } else {
-                rows[ri].dn = fa_put(&fa, name);
+                if (!numeric) rows[ri].s = fa_put(&fa, sort_string(&sc, i));
+                if (!sc.tie_rank) rows[ri].dn = fa_put(&fa, name);
             }
         }
         ri++;
