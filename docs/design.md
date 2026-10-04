@@ -209,6 +209,16 @@ version-2 snapshot would load without complaint and then resolve extensions to t
 wrong strings; the version check is the only thing separating the two, which is what
 it is for.
 
+Extensions are **not truncated**: an extension is a suffix of a name, so `NAME_MAX`
+bounds it, and the one constant that says so (`EXT_NAME_MAX`) is shared by the writer
+and the reader of a query's extension list. They kept 31 and 63 characters
+respectively, which is worse than lossy — `ext:` for a real extension matched nothing,
+and two extensions sharing their first 31 characters matched each other's rows. Real
+trees hit it: `/usr` has one entry with a 34-character extension, `/work` has 709, and
+the longest on `/work` is 74 characters. Before the fix the index held 6 508 distinct
+extensions; it holds 6 765, because names that used to be merged by the cut are
+separate extensions and 249 of them are singletons.
+
 ### 4.3 Sparse metadata table
 
 Media metadata and content-index offsets live in a K/V table keyed by

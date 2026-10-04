@@ -433,6 +433,13 @@ const char *display_name_of(const esidx_t *db, eid_t id);
  * than the pool, because an id is dense and an offset is 32-bit (see esidx_t). */
 const char *ext_of_str(const esidx_t *db, eid_t id);
 const char *ext_str(const esidx_t *db, uint16_t ext_id);
+
+/* Longest extension this codebase will hold, NUL included: NAME_MAX is 255 on ext4 and
+ * an extension is a suffix of a name, so nothing real reaches it. One constant because
+ * the writer and the reader of a query's extension list have to agree on where a name
+ * ends -- they kept 31 and 63 respectively, so `ext:` could not match what the index
+ * held (store.c's ext_of, query.c's ext_list_ids). */
+#define EXT_NAME_MAX 256
 /* full path of the directory containing `id` -- dirname(path_of()), so it is defined
  * for the root too (the directory above it), and empty only when the path has no
  * separator in it at all */

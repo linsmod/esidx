@@ -241,24 +241,22 @@ const char *ext_str(const esidx_t *db, uint16_t ext_id)
     return sp_get(&db->exts, db->ext_off[ext_id - 1]);
 }
 
-/* Extensions longer than EXT_MAX are cut to it, which loses the tail: two extensions
- * sharing their first EXT_MAX characters become one id, so `ext:` matches both, and a
- * query for the real one matches neither (the query side keeps 63, so the two ends do
- * not even agree on where to cut). ext_list_ids() caps at 63.
+/* An extension is the text after the last dot of a name, so its length is bounded by
+ * NAME_MAX -- 255 on ext4, and there is nothing above that to allow for. The bound here is
+ * that plus the NUL, and it is shared with ext_list_ids() so the two ends cannot disagree
+ * about where a name ends: they used to (31 here, 63 there), which is how a query for a
+ * real extension matched nothing at all.
  *
- * Nothing counts how often that happens, so nothing knows whether it is a curiosity or
- * a live answer being wrong. Counted here, at the one place the cut happens, and printed
- * by log_ext_lengths() -- which is also why the pool's own histogram cannot answer the
- * question: a cut string is already cut by the time it is in the pool, so the 32+ bucket
- * is empty by construction rather than by evidence. */
-#define EXT_MAX 32
-static uint64_t g_ext_truncated;      /* entries whose extension was cut to EXT_MAX-1 */
+ * A cut is still bounded rather than trusted, because a caller with a longer string must
+ * not overflow the buffer -- but it is unreachable from a filename, so the counter behind
+ * it is a guard and not a statistic. */
+static uint64_t g_ext_truncated;      /* entries whose extension did not fit */
 
 static uint16_t ext_of(esidx_t *db, const char *name)
 {
     const char *dot = strrchr(name, '.');
     if (!dot || dot[1] == '\0' || dot == name) return 0;
-    char buf[EXT_MAX];
+    char buf[EXT_NAME_MAX];
     size_t n = strlen(dot + 1);
     if (n >= sizeof(buf)) { n = sizeof(buf) - 1; g_ext_truncated++; }
     for (size_t i = 0; i < n; i++) buf[i] = (char)tolower((unsigned char)dot[1 + i]);
@@ -949,11 +947,14 @@ static void log_ext_lengths(const esidx_t *db, uint32_t ext_in_use)
          n, (unsigned long long)longest, n ? (double)total / (double)n : 0.0,
          (unsigned long long)db->exts.len,
          bn[0], bn[1], bn[2], bn[3], bn[4], bn[5], bn[6]);
-    /* Only entries added by this process are counted, so on a load this reads 0 -- the
-     * pool was written by whoever built the snapshot, and the tail it lost is gone. */
-    LOGI("ext lengths: %llu entries had an extension cut to %d characters by ext_of()"
-         " | 0 here on a load: the cut already happened when the snapshot was written",
-         (unsigned long long)g_ext_truncated, EXT_MAX - 1);
+    /* A cut is meant to be unreachable -- EXT_NAME_MAX is NAME_MAX -- so this is a
+     * warning rather than a statistic, and it says so by being silent when it is zero.
+     * At INFO it was invisible without -v 3, which is how the assertion for it in
+     * test.sh passed on a fixture that *was* being cut (AGENTS.md 3.5). */
+    if (g_ext_truncated)
+        LOGW("ext lengths: %llu entries had an extension too long for %d characters and"
+             " were cut -- the index is lossy, ext: will not match the real name",
+             (unsigned long long)g_ext_truncated, EXT_NAME_MAX - 1);
 
     /* Every string in the pool was interned by some entry, and ids are dense over that
      * pool -- so at build time the two counts must be equal, and when they are not, some

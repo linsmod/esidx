@@ -190,6 +190,47 @@ else
         "$extbad of 40 wrong, first: $extfirst"
 fi
 
+# An extension used to be cut to 31 characters on the way into the index, which loses
+# the tail: a query for the real extension matched nothing, and two extensions sharing
+# their first 31 characters became one id and matched each other's rows. Counted on
+# real trees by the build (1 entry on /usr, 709 on /work -- a 34-character extension
+# under /usr/lib), so it is not a fixture artefact.
+#
+# The two cases below are the two wrong answers, and they are separate: the first is a
+# miss, the second is a false hit. 31 characters is comfortably inside NAME_MAX, which is
+# why the cut was never supposed to be reachable.
+EXTL="$TMP/extlong"
+mkdir -p "$EXTL"
+P31=$(printf 'a%.0s' $(seq 1 31))
+: >"$EXTL/one.${P31}TAILONE"
+: >"$EXTL/two.${P31}TAILTWO"
+: >"$EXTL/short.txt"
+EXTL_DB="$TMP/extlong.idx"
+build "$EXTL" "$EXTL_DB" >/dev/null
+
+DB="$EXTL_DB"
+q "ext:${P31}TAILONE" "count:0"
+expect "an extension longer than 31 characters is found by its full name" \
+       "$(paths "$LAST")" "$EXTL/one.${P31}TAILONE "
+q "ext:${P31}TAILTWO" "count:0"
+expect "...and the other one, which shares its first 31 characters, stays separate" \
+       "$(paths "$LAST")" "$EXTL/two.${P31}TAILTWO "
+q "ext:$P31" "count:0"
+expect "a 31-character prefix of them is not an extension of anything" \
+       "$(n "$LAST")" "0"
+DB="$TREE_DB"
+
+# ...and the build must report no cut at all, which is the invariant rather than one
+# example of it: the counter is in ext_of(), so it reads 0 or the index is lossy. It is a
+# warning, not an INFO line, so it is visible here without ESIDX_LOG -- an INFO version of
+# this assertion passed on a fixture that was being cut, which is AGENTS.md 3.5 exactly.
+if grep -q 'the index is lossy' "$TMP/be"; then
+    bad "no extension is cut on the way into the index" \
+        "$(grep -m1 'the index is lossy' "$TMP/be" | sed 's/^\[[a-z]* \] //')"
+else
+    ok "no extension is cut on the way into the index"
+fi
+
 say "size filter (sorted index -> bitmap)"
 
 # NOTE: size: also matches folders -- on ext4 a directory's st_size is typically

@@ -695,7 +695,9 @@ static uint32_t ext_list_ids(const esidx_t *db, const char *v, uint16_t *out, ui
         else if (l >= 1 && src[0] == '.')          { src += 1; l -= 1; }
         else if (l == 1 && src[0] == '*')          { src += 1; l = 0; }
         if (l) {
-            char buf[64];
+            /* EXT_NAME_MAX, and it used to be 64 here against 31 in ext_of(): a query
+             * could name an extension the index was incapable of holding. */
+            char buf[EXT_NAME_MAX];
             if (l >= sizeof(buf)) l = sizeof(buf) - 1;
             for (size_t i = 0; i < l; i++) buf[i] = (char)tolower((unsigned char)src[i]);
             buf[l] = '\0';
