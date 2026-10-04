@@ -475,6 +475,9 @@ uint32_t   esidx_win_attributes(const esidx_t *db, eid_t id);
 /* scan counters (zero after esidx_init, filled by esidx_scan) */
 const scan_stats_t *esidx_scan_stats(const esidx_t *db);
 void esidx_log_stats(const esidx_t *db, const char *phase);
+/* Per-structure memory ledger, allocated-vs-used. Called by esidx_log_stats, so
+ * every phase that reports the index reports its footprint with it. */
+void esidx_log_mem(const esidx_t *db, const char *phase);
 
 /* ----------------------------------------------------------------- query */
 

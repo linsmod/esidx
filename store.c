@@ -1489,6 +1489,204 @@ void esidx_log_stats(const esidx_t *db, const char *phase)
     uint64_t hwm = vm_hwm_kb();
     if (hwm)
         LOGI("%s: peak rss %.0f MiB", phase, (double)hwm / 1024.0);
+    esidx_log_mem(db, phase);
+}
+
+/* Per-structure memory ledger.
+ *
+ * Written because "the index uses too much memory" is not an actionable statement:
+ * every fix for it is a claim about *which* structure is oversized, and the three
+ * biggest here are not the ones the design's structure list suggests. Two of them
+ * are pure overhead -- `di.child` is indexed by entry id when 12 % of ids are
+ * directories, and every array that grows by doubling is resident at its high-water
+ * capacity -- so the interesting column is allocated-vs-used, not just total.
+ *
+* `touched` is what the structure has actually written -- what the process is
+ * charged for -- and `address` is what it has reserved. The two are different
+ * questions with different fixes: address space only becomes memory under a
+ * refused overcommit or a `ulimit -v`, which is how design §5.4's 4.2 GB of
+ * bitmaps failed while measuring 213 MB resident. Which of the two a row reports
+ * is stated per row, because it depends on how that structure is grown: `realloc`
+ * without a write past the old length leaves the tail untouched, `calloc` of a
+ * large block returns zero pages nobody touches, and a `memset` of a new range
+ * makes every byte of it resident.
+ *
+ * `*total` accumulates the touched column so the last line can be compared with
+ * the process's own peak: the difference is the allocator's overhead plus whatever
+ * scratch the build has already freed. */
+static void mem_row(const char *phase, const char *what, uint64_t touched,
+                    uint64_t address, uint64_t *total)
+{
+    if (total) *total += touched;
+    LOGI("%s: mem %-22s %8.1f MiB touched %8.1f MiB addr  (%3.0f%%)",
+         phase, what, (double)touched / 1048576.0, (double)address / 1048576.0,
+         address ? 100.0 * (double)touched / (double)address : 0.0);
+}
+
+void esidx_log_mem(const esidx_t *db, const char *phase)
+{
+    if (!log_enabled(LOG_INFO)) return;
+    const entry_table_t *et = &db->et;
+    uint64_t total = 0;
+
+    /* The nine columns, allocated at cap and holding count. sizeof each, so a
+     * changed column cannot silently keep the old sum. */
+    struct { const void *p; size_t sz; } col[9] = {
+        { et->parent, sizeof(eid_t)    }, { et->depth,  sizeof(uint16_t) },
+        { et->flags,  sizeof(uint16_t) }, { et->size,   sizeof(int64_t)  },
+        { et->mtime,  sizeof(int64_t)  }, { et->ctime,  sizeof(int64_t)  },
+        { et->stamp,  sizeof(int64_t)  }, { et->ext_id, sizeof(uint16_t) },
+        { et->name,   sizeof(strref_t) },
+    };
+    uint64_t col_bytes = 0, col_used = 0;
+    for (int i = 0; i < 9; i++) {
+        if (!col[i].p) continue;
+        col_bytes += (uint64_t)et->cap * col[i].sz;
+        col_used  += (uint64_t)et->count * col[i].sz;
+    }
+    mem_row(phase, "entry columns", col_used, col_bytes, &total);
+    mem_row(phase, "names pool", db->names.len, db->names.cap, &total);
+
+    /* di.child is `child_cap` vector headers indexed by entry id, and only a
+     * directory's slot is ever used: on /work that is 8 388 608 headers of which
+     * 651 897 are live. All of it is resident -- the growth path memsets the new
+     * range -- so this row is the one sparse index that costs real memory rather
+     * than address space. */
+    if (db->di.child) {
+        uint32_t ndirs = 0;
+        for (uint32_t i = 0; i < et->count && i < db->di.child_cap; i++)
+            if ((et->flags[i] & EF_DIR) && !(et->flags[i] & EF_DEAD)) ndirs++;
+        uint64_t hdr = (uint64_t)db->di.child_cap * sizeof(childvec_t);
+        mem_row(phase, "dir vector headers", hdr, hdr, &total);
+        LOGI("%s: mem dir headers: %u live of %u slots (%.0f%%)",
+             phase, ndirs, db->di.child_cap,
+             db->di.child_cap ? 100.0 * (double)ndirs / (double)db->di.child_cap : 0.0);
+
+        /* Every vector's whole capacity is resident: realloc copies the old contents
+         * and the new element is written, so nothing is ever untouched. */
+        uint64_t items_used = 0, items_bytes = 0;
+        for (uint32_t d = 0; d < db->di.child_cap; d++) {
+            items_used  += (uint64_t)db->di.child[d].n * sizeof(eid_t);
+            items_bytes += (uint64_t)db->di.child[d].cap * sizeof(eid_t);
+        }
+        mem_row(phase, "dir children vectors", items_bytes, items_bytes, &total);
+        LOGI("%s: mem dir children: %llu of %llu ids in vectors (%.0f%%)",
+             phase, (unsigned long long)(items_used / 4),
+             (unsigned long long)(items_bytes / 4),
+             items_bytes ? 100.0 * (double)items_used / (double)items_bytes : 0.0);
+    }
+    if (db->di.ht_off) {
+        uint64_t slots = (uint64_t)db->di.ht_mask + 1;
+        /* Every occupied slot holds an offset into the name pool and the string
+         * there is the directory's whole path -- a second copy of something the
+         * parent chain already rebuilds. Counted exactly, by walking the strings
+         * the table points at, because "how much does the dir tree cost twice" is
+         * not a number worth estimating. It is part of the names pool above, so it
+         * does not go in the total.
+         *
+         * HT_TOMB is a *slot* marker, not an offset: a reconcile's removal leaves it
+         * behind (di_hash_erase, and why it does), and reading the pool at
+         * 0xFFFFFFFF is what the first version of this row did. The sanitiser
+         * build caught it and the incremental suite is what surfaced it -- the
+         * update that hit a tombstone died, the snapshot was never rewritten, and
+         * every assertion after it was a stale index. */
+        uint64_t stored = 0;
+        for (uint64_t s = 0; s < slots; s++)
+            if (db->di.ht_off[s] && db->di.ht_off[s] != HT_TOMB)
+                stored += strlen(sp_get(&db->names, db->di.ht_off[s])) + 1;
+        /* calloc: only the occupied slots are ever written, so the rest is address
+         * space and not memory -- until something runs under a ulimit -v. */
+        mem_row(phase, "dir path hash table", (uint64_t)db->di.ht_count * 8,
+                slots * 8, &total);
+        mem_row(phase, "dir paths copied to pool", stored, stored, NULL);
+        LOGI("%s: mem dir hash load %.2f of %.0f slots for %u dirs",
+             phase, (double)db->di.ht_count / (double)slots, (double)slots,
+             db->di.ht_count);
+    }
+
+    /* sidx_ent_t is {int64 v; eid_t id} -- 16 bytes, of which 4 are padding, and
+     * the array is written end to end so all of it is resident. */
+    const sidx_t *si[3] = { &db->by_size, &db->by_mtime, &db->by_ctime };
+    uint64_t sidx_bytes = 0, sidx_soa = 0;
+    for (int i = 0; i < 3; i++) {
+        sidx_bytes += ((uint64_t)si[i]->n + si[i]->dn) * sizeof(sidx_ent_t);
+        sidx_soa   += (uint64_t)si[i]->n * (sizeof(int64_t) + sizeof(eid_t));
+    }
+    mem_row(phase, "sorted arrays x3", sidx_bytes, sidx_bytes, &total);
+    LOGI("%s: mem sorted arrays: %.1f MiB would be two arrays, %.1f MiB is padding",
+         phase, (double)sidx_soa / 1048576.0,
+         (double)(sidx_bytes - sidx_soa) / 1048576.0);
+
+    if (db->ext.n) {
+        uint64_t set_bytes = 0, list_bytes = 0, list_used = 0;
+        uint32_t nset = 0, nlist = 0;
+        for (uint32_t i = 0; i < db->ext.n; i++) {
+            if (db->ext.posts[i].ids) {
+                nlist++;
+                list_bytes += (uint64_t)db->ext.posts[i].cap * sizeof(eid_t);
+                list_used  += (uint64_t)db->ext.posts[i].n * sizeof(eid_t);
+            } else {
+                nset++;
+                set_bytes += (db->ext.sets[i].nbits + 7u) / 8u;
+            }
+        }
+        uint64_t fixed = (uint64_t)db->ext.n * (sizeof(ext_post_t) + 2 * sizeof(uint32_t));
+        if (db->ext.tab) fixed += ((uint64_t)db->ext.tab_mask + 1) * sizeof(uint32_t);
+        mem_row(phase, "ext bitmaps", set_bytes, set_bytes + fixed, &total);
+        mem_row(phase, "ext posting lists", list_bytes, list_bytes + fixed, NULL);
+        LOGI("%s: mem ext structures: %u bitmaps, %u lists, tab %llu slots for %u "
+             "extensions", phase, nset, nlist,
+             (unsigned long long)(db->ext.tab ? (uint64_t)db->ext.tab_mask + 1 : 0),
+             db->ext.n);
+    }
+
+    if (db->tri.n_slots) {
+        uint64_t post_bytes = 0, post_used = 0;
+        for (uint32_t i = 0; i < db->tri.n_slots; i++) {
+            post_bytes += (uint64_t)db->tri.list[i].cap * sizeof(eid_t);
+            post_used  += (uint64_t)db->tri.list[i].n * sizeof(eid_t);
+        }
+        uint64_t fixed = (uint64_t)db->tri.cap_slots *
+                         (sizeof(tri_list_t) + sizeof(uint32_t));
+        if (db->tri.tab) fixed += ((uint64_t)db->tri.tab_mask + 1) * sizeof(uint32_t);
+        /* Resident at the capacity, not at the length: tri_index_add() grows a
+         * posting list by doubling, and realloc copies what was there, so the
+         * headroom between n and cap was written at some point and stays mapped.
+         * A counting pass before the fill is what would make these two columns
+         * agree -- the ext index above already does it, in the same function. */
+        mem_row(phase, "name trigram lists", post_bytes, post_bytes + fixed, &total);
+        LOGI("%s: mem trigram slots=%u of %u cap, %.1f postings/entry, %.0f%% of the "
+             "list capacity in use", phase, db->tri.n_slots, db->tri.cap_slots,
+             et->count ? (double)db->tri.n_postings / (double)et->count : 0.0,
+             post_bytes ? 100.0 * (double)post_used / (double)post_bytes : 0.0);
+    }
+
+    if (db->name_rank) {
+        uint64_t bytes = (uint64_t)et->count * sizeof(uint32_t) + db->folded.cap +
+                         (uint64_t)db->n_ranks * sizeof(uint32_t);
+        uint64_t used  = (uint64_t)et->count * sizeof(uint32_t) + db->folded.len +
+                         (uint64_t)db->n_ranks * sizeof(uint32_t);
+        if (db->rk_tab) bytes += ((uint64_t)db->rk_mask + 1) * sizeof(uint32_t);
+        mem_row(phase, "name rank", used, bytes, &total);
+        LOGI("%s: mem name ranks: %u distinct folded names over %u entries",
+             phase, db->n_ranks, et->count);
+    }
+
+    if (db->live.w)
+        mem_row(phase, "live bitset", (uint64_t)db->live.nbits / 8u,
+                (uint64_t)db->live.nbits / 8u, &total);
+    if (db->type.dirs.w) {
+        uint64_t b = (uint64_t)(db->type.all.nbits + 7u) / 8u * 3;
+        mem_row(phase, "type bitmaps", b, b, &total);
+    }
+
+    LOGI("%s: mem %-22s %8.1f MiB accounted", phase, "TOTAL",
+         (double)total / 1048576.0);
+    uint64_t hwm = vm_hwm_kb() * 1024u;
+    if (hwm)
+        LOGI("%s: mem peak rss %.1f MiB -- the difference is the allocator's own "
+             "overhead and the scratch a build has already freed (qsort's temp "
+             "buffer, the rank arena)", phase, (double)hwm / 1048576.0);
 }
 
 /* --------------------------------------------------------------- snapshot */
