@@ -278,28 +278,50 @@ send" — see §1.4.
 ### 3.1 Both suites, both builds, every time
 
 ```sh
-make clean && make
-./test.sh && ./test_etp.sh
-
-make clean && make DEBUG=1
-ASAN_OPTIONS=detect_leaks=1 ./test.sh
-ASAN_OPTIONS=detect_leaks=1 ./test_etp.sh
+make check
 ```
 
-One `make` builds both binaries (`all: esidx etp-probe`), so there is no second
-step to forget. It used to be `make && make etp-probe`, and forgetting it cost an
-hour's confusion: `test_etp.sh` stops with `./etp-probe not built`, which reads
-like a broken checkout rather than a missing prerequisite.
+That is the whole gate: it builds **both** flavours and runs both suites against each,
+in the order below (index before protocol, so a parse regression is not read as a
+protocol fault). It takes about 30 s.
+
+```sh
+make                      # optimised + sanitiser, no selector, no env var
+./test.sh && ./test_etp.sh
+
+ESIDX_BUILD=dbg ASAN_OPTIONS=detect_leaks=1 ./test.sh
+ESIDX_BUILD=dbg ASAN_OPTIONS=detect_leaks=1 ./test_etp.sh
+```
+
+**There is no `DEBUG` variable and no `make clean` between the two.** The flavours used
+to share object names, so switching meant `make clean && make DEBUG=1` and forgetting
+the clean left the `-O2` objects in place — a run that *looked* sanitised and was not,
+which cost an hour of "the ASan failure is not reproducible" (the run was the optimised
+binary). The objects are named apart now (`%.o` and `%.dbg.o`), `make` builds both, and
+`make opt` / `make dbg` name one. Do not reintroduce a selector that points the gate at
+a single flavour: the whole reason the ASan build finds things is that it is not optional.
+
+One `make` also builds the two test peers (`all: opt dbg` covers `etp-probe` and
+`order-ref` in both flavours), so there is no second step to forget. It used to be
+`make && make etp-probe`, and forgetting it cost an hour's confusion:
+`test_etp.sh` stops with `./etp-probe not built`, which reads like a broken checkout
+rather than a missing prerequisite.
 
 The ASan build is not optional. It is the only thing that catches:
 
 - **use-after-free hidden by -O2.** The freed block still holds its bytes, so an
   optimised build passes while a use-after-free on a compiled regex sits in
-  `text_match`. It was caught only because the DEBUG suite ran.
+  `text_match`. It was caught only because the sanitiser suite ran.
+- **an uninitialised struct field read as a valid empty set.** `ext_index_add()` grew
+  `sets[]` by `realloc` and left the new slot's `nbits` and `w` as whatever was in the
+  heap; `bs_reserve()` read that as "big enough" and `bs_test()` dereferenced
+  `0xbebebebe`. 35 assertions failed under the sanitiser build and **all 238 passed at
+  `-O2`**, because fresh pages from the OS read as zero — the garbage happened to be a
+  valid empty bitset.
 - **leaks that swallow buffered stdout.** A 64 KiB path buffer leaked per query
   made three query tests fail with *empty output* rather than a leak report,
   because ASan aborts before stdout is flushed. If a query test suddenly returns
-  nothing under `DEBUG=1`, look for a leak before looking for a logic bug.
+  nothing under `ESIDX_BUILD=dbg`, look for a leak before looking for a logic bug.
 - **out-of-bounds and signed overflow**, which on this code are silent.
 
 Run `./round.sh /etc` too. It is cheap and it is the only thing that exercises all
@@ -570,8 +592,7 @@ here first.
 ## 8. Before committing
 
 - [ ] `make` clean of warnings, `-Wall -Wextra`
-- [ ] `./test.sh` and `./test_etp.sh` pass
-- [ ] both pass again under `make DEBUG=1` with `ASAN_OPTIONS=detect_leaks=1`
+- [ ] `make check` green — both suites against both builds, which is the whole gate
 - [ ] `./round.sh /etc` runs and its numbers are sane
 - [ ] new assertions have an expected value that came from `find(1)` or a fixture
       a reader can check, not from running the code

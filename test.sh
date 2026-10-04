@@ -6,6 +6,13 @@
 #   ./test.sh -v              echo each query and its diagnostics
 #   ESIDX_LOG=info ./test.sh  keep INFO timings (they go to the log dump)
 #   TEST_ROOT=/ ./test.sh    index a bigger tree (slower)
+#   ESIDX_BUILD=dbg ./test.sh  run against the sanitiser build (what `make check` does)
+#   ESIDX_BIN=/path ./test.sh   run against any binary at all
+#
+# ESIDX_BUILD picks the flavour `make` built -- `opt` (default) or `dbg`, the -O0 +
+# AddressSanitizer/UBSan one. Both are built by one `make` and their objects are named
+# apart, so the two cannot be stale relative to each other; that is the whole reason the
+# selection is a name here rather than a `make DEBUG=1` that rebuilds the same .o.
 #
 # Runs entirely inside a mktemp dir, so the source tree stays clean.
 # Results go to stdout and diagnostics to stderr; the helpers keep them apart so
@@ -17,7 +24,12 @@
 set -u
 cd "$(dirname "$0")"
 
-BIN=./esidx
+ORDER_REF=./order-ref
+case "${ESIDX_BUILD:-opt}" in
+    dbg) BIN=${ESIDX_BIN:-./esidx-dbg}; ORDER_REF=./order-ref-dbg ;;
+    opt) BIN=${ESIDX_BIN:-./esidx} ;;
+    *)   printf 'ESIDX_BUILD must be opt or dbg, not "%s"\n' "${ESIDX_BUILD}" >&2; exit 2 ;;
+esac
 TEST_ROOT=${TEST_ROOT:-/etc}
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/esidx-test.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
@@ -416,7 +428,7 @@ else
     ( ulimit -v "$SORT_CAP_KB" 2>/dev/null
       "$BIN" query "$SORT_DB" "sort:path:asc" "count:0" 2>/dev/null ) \
         | awk '{print $NF}' >"$TMP/sort.got"
-    if ./order-ref -c "$TMP/sort.got" "$TMP/sort.want" >"$TMP/ord.msg" 2>&1; then
+    if $ORDER_REF -c "$TMP/sort.got" "$TMP/sort.want" >"$TMP/ord.msg" 2>&1; then
         ok "a path sort of 5007 rows keeps path order under a 64 MiB cap"
     else
         bad "a path sort of 5007 rows keeps path order under a 64 MiB cap" \
@@ -427,7 +439,7 @@ fi
 # the invariant, without the cap
 "$BIN" query "$SORT_DB" "sort:path:asc" "count:0" 2>/dev/null \
     | awk '{print $NF}' >"$TMP/sort.got"
-if ./order-ref -c "$TMP/sort.got" "$TMP/sort.want" >"$TMP/ord.msg" 2>&1; then
+if $ORDER_REF -c "$TMP/sort.got" "$TMP/sort.want" >"$TMP/ord.msg" 2>&1; then
     ok "a path sort agrees with strcasecmp on the full result set"
 else
     bad "a path sort agrees with strcasecmp on the full result set" "$(cat "$TMP/ord.msg")"
@@ -441,7 +453,7 @@ fi
 "$BIN" query "$SORT_DB" "sort:name:asc" "count:0" 2>/dev/null \
     | awk -F/ '{print $NF}' >"$TMP/nm.got"
 find "$SORT" | awk -F/ '{print $NF}' >"$TMP/nm.want"
-if ./order-ref -c "$TMP/nm.got" "$TMP/nm.want" >"$TMP/ord.msg" 2>&1; then
+if $ORDER_REF -c "$TMP/nm.got" "$TMP/nm.want" >"$TMP/ord.msg" 2>&1; then
     ok "a name sort is strcasecmp order over every row"
 else
     bad "a name sort is strcasecmp order over every row" "$(cat "$TMP/ord.msg")"
@@ -450,13 +462,13 @@ fi
 # ...and the descending direction, a different line through cmp_rec (`desc ? -r : r`)
 "$BIN" query "$SORT_DB" "sort:name:desc" "count:0" 2>/dev/null \
     | awk -F/ '{print $NF}' >"$TMP/nm.got"
-if ./order-ref -c "$TMP/nm.got" "$TMP/nm.want" >/dev/null 2>&1; then
+if $ORDER_REF -c "$TMP/nm.got" "$TMP/nm.want" >/dev/null 2>&1; then
     bad "sort:name:desc must differ from ascending" "it did not"
 else
     ok "sort:name:desc differs from ascending"
 fi
 tac "$TMP/nm.got" >"$TMP/nm.rev"
-if ./order-ref -c "$TMP/nm.rev" "$TMP/nm.want" >"$TMP/ord.msg" 2>&1; then
+if $ORDER_REF -c "$TMP/nm.rev" "$TMP/nm.want" >"$TMP/ord.msg" 2>&1; then
     ok "sort:name:desc is the exact reverse of ascending"
 else
     bad "sort:name:desc is the exact reverse of ascending" "$(cat "$TMP/ord.msg")"
@@ -482,7 +494,7 @@ tie_ok() {
     _tl=$1; _tk=$2; _tw=$3; shift 3
     q "$@" "sort:$_tk" "count:0"
     printf '%s\n' "$LAST" | awk -F/ '{print $NF}' >"$TMP/tb.got"
-    if ./order-ref -c "$TMP/tb.got" "$_tw" >"$TMP/ord.msg" 2>&1; then
+    if $ORDER_REF -c "$TMP/tb.got" "$_tw" >"$TMP/ord.msg" 2>&1; then
         ok "$_tl"
     else
         bad "$_tl" "$(cat "$TMP/ord.msg")"
@@ -985,7 +997,7 @@ inc_sync "rename"
 q "" "sort:name:asc"
 printf '%s\n' "$LAST" | awk -F/ '{print $NF}' >"$TMP/incnm.got"
 find "$INC" | awk -F/ '{print $NF}' >"$TMP/incnm.want"
-if ./order-ref -c "$TMP/incnm.got" "$TMP/incnm.want" >"$TMP/ord.msg" 2>&1; then
+if $ORDER_REF -c "$TMP/incnm.got" "$TMP/incnm.want" >"$TMP/ord.msg" 2>&1; then
     ok "a name sort after a rename is still in name order"
 else
     bad "a name sort after a rename is still in name order" "$(cat "$TMP/ord.msg")"

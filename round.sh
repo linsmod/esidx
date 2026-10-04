@@ -17,7 +17,7 @@
 set -u
 cd "$(dirname "$0")"
 
-BIN=./esidx
+BIN=${ESIDX_BIN:-./esidx}
 PROBE=./etp-probe
 TEST_ROOT=${1:-/etc}
 [ "${1:-}" = "-v" ] && { VERBOSE=-v 2>&1; TEST_ROOT=/etc; }

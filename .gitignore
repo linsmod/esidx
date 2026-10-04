@@ -1,8 +1,11 @@
-# build artifacts
 *.o
+*.dbg.o
 /esidx
+/esidx-dbg
 /etp-probe
+/etp-probe-dbg
 /order-ref
+/order-ref-dbg
 
 # snapshots and scratch output
 *.idx

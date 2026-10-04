@@ -5,6 +5,7 @@
 #   ./test_etp.sh            run against a synthetic flat tree
 #   ./test_etp.sh -v         echo every line sent and received
 #   TEST_ROOT=/usr ./test_etp.sh   also exercise a real index
+#   ESIDX_BUILD=dbg ./test_etp.sh  run against the sanitiser build (what `make check` does)
 #
 # Independent of test.sh on purpose. test.sh pins the *index* against find(1);
 # this pins the *wire*, against the exact byte sequence an ETP client puts on the
@@ -54,8 +55,15 @@
 set -u
 cd "$(dirname "$0")"
 
-BIN=./esidx
-PROBE=./etp-probe
+# ESIDX_BUILD picks the flavour `make` built -- `opt` (default) or `dbg`, the -O0 +
+# AddressSanitizer/UBSan one. Both are built by one `make` and their objects are named
+# apart, so neither can be stale relative to the other; that is why the selection is a
+# name here and not a `make DEBUG=1` that rewrites the same object files.
+case "${ESIDX_BUILD:-opt}" in
+    dbg) BIN=${ESIDX_BIN:-./esidx-dbg}; PROBE=./etp-probe-dbg ;;
+    opt) BIN=${ESIDX_BIN:-./esidx};    PROBE=./etp-probe ;;
+    *)   printf 'ESIDX_BUILD must be opt or dbg, not "%s"\n' "${ESIDX_BUILD}" >&2; exit 2 ;;
+esac
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/esidx-etp.XXXXXX")
 SRV_PID=""
 SRV_PID2=""

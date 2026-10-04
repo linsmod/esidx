@@ -43,13 +43,20 @@ a file, states what is outstanding, and carries the current measurements.
 ## Build
 
 ```sh
-make            # -O2, log level = warn: builds esidx and etp-probe
-make DEBUG=1    # -O0 -g + AddressSanitizer/UBSan, log level = debug
+make            # both flavours: -O2 (log level = warn) and
+                 # -O0 -g + AddressSanitizer/UBSan (log level = debug)
+make opt        # just the optimised build
+make dbg        # just the sanitiser one
+make check      # the gate: both suites against both builds
 make clean
 ```
 
-One `make` leaves the tree ready for both test suites — `etp-probe` is the
-acceptance client, not a user-facing tool, so `make install` installs only
+One `make` leaves the tree ready for everything, and it always builds both
+flavours: the gate needs both, and a selector that could point it at one of them
+is how it used to go wrong — the two shared object names, so switching meant
+`make clean && make DEBUG=1`, and forgetting the clean ran the "sanitised" suite
+against optimised objects. `etp-probe` and `order-ref` are built in both flavours
+too; they are test peers, not user-facing tools, so `make install` installs only
 `esidx`. Requires a Linux target (ext4), GCC or Clang with C11, and `make`.
 
 ## Test
@@ -57,9 +64,12 @@ acceptance client, not a user-facing tool, so `make install` installs only
 Suites and harnesses, all runnable from a clean checkout:
 
 ```sh
-./test.sh              # index and query correctness   (219 assertions)
+make check             # the gate: both suites x both builds, ~30 s
+
+./test.sh              # index and query correctness   (238 assertions)
 ./test_etp.sh          # protocol acceptance           (213 assertions)
-make test-all          # both, in that order
+make test-all          # both, in that order, optimised build only
+ESIDX_BUILD=dbg ./test.sh        # the sanitiser build
 
 ./round.sh             # one full round on a real tree, with timings
 ./round.sh /usr        # ...on a bigger one
@@ -91,7 +101,9 @@ make test-all          # both, in that order
   alternative is a number produced by a throwaway script — which is exactly how the
   sort numbers in design §10 were first produced.
 
-Both suites pass under `make DEBUG=1` (ASan + UBSan, zero leaks) and run entirely
+`make check` runs both suites against both builds, and the sanitiser build is part
+of the gate rather than an extra step: it is the only thing that catches a
+use-after-free or an uninitialised field that `-O2` hides. Both suites run entirely
 inside a `mktemp` directory, leaving the source tree clean.
 
 ## Usage
