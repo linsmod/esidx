@@ -147,8 +147,16 @@ typedef struct {
 
     /* ---- state the 32 subcommands mutate (design §1.1) ---- */
     match_opts_t mo;
-    char         search[4096];
-    char         filter_search[4096];
+    /* CTL_BUF, not 4096, because a value arrives on a control line and a control line
+     * is at most CTL_BUF: a fixed array smaller than the line it is parsed out of
+     * truncates a long search *silently*, and then the server answers a different
+     * query than the client asked -- 1 200 rows where 1 476 were asked for on the
+     * fixture below, with no error anywhere. The reference keeps the same string in a
+     * realloc per SEARCH (etp_server.c:4025), so its only limit is the line too.
+     * cache_search/cache_filter are the same two values copied for design §6.4's
+     * result cache and have to be able to hold them. */
+    char         search[CTL_BUF];
+    char         filter_search[CTL_BUF];
     uint16_t     sort_key;      /* SORT_* plus SORT_INVERSE_SIZE */
     int          sort_asc;
     uint32_t     offset, count;
@@ -164,8 +172,8 @@ typedef struct {
     /* ---- result cache (design §6.4, ref G3) ---- */
     bool     cache_valid;
     qset_t   cache;             /* the full sorted match set */
-    char     cache_search[4096];
-    char     cache_filter[4096];
+    char     cache_search[CTL_BUF];
+    char     cache_filter[CTL_BUF];
     uint32_t cache_filter_flags;
     match_opts_t cache_mo;
     uint16_t cache_sort_key;
@@ -204,15 +212,41 @@ static void c_flush(client_t *c)
     if (c->wbuf.p) c->wbuf.p[0] = '\0';
 }
 
+/* One reply line, formatted at whatever length it needs to be.
+ *
+ * It used to be formatted into a char[1024], which is invisible until a reply crosses
+ * 1023 bytes: vsnprintf truncates, the CRLF goes with the tail, and a client waiting
+ * for the end of the line waits forever. There is no error on either side -- the reply
+ * simply stops mid-sentence, which is the same shape as the OPTS UTF8 hang AGENTS.md 1.4
+ * records, and it was found the same way: a real value that turned out to be longer
+ * than the buffer. `EVERYTHING SEARCH` acknowledges by echoing the whole search
+ * (etp_server.c:4027), so a search over about 1000 characters is enough, and Everything
+ * lets the user type tens of thousands.
+ *
+ * The reference has no such buffer: its printf writes into the client's output stream
+ * through etp_server_client_printf(), and the search it echoes lives in a string it
+ * reallocs per SEARCH (etp_server.c:4025) rather than in a fixed array. */
 static void c_reply(client_t *c, const char *fmt, ...)
 {
     char stack[1024];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(stack, sizeof(stack), fmt, ap);
+    int n = vsnprintf(stack, sizeof(stack), fmt, ap);
     va_end(ap);
-    LOGD("> %s", stack);
-    obuf_puts(&c->wbuf, stack);
+    if (n < 0) return;
+    if ((size_t)n < sizeof(stack)) {
+        LOGD("> %s", stack);
+        obuf_add(&c->wbuf, stack, (size_t)n);
+    } else {
+        char *heap = malloc((size_t)n + 1);
+        if (!heap) { LOGE("cannot format a %d-byte reply", n); return; }
+        va_start(ap, fmt);
+        vsnprintf(heap, (size_t)n + 1, fmt, ap);
+        va_end(ap);
+        LOGD("> %s", heap);
+        obuf_add(&c->wbuf, heap, (size_t)n);
+        free(heap);
+    }
     c_flush(c);
 }
 
@@ -1180,7 +1214,14 @@ static void client_read(const etp_opts_t *o, const esidx_t *db, client_t *c)
         while ((nl = memchr(start, '\n', c->rlen - (size_t)(start - c->rbuf))) != NULL) {
             *nl = '\0';
             char line[CTL_BUF];
-            snprintf(line, sizeof(line), "%s", start);
+            /* A copy, not a truncation. It cannot cut anything: client_read() refuses
+             * to read past CTL_BUF - 1 bytes without a newline in them and hangs up, so
+             * the longest line that reaches here is CTL_BUF - 1 including its NUL, and
+             * that is exactly what `line` holds. The snprintf this replaced read like
+             * a silent-truncation site on a protocol value, which is what the two fixed
+             * buffers above turned out to be -- one reply line and one search -- and it
+             * is worth not looking like a third. */
+            memcpy(line, start, strlen(start) + 1);
             handle_command(o, db, c, line);
             if (c->fd < 0) return;
             start = nl + 1;

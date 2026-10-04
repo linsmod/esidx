@@ -115,6 +115,17 @@ case $ROOT_PARENT in
     *) TERMS+=("name:$ROOT_PARENT") ;;
 esac
 
+# A term longer than every fixed buffer this server used to have on the way in, with
+# the extension that exists *last* so that a cut anywhere drops it and the answer
+# collapses. It is a term because three of them were found by asking this question of
+# the reference and not of ourselves: the search buffer (4096), the acknowledgement
+# c_reply() formatted (1023, which hung the client rather than answering wrongly), and
+# the parser's per-term value (2048). All three now hold a value this long, and the
+# reference always did -- it reallocs the search per SEARCH (etp_server.c:4025) and
+# prints the acknowledgement straight into the client's stream (etp_server.c:4027).
+PAD=$(for i in $(seq 1 400); do printf 'zzzzzzzzzzzzzz%s;' "$i"; done)
+TERMS+=("ext:${PAD}c")
+
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/esidx-cmp.XXXXXX")
 trap 'rm -rf "$TMP"; pkill -x esidx 2>/dev/null' EXIT
 

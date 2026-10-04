@@ -182,8 +182,16 @@ etp() {
     if [ "$VERBOSE" = 1 ]; then
         sed 's/^/     | /' "$script"
     fi
-    "$PROBE" "$port" "$script" >"$OUT" 2>"$TMP/probe.err"
+    # Bounded, because the failure this suite now asserts against *is* a hang: a reply
+    # line that loses its CRLF leaves the client waiting for the end of it forever, and
+    # a suite that waits with it reports nothing at all. 30 s is far longer than any
+    # session here needs -- the whole suite takes about that.
+    timeout 30 "$PROBE" "$port" "$script" >"$OUT" 2>"$TMP/probe.err"
     local rc=$?
+    if [ $rc -eq 124 ]; then
+        bad "$name" "the probe timed out -- a real client hangs here too"
+        return 1
+    fi
     if [ $rc -ne 0 ]; then
         bad "$name" "$(grep -E 'PROTOCOL-ERROR' "$OUT" | head -3)$(cat "$TMP/probe.err")"
         cat "$OUT" >>"$DIAG"
@@ -657,6 +665,36 @@ cq "path:regex: with a backslash anchor, as the client sends it" \
 cq "path: + wildcard"              "path:alpha *.conf"             "1"
 cq "dm: today"                     "dm:today"                       "14"
 cq "a bare word as a substring"    "conf"                           "3"
+
+say "10b. a search longer than every buffer it used to cross"
+
+# Two fixed buffers on this path cut a long search, and neither said so.
+#
+# The acknowledgement was one of them. `EVERYTHING SEARCH` answers by echoing the whole
+# search (etp_server.c:4027), and c_reply() formatted that into a char[1024]: past 1023
+# bytes vsnprintf drops the tail *and the CRLF*, so the reply never ends and the client
+# waits for the rest of a line that is not coming. No error on either side, the session
+# simply goes quiet -- the same shape as the OPTS UTF8 hang in section 11, found the same
+# way. The other was a 4096-byte search buffer: past that, the query answered was not the
+# query asked, which is worse than a hang (design §5.3).
+#
+# A client can produce this: Everything's search box takes tens of thousands of
+# characters and `ext:` is the shape that gets there. The reference has neither buffer --
+# its search lives in a string it reallocs per SEARCH (etp_server.c:4025) and the
+# acknowledgement goes straight into the client's stream -- and measured against it on
+# :21, a 451-name `ext:` list answers exactly what `ext:c` alone answers. That comparison
+# is a term in ./cmp_ref.sh so it can be re-run.
+#
+# 400 padded names is a 6 900-character value, past the 4096 search buffer and well past
+# the 1023 reply buffer, with the one extension that exists *last* so that any cut along
+# the way drops it and the answer comes back empty.
+PAD=$(for i in $(seq 1 400); do printf 'zzzzzzzzzzzzzz%s;' "$i"; done)
+cq "a 6 900-character ext: value: the ack is whole and the query runs" \
+   "ext:${PAD}conf" "3"
+# and the same value through the *bare word* path, which the parser sizes differently
+q_name=$(printf 'z%.0s' $(seq 1 6000))
+cq "a 6 000-character bare word matches nothing rather than a prefix of it" \
+   "$q_name" "0"
 
 say "11. FTP verbs the client never sends, for other clients"
 

@@ -66,8 +66,8 @@ Suites and harnesses, all runnable from a clean checkout:
 ```sh
 make check             # the gate: both suites x both builds, ~30 s
 
-./test.sh              # index and query correctness   (273 assertions)
-./test_etp.sh          # protocol acceptance           (213 assertions)
+./test.sh              # index and query correctness   (276 assertions)
+./test_etp.sh          # protocol acceptance           (217 assertions)
 make test-all          # both, in that order, optimised build only
 ESIDX_BUILD=dbg ./test.sh        # the sanitiser build
 
@@ -168,6 +168,10 @@ size/date constants, and the type macros. Highlights:
 Functions Everything has and ext4 cannot answer — `content:`, `dupe:`,
 `si:`, the media metadata — parse and return no results, with one warning, rather
 than failing the query. `si:` has no Linux counterpart at all (design §12, risk 2).
+
+A term's value may be up to **8 191 characters** — a long `ext:` list is the shape
+that gets there, and it is answered whole. That is the length of the longest control
+line the ETP server accepts; anything longer is refused, with a line in the log.
 
 > **Quote every query argument.** `size:>1k` unquoted is a shell redirection, not
 > a query — esidx then receives the literal string `size:` and silently matches

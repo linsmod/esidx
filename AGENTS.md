@@ -531,6 +531,17 @@ deliberately:
 | `COUNT` is only sent when positive | trace | the default must be "unlimited", matching `etp_server.c:1207` |
 | closes the socket right after QUIT without reading | observed on `:21` | a clean EOF is normal, not an error |
 | cannot classify ` MLSD` in the reference's own `211-` FEAT reply | the probe truncates at the same line | do not "fix" the server around it; a client never sends FEAT |
+| echoes the whole search in `200 Search set to (...)` | `etp_server.c:4027` | the acknowledgement must be as long as the search: formatting it into a fixed 1 KB buffer loses the CRLF, and the client then waits for the rest of a line that is never coming — a hang with no error on either side, the same shape as the `OPTS` one above |
+
+**A silent cut is worse than a refusal.** Three fixed buffers on the way in used to
+truncate a long search without saying so — the parser's per-term value at 2047, the
+protocol layer's search at 4096, and the acknowledgement above at 1023 — and the answer
+was a query nobody asked. Found by asking the reference the question instead of asking
+ours: a 451-name `ext:` list answers `167 658` on `:21`, the same as `ext:c` alone, and
+ours used to hang. That term is in `./cmp_ref.sh`. The general rule this leaves behind:
+**every fixed buffer between the socket and a term's value needs a reason to be smaller
+than a control line**, and a test for it has to put the discriminator at the *end* of a
+value past every bound — a value that happens to fit proves nothing.
 
 The official Everything client is a second, independent reader, and it disagrees
 with the one the probe was built from in one place that matters: it sends
@@ -550,11 +561,12 @@ reinvented. Cite the line in a comment (`etp_server.c:5189`) so a reader can che
 the claim.
 
 When a deviation is genuinely better, do both: make the change *and* record why in
-the same place a future reader will look. The one that is left:
+the same place a future reader will look. The two that are left:
 
 | Deviation | Why | Consequence |
 |---|---|---|
 | a top-level index root's PATH column is `/` | the reference's is `C:` — it indexes the drive root, we have no drive | POSIX's spelling of "the directory above `/etc`". A client joining `path + "\" + name` gets `\/etc`, which is the mixed-separator form §5.1 says it round-trips; an empty PATH instead would lose the leading `/` outright. Design §12.12 |
+| a control line longer than 8 KB is refused, with a log line, rather than parsed | ours has one control buffer; the reference reallocs the search per `SEARCH` (`etp_server.c:4025`) and its only limit is its own line reader, which was not measured past 4 950 characters | Everything's search box takes tens of thousands of characters, so a client *can* send more than we take. The reference was asked with 4 950 and answered; we answer the same at 4 950 and refuse beyond 8 KB. Everything above the buffer — the parser's term value, the search itself, the acknowledgement — now holds anything that fits, so the limit is one number, in one place, and it is logged |
 
 ### 5.3 A parse error must yield no results, never everything
 
