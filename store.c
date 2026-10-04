@@ -213,13 +213,26 @@ uint16_t ext_intern(esidx_t *db, const char *name)
     return (uint16_t)(noff + 1);   /* 0 reserved for "none" */
 }
 
+/* Extensions longer than EXT_MAX are cut to it, which loses the tail: two extensions
+ * sharing their first EXT_MAX characters become one id, so `ext:` matches both, and a
+ * query for the real one matches neither (the query side keeps 63, so the two ends do
+ * not even agree on where to cut). ext_list_ids() caps at 63.
+ *
+ * Nothing counts how often that happens, so nothing knows whether it is a curiosity or
+ * a live answer being wrong. Counted here, at the one place the cut happens, and printed
+ * by log_ext_lengths() -- which is also why the pool's own histogram cannot answer the
+ * question: a cut string is already cut by the time it is in the pool, so the 32+ bucket
+ * is empty by construction rather than by evidence. */
+#define EXT_MAX 32
+static uint64_t g_ext_truncated;      /* entries whose extension was cut to EXT_MAX-1 */
+
 static uint16_t ext_of(esidx_t *db, const char *name)
 {
     const char *dot = strrchr(name, '.');
     if (!dot || dot[1] == '\0' || dot == name) return 0;
-    char buf[32];
+    char buf[EXT_MAX];
     size_t n = strlen(dot + 1);
-    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+    if (n >= sizeof(buf)) { n = sizeof(buf) - 1; g_ext_truncated++; }
     for (size_t i = 0; i < n; i++) buf[i] = (char)tolower((unsigned char)dot[1 + i]);
     buf[n] = '\0';
     return ext_intern(db, buf);
@@ -870,6 +883,69 @@ static void log_ext_cardinality(const ext_index_t *xi, uint32_t entries)
          bmb, lmb, (uint32_t)(bitset_bytes / sizeof(eid_t)));
 }
 
+/* The shape of the extension *names*, as opposed to the shape of their sets (which is
+ * log_ext_cardinality). Two things it settles that the cardinality line cannot:
+ *
+ *   - whether real extensions come anywhere near EXT_MAX, which is what decides whether
+ *     cutting there is harmless in practice;
+ *   - how many entries were actually cut, which is the only number that says whether the
+ *     cut costs a wrong answer on *this* tree. The pool's own histogram cannot say it: a
+ *     cut string is already cut when it lands in the pool, so the 32+ buckets are empty
+ *     by construction and not by evidence.
+ *
+ * The buckets straddle both caps on purpose -- 16-31 is the last bucket before the cut,
+ * 32-63 is the first after it -- so a tree that is *about* to hit the cut is visible as
+ * mass at the top of 16-31 rather than as a surprise much later.
+ */
+static void log_ext_lengths(const esidx_t *db, uint32_t ext_in_use)
+{
+    /* =1, 2-3, 4-7, 8-15, 16-31, 32-63, >=64 */
+    enum { NB = 7 };
+    uint32_t bn[NB] = {0};
+    uint64_t total = 0, longest = 0;
+    uint32_t n = 0;
+
+    for (uint32_t off = 0; off < db->exts.len; ) {
+        const char *s = db->exts.buf + off;
+        size_t l = strlen(s);
+        int b = (l == 1) ? 0 : l < 4 ? 1 : l < 8 ? 2 : l < 16 ? 3
+              : l < 32 ? 4 : l < 64 ? 5 : 6;
+        bn[b]++; n++;
+        total += l;
+        if (l > longest) longest = l;
+        off += (uint32_t)l + 1;
+    }
+
+    LOGI("ext lengths: %u distinct, longest %llu, mean %.1f, pool %llu bytes |"
+         " characters per extension: =1:%u  2-3:%u  4-7:%u  8-15:%u  16-31:%u"
+         "  32-63:%u  >=64:%u",
+         n, (unsigned long long)longest, n ? (double)total / (double)n : 0.0,
+         (unsigned long long)db->exts.len,
+         bn[0], bn[1], bn[2], bn[3], bn[4], bn[5], bn[6]);
+    /* Only entries added by this process are counted, so on a load this reads 0 -- the
+     * pool was written by whoever built the snapshot, and the tail it lost is gone. */
+    LOGI("ext lengths: %llu entries had an extension cut to %d characters by ext_of()"
+         " | 0 here on a load: the cut already happened when the snapshot was written",
+         (unsigned long long)g_ext_truncated, EXT_MAX - 1);
+
+    /* Every string in the pool was interned by some entry, and ids are dense over that
+     * pool -- so at build time the two counts must be equal, and when they are not, some
+     * id has collided with another and `ext:` is answering with the wrong rows. It is
+     * checked here rather than in a test because the fixture that triggers it needs a
+     * pool past 64 KB, i.e. thousands of distinct extensions (AGENTS.md 3.4: only visible
+     * above a size threshold), whereas this runs on every build of every tree.
+     *
+     * A query can also intern a string that is in no entry at all (ext_list_ids() on an
+     * unknown extension), which makes the pool legitimately longer -- so this is only
+     * valid because ext_index_build() runs during finalize, before anything has queried
+     * this db. */
+    if (n != ext_in_use)
+        LOGE("ext pool holds %u distinct strings but only %u extensions are in use:"
+             " %u interned id(s) address the wrong string, so ext: matches the wrong"
+             " rows (ext ids are 16-bit offsets into a pool that has outgrown 64 KB)",
+             n, ext_in_use, n - ext_in_use);
+}
+
 int ext_index_build(ext_index_t *xi, const esidx_t *db)
 {
     ext_index_free(xi);
@@ -922,6 +998,7 @@ int ext_index_build(ext_index_t *xi, const esidx_t *db)
     xi->tab = tab;
     xi->tab_mask = mask;
     log_ext_cardinality(xi, et->count);
+    log_ext_lengths(db, xi->n);
     LOGD("ext bitmaps: %u distinct extensions over %u entries", n, et->count);
     return 0;
 }
