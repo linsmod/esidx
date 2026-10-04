@@ -1020,7 +1020,7 @@ the tree the `find(1)` baseline in `AGENTS.md` was taken on:
 | build, total | 1 492 ms | **60 847 ms** |
 | load | 327 ms | 5 664 ms |
 | snapshot | 25.1 MiB | 414 MiB |
-| peak rss | 98 MiB | 1 419 MiB |
+| peak rss | 87.3 MiB | **1 306 MiB** |
 | entries/s, warm | 308 000 | 98 400 |
 
 The `/usr` figure is the same measurement as the 268 k/s quoted above, run with a warm
@@ -1127,6 +1127,61 @@ Reproduce, on a host where `/work` exists:
 `count:5` against that index takes 1 189 ms: the answer is five rows, and the whole table
 is sorted to produce them — §6.2 step 4's problem stated as a number on a real tree rather
 than on a fixture.
+
+#### The memory ledger, and what it says is oversized
+
+`esidx_log_mem()` prints one line per structure, `touched` against `address`, from
+`esidx_log_stats()` — so every phase that reports the index reports its footprint with it.
+Two columns because they are different questions: address space becomes memory only under a
+refused overcommit or a `ulimit -v`, which is exactly how §5.4's 4.2 GB of ext bitmaps failed
+while measuring 213 MB resident. Which of the two a row reports depends on how that structure
+is grown, and is stated per row: `realloc` without a write past the old length leaves the tail
+untouched, `calloc` of a large block returns zero pages nobody touches, and a `memset` of a
+new range makes every byte of it resident.
+
+`/work`, 5 476 485 entries, `r7000`, at the time the ledger landed:
+
+| | touched | address | |
+|---|---|---|---|
+| name trigram lists | 450.4 | 452.1 | 15.2 postings/entry, **71 % of the capacity in use** |
+| entry columns | 261.1 | 400.0 | cap 8 388 608 vs count 5 476 485 |
+| sorted arrays ×3 | 250.7 | 250.7 | 188.0 would be two arrays |
+| names pool | 152.6 | 256.0 | 56.6 of it is dir path copies |
+| dir vector headers | 128.0 | 128.0 | 651 897 live of 8 388 608 slots |
+| name rank | 63.8 | 122.6 | 1 493 203 distinct folded names |
+| dir children vectors | 39.4 | 39.4 | 5 476 484 ids in 10 324 800 slots |
+| ext index | 15.1 | 79.4 | `tab`: 8 388 608 slots for 6 765 extensions |
+| dir path hash | 5.0 | 32.0 | load factor 0.16 |
+| **total** | **1 364.7** | 1 841 | peak rss 1 418.4 |
+
+Six things it says that no document recorded, and what has been done about each:
+
+- **`ext_index_build()` sized `tab` to the entry count** — 8 388 608 slots for 6 765
+  extensions, load factor 0.0008, plus `ids` at the same capacity for 27 KB. Sized by the
+  extension count now, which the first pass discovers: 16 384 slots.
+- **`di_hash_build()` sized the dir hash at 4x the directory count**, running /work at load
+  factor 0.16, under a comment that said "2x entry count" — a label wrong for what the code
+  does, the same class the ext bitmap commit recorded. Now 2x, which is the smallest power of
+  two that cannot reach the 3/4-load growth threshold before the next doubling.
+- **The columns' `cap` is the next power of two above the entry count.** Harmless resident
+  (realloc never writes past `count`) and fatal under a memory cap; trimmed once at the top of
+  `finalize`, where mremap shrinks in place and before anything derived has been built.
+- **The trigram posting lists were resident at their high-water capacity** — 450.4 MiB
+  touched for 318.6 MiB of ids. Now counted first and sized exactly, at the cost of a second
+  walk over the names: −85 MiB of peak rss for +21 % on `finalize`, which is +5 % of a /work
+  build and is re-run by every load.
+- **`di.child` is indexed by entry id.** 651 897 of 8 388 608 slots are a directory's, and the
+  growth path memsets every new range, so all 128 MiB is resident. **Not fixed**: the fix is a
+  dense directory ordinal, which is §7's rank/select and D7's CRoaring, and it is worth doing
+  for the 118 MiB alone.
+- **The names pool holds 3.65 copies of every name** — 1 499 994 distinct basenames against
+  5 476 485 entries, and `sp_intern()` only appends despite the name. Interning is a hash
+  table, which is also what `ext_intern()`'s linear scan over the interned names wants; that
+  scan is 4 217 609 calls over 6 765 names on /work and is a real share of the walk.
+
+`sidx_ent_t`'s 62.7 MiB of padding and the 56.6 MiB of directory paths copied into the pool are
+in the same category and equally unfixed; the paths are derived data (D4) and should not be in
+a persisted pool at all, which is why they now live in one of their own.
 
 ---
 
