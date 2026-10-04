@@ -210,58 +210,115 @@ expect "sort:ext:asc keeps every row"         "$(n "$LAST")" "3"
 # A path sort over a large result set. The bug this pins is not an ordering rule
 # but an allocation: sort_string() handed a path sort a fresh 64 KiB buffer per row
 # and held every one of them until the sort ended, so the *address space* a query
-# asked for was 64 KiB x rows -- 23 GB over an unfiltered /usr. Where malloc then
-# refused, sort_string() returned "", every comparison tied, and cmp_rec's tie-break
-# silently turned the path sort into a name sort. So the assertion has to run under
-# a virtual-memory cap small enough that the old path cannot allocate at all, and
-# the expectation comes from `sort -f` -- an independent implementation of the same
-# order (case-insensitive byte order, which is what strcasecmp does in the C locale).
-# Without the cap the old code passed, which is why it shipped.
+# asked for was 64 KiB x rows -- 23 GB over an unfiltered /usr. It looks like it
+# works because only the first page of each buffer is ever written, and it does not:
+# where malloc refuses, sort_string() returned "", every comparison tied, and
+# cmp_rec's tie-break silently turned the path sort into a name sort.
 #
-# The names are chosen so that path order and name order disagree in the first few
-# rows: scan order is a_dir, a_dir/z.txt, b.txt, ...; name order is a_dir, b.txt,
-# z.txt, ...; path order is $SORT/a_dir, $SORT/a_dir/z.txt, $SORT/b.txt. A tie
-# therefore cannot produce the right answer by accident.
+# So the assertion runs under a virtual-memory cap small enough that the old path
+# cannot allocate at all. The expectation is order_ref, which is strcasecmp -- see
+# tools/order_ref.c for why `sort -f` and `tr | sort` are each wrong in a way a
+# lower-case fixture hides.
 SORT="$TMP/sortbig"
-mkdir -p "$SORT/a_dir"
+mkdir -p "$SORT/a_dir" "$SORT/zdir"
 ( cd "$SORT" && seq 1 5000 | sed 's/^/f/' | xargs touch )
 : >"$SORT/a_dir/z.txt"
 : >"$SORT/b.txt"
+# Case that separates the three candidate orders. `sort -f` puts Apple.txt before
+# a_dir, because it orders by the original bytes; strcasecmp puts a_dir first,
+# because '_' (0x5F) is below 'p'. And a non-ASCII name separates strcasecmp from
+# `tr | sort`, because LC_ALL=C sort compares bytes signed and strcasecmp unsigned.
+#
+# zdir exists for the attribute-sort assertion below: a directory scores 0x10 and a
+# plain file 0x20 (store.c esidx_win_attributes), so an attribute sort puts both
+# directories first while a name sort puts zdir last. That is what lets the two be
+# told apart.
+UNAME=$'\u00dcnicode.txt'
+: >"$SORT/Apple.txt"; : >"$SORT/banana.txt"; : >"$SORT/Cherry.txt"; : >"$SORT/$UNAME"
 SORT_DB="$TMP/sortbig.idx"
 build "$SORT" "$SORT_DB" >/dev/null
 
-# 5000 rows x 64 KiB is 320 MB of address space; the cap leaves room for the index
+# The CLI's sort: used to carry its own list of keys, which drifted from the 22 the
+# ETP path uses: `attributes` and `inverse_size` were missing and fell through to
+# `else sort.key = SORT_NAME`, so `sort:attributes:asc` answered with a *name* sort,
+# silently. It is now routed through sort_from_etp_name(), and an unknown key is an
+# error instead of a name sort (design §5.3).
+DB="$SORT_DB"
+# the root is a directory too, so it sorts with the others -- and its *name* is the
+# basename of the path it was indexed from, which is what puts it between the two
+q "" "sort:attributes:asc" "count:3"
+expect "sort:attributes:asc is an attribute sort, not a name sort" \
+       "$(paths "$LAST")" "$SORT/a_dir $SORT $SORT/zdir "
+q "" "sort:attributes:desc" "count:1"
+expect "sort:attributes:desc is the other end of the attribute order" \
+       "$(paths "$LAST")" "$SORT/$UNAME "
+if "$BIN" query "$SORT_DB" "" "sort:nosuchkey:asc" >/dev/null 2>"$TMP/err"; then
+    bad "an unknown sort: key is refused" "it answered $(cat "$TMP/err")"
+else
+    grep -q 'unknown sort key' "$TMP/err" \
+        && ok "an unknown sort: key is refused" \
+        || bad "an unknown sort: key is refused" "$(cat "$TMP/err")"
+fi
+DB="$TREE_DB"
+
+# 5007 rows x 64 KiB is 321 MB of address space; the cap leaves room for the index
 # itself (~1 MB) and nothing else. Under a sanitiser build the cap cannot be used at
-# all -- AddressSanitizer reserves terabytes of address space before main() -- so
-# the ordering assertion below runs unconditionally and only the cap is skipped.
+# all -- AddressSanitizer reserves terabytes of address space before main() -- so the
+# uncapped ordering assertion below runs in both builds and only the cap is skipped.
 SORT_CAP_KB=65536
+find "$SORT" | awk '{print $NF}' >"$TMP/sort.want"
 if ldd "$BIN" 2>/dev/null | grep -q 'libasan\|libubsan'; then
     printf '   \033[33mskip\033[0m the memory-capped path sort under the sanitiser build\n'
 else
-    "$BIN" query "$SORT_DB" "sort:path:asc" "count:0" 2>/dev/null \
-        | awk '{print $NF}' | LC_ALL=C sort -f >"$TMP/sort.want"
     ( ulimit -v "$SORT_CAP_KB" 2>/dev/null
       "$BIN" query "$SORT_DB" "sort:path:asc" "count:0" 2>/dev/null ) \
         | awk '{print $NF}' >"$TMP/sort.got"
-    if diff -q "$TMP/sort.want" "$TMP/sort.got" >/dev/null 2>&1; then
-        ok "a path sort of 5003 rows keeps path order under a 64 MiB cap"
+    if ./order-ref -c "$TMP/sort.got" "$TMP/sort.want" >"$TMP/ord.msg" 2>&1; then
+        ok "a path sort of 5007 rows keeps path order under a 64 MiB cap"
     else
-        bad "a path sort of 5003 rows keeps path order under a 64 MiB cap" \
-            "got $(head -1 "$TMP/sort.got") want $(head -1 "$TMP/sort.want")"
+        bad "a path sort of 5007 rows keeps path order under a 64 MiB cap" \
+            "$(cat "$TMP/ord.msg")"
     fi
 fi
 
-# ...and the same order without the cap, which is the invariant rather than the bug
-"$BIN" query "$SORT_DB" "sort:path:asc" "count:0" 2>/dev/null \
-    | awk '{print $NF}' | LC_ALL=C sort -f >"$TMP/sort.want"
+# the invariant, without the cap
 "$BIN" query "$SORT_DB" "sort:path:asc" "count:0" 2>/dev/null \
     | awk '{print $NF}' >"$TMP/sort.got"
-if diff -q "$TMP/sort.want" "$TMP/sort.got" >/dev/null 2>&1; then
-    ok "a path sort agrees with sort -f on the full result set"
+if ./order-ref -c "$TMP/sort.got" "$TMP/sort.want" >"$TMP/ord.msg" 2>&1; then
+    ok "a path sort agrees with strcasecmp on the full result set"
 else
-    bad "a path sort agrees with sort -f on the full result set" \
-        "$(diff "$TMP/sort.want" "$TMP/sort.got" | head -3)"
+    bad "a path sort agrees with strcasecmp on the full result set" "$(cat "$TMP/ord.msg")"
 fi
+
+# A name sort is an integer compare on a rank built in finalize, so its order has to
+# be strcasecmp's exactly -- the one the sort produced before the rank existed,
+# because a client pages by OFFSET and cmp_ref.sh compares ordered result sets.
+# Checked over every row, not a page: a rank bug puts one row in the wrong place
+# among thousands, and a page would not see it.
+"$BIN" query "$SORT_DB" "sort:name:asc" "count:0" 2>/dev/null \
+    | awk -F/ '{print $NF}' >"$TMP/nm.got"
+find "$SORT" | awk -F/ '{print $NF}' >"$TMP/nm.want"
+if ./order-ref -c "$TMP/nm.got" "$TMP/nm.want" >"$TMP/ord.msg" 2>&1; then
+    ok "a name sort is strcasecmp order over every row"
+else
+    bad "a name sort is strcasecmp order over every row" "$(cat "$TMP/ord.msg")"
+fi
+
+# ...and the descending direction, a different line through cmp_rec (`desc ? -r : r`)
+"$BIN" query "$SORT_DB" "sort:name:desc" "count:0" 2>/dev/null \
+    | awk -F/ '{print $NF}' >"$TMP/nm.got"
+if ./order-ref -c "$TMP/nm.got" "$TMP/nm.want" >/dev/null 2>&1; then
+    bad "sort:name:desc must differ from ascending" "it did not"
+else
+    ok "sort:name:desc differs from ascending"
+fi
+tac "$TMP/nm.got" >"$TMP/nm.rev"
+if ./order-ref -c "$TMP/nm.rev" "$TMP/nm.want" >"$TMP/ord.msg" 2>&1; then
+    ok "sort:name:desc is the exact reverse of ascending"
+else
+    bad "sort:name:desc is the exact reverse of ascending" "$(cat "$TMP/ord.msg")"
+fi
+
 
 say "offset / count"
 
@@ -676,6 +733,20 @@ expect "the old name is not" "$(n "$LAST")" "0"
 q "ext:dat"
 expect "the extension followed the rename" "$(n "$LAST")" "1"
 inc_sync "rename"
+
+# A name sort after a reconcile. The rank is a *sorted position* (design §10), so a
+# name the index has never seen has nowhere to go until the order is recomputed --
+# which esidx_update() does once per pass that added something. Without that the new
+# name sorts last instead of between renamed.dat and three.txt, and every row count
+# in the suite still passes. Oracle is find(1) read through order_ref.
+q "" "sort:name:asc"
+printf '%s\n' "$LAST" | awk -F/ '{print $NF}' >"$TMP/incnm.got"
+find "$INC" | awk -F/ '{print $NF}' >"$TMP/incnm.want"
+if ./order-ref -c "$TMP/incnm.got" "$TMP/incnm.want" >"$TMP/ord.msg" 2>&1; then
+    ok "a name sort after a rename is still in name order"
+else
+    bad "a name sort after a rename is still in name order" "$(cat "$TMP/ord.msg")"
+fi
 
 # 5. a file replaced by a directory of the same name. The flags are baked into
 #    the type and ext bitmaps, so this is the case that catches a touch() which

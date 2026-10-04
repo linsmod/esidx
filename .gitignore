@@ -2,6 +2,7 @@
 *.o
 /esidx
 /etp-probe
+/order-ref
 
 # snapshots and scratch output
 *.idx

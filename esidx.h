@@ -150,7 +150,27 @@ void sidx_erase(sidx_t *s, int64_t v, eid_t id);
  * delta, so a merge never resurrects a retracted value. */
 int  sidx_merge(sidx_t *s);
 
-/* ------------------------------------------------------- name trigram index */
+/* ------------------------------------------------------- name order (design §10) */
+
+/* A dense rank over the *distinct* folded display names, so ordering by name is an
+ * integer comparison instead of a string one.
+ *
+ * "Dense" is the load-bearing word and it is about the tie-break, not about space:
+ * two rows with the same name must get the *same* rank, so that cmp_rec falls
+ * through to the display-name tie-break and then to the id, exactly as it did when
+ * the name itself was being compared. A rank assigned by position would order equal
+ * names by insertion and silently change the result order, which is part of the
+ * protocol contract (design §1.2 -- 22 sort names, and a client pages by OFFSET).
+ *
+ * The strings live in their own pool, folded once, because folding at query time
+ * costs as much as the comparison it saves (measured: ~20 ms per sort over 372 084
+ * rows, against ~26 ns saved per comparison).
+ *
+ * `folded` is kept even though only the rank is read on the sort path, because it is
+ * what makes the rank reproducible and because §5.2's `startwith:`/`whole:`/`ww:`
+ * want the same folded order. */
+
+/* -------------------------------------------------------- name trigram index */
 
 /* design §5.2, the name half of it: byte trigrams over the *display name*, used
  * only to narrow a candidate set before the matcher runs.
@@ -255,6 +275,14 @@ typedef struct {
     ext_index_t   ext;      /* ext: bitmap set, built in finalize */
     type_index_t  type;     /* file:/folder: bitmaps, built in finalize */
     tri_index_t   tri;      /* name trigrams, built in finalize (design §5.2) */
+    /* Folded display names and a dense rank over the distinct ones, built in
+     * finalize: a name sort is an integer compare rather than a string one. */
+    strpool_t     folded;
+    uint32_t     *name_rank;  /* eid -> rank of its display name */
+    uint32_t      n_ranks;    /* distinct folded names */
+    uint32_t     *rk_off;     /* rank -> offset into `folded` */
+    uint32_t     *rk_tab;     /* open addressing, value = rank + 1, 0 = empty */
+    uint32_t      rk_mask;
     /* One bit per entry id: clear for a tombstone (EF_DEAD), set for every live
      * row. Every query seeds its candidate set from here, which is what keeps a
      * removed entry out of every matcher without each matcher having to know
@@ -337,6 +365,19 @@ uint32_t ext_index_count(const ext_index_t *xi, uint16_t ext_id);
 /* incremental maintenance (design §7) */
 int      ext_index_add(ext_index_t *xi, const esidx_t *db, uint16_t ext_id, eid_t id);
 int      ext_index_del(ext_index_t *xi, uint16_t ext_id, eid_t id);
+
+/* ------------------------------------------------------------ name order */
+
+/* Fold every live display name and rank it by sorted position. Called from
+ * esidx_finalize(), so a snapshot load and a compaction both get it -- and from
+ * esidx_update(), once per pass that actually added a name, because a rank is a
+ * sorted position and a name the index has never seen has nowhere to go until the
+ * order is recomputed. A pass that added nothing does not rebuild, so the idle cost
+ * design §7 reports is unchanged. */
+int      esidx_build_name_rank(esidx_t *db);
+void     esidx_free_name_rank(esidx_t *db);
+/* rank of an entry's display name; 0 when the column has not been built */
+uint32_t esidx_name_rank(const esidx_t *db, eid_t id);
 
 /* -------------------------------------------------------- name trigram index */
 

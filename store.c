@@ -34,6 +34,147 @@ const char *sp_get(const strpool_t *sp, uint32_t off)
     return sp->buf + off;
 }
 
+/* ------------------------------------------------------- name order (design §10) */
+
+/* Fold a name into `buf`. NAME_MAX is 255 on ext4, so this never truncates a real
+ * filename; a longer one is still folded rather than copied, because a truncated
+ * name would give two different ranks to one string. */
+static void fold_name(const char *name, char *buf, size_t bufsz)
+{
+    size_t i = 0;
+    for (; name[i] && i + 1 < bufsz; i++) {
+        unsigned char c = (unsigned char)name[i];
+        buf[i] = (char)((c >= 'A' && c <= 'Z') ? c - 'A' + 'a' : c);
+    }
+    buf[i] = '\0';
+}
+
+static uint32_t hash_bytes(const char *s)
+{
+    uint32_t h = 2166136261u;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        h ^= *p;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+/* Rank of a folded name, interning it into `folded` if it is new.
+ *
+ * The table is hashed on the *content*, not on a pool offset, because sp_intern()
+ * appends unconditionally and so hands two identical names two different offsets.
+ * One strcmp per probe on a matching string is the price; hashing the offset would
+ * have needed a deduplicating intern to be correct. */
+static uint32_t rk_intern(esidx_t *db, const char *folded)
+{
+    uint32_t h = hash_bytes(folded) & db->rk_mask;
+    while (db->rk_tab[h]) {
+        uint32_t rank = db->rk_tab[h] - 1;
+        if (!strcmp(sp_get(&db->folded, db->rk_off[rank]), folded)) return rank;
+        h = (h + 1) & db->rk_mask;
+    }
+    uint32_t rank = db->n_ranks++;
+    db->rk_off[rank] = sp_intern(&db->folded, folded, strlen(folded));
+    db->rk_tab[h] = rank + 1;
+    return rank;
+}
+
+/* Rank has to mean *sorted position* or it is not a sort key at all -- interning in
+ * scan order would hand out "the first name this directory walk saw", which is the
+ * order the answer already has. So the distinct names are sorted once here and
+ * renumbered. strcmp on the folded strings is the same order cmp_folded() produces,
+ * because they are folded: memcmp over the common prefix then length. */
+static int cmp_rank_str(const void *pa, const void *pb, void *arg)
+{
+    const esidx_t *db = arg;
+    uint32_t a = *(const uint32_t *)pa, b = *(const uint32_t *)pb;
+    return strcmp(sp_get(&db->folded, db->rk_off[a]),
+                  sp_get(&db->folded, db->rk_off[b]));
+}
+
+int esidx_build_name_rank(esidx_t *db)
+{
+    esidx_free_name_rank(db);
+    const entry_table_t *et = &db->et;
+    if (et->count == 0) return 0;
+
+    /* One slot per entry bounds the distinct names from above -- two entries in one
+     * directory cannot share a name -- so these tables never have to grow. */
+    uint32_t cap = 64;
+    while (cap < et->count) cap <<= 1;
+    db->rk_tab  = calloc(cap, sizeof(uint32_t));
+    db->rk_off  = malloc((size_t)et->count * sizeof(uint32_t));
+    db->name_rank = malloc((size_t)et->count * sizeof(uint32_t));
+    if (!db->rk_tab || !db->rk_off || !db->name_rank) {
+        esidx_free_name_rank(db);
+        return -1;
+    }
+    db->rk_mask = cap - 1;
+
+    uint64_t t0 = ts_us();
+    char buf[1024];
+    for (uint32_t i = 0; i < et->count; i++) {
+        if (et->flags[i] & EF_DEAD) continue;
+        fold_name(display_name_of(db, i), buf, sizeof(buf));
+        db->name_rank[i] = rk_intern(db, buf);
+    }
+
+    /* sort the distinct names and renumber into sorted position */
+    uint32_t n = db->n_ranks;
+    uint32_t *order = malloc((size_t)n * sizeof(uint32_t));
+    uint32_t *newr  = malloc((size_t)n * sizeof(uint32_t));
+    if (!order || !newr) { free(order); free(newr); esidx_free_name_rank(db); return -1; }
+    for (uint32_t i = 0; i < n; i++) order[i] = i;
+    qsort_r(order, n, sizeof(uint32_t), cmp_rank_str, db);
+
+    /* Equal names must land on equal ranks, or the tie-break would order them by
+     * insertion instead of falling through to the id as it did before. */
+    uint32_t m = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (i > 0 && strcmp(sp_get(&db->folded, db->rk_off[order[i - 1]]),
+                            sp_get(&db->folded, db->rk_off[order[i]])) != 0)
+            m++;
+        newr[order[i]] = m;
+    }
+    uint32_t *noff = malloc((size_t)n * sizeof(uint32_t));
+    if (!noff) { free(order); free(newr); esidx_free_name_rank(db); return -1; }
+    for (uint32_t i = 0; i < n; i++) noff[newr[i]] = db->rk_off[order[i]];
+    memcpy(db->rk_off, noff, (size_t)n * sizeof(uint32_t));
+    for (uint32_t i = 0; i < et->count; i++)
+        if (!(et->flags[i] & EF_DEAD)) db->name_rank[i] = newr[db->name_rank[i]];
+    db->n_ranks = m + 1;
+    free(order); free(newr); free(noff);
+
+    /* the intern table indexes the *new* numbering */
+    memset(db->rk_tab, 0, ((size_t)db->rk_mask + 1) * sizeof(uint32_t));
+    for (uint32_t r = 0; r < db->n_ranks; r++) {
+        uint32_t h = hash_bytes(sp_get(&db->folded, db->rk_off[r])) & db->rk_mask;
+        while (db->rk_tab[h]) h = (h + 1) & db->rk_mask;
+        db->rk_tab[h] = r + 1;
+    }
+
+    TSDONE2("finalize: name rank", t0, "(%u distinct of %u)", db->n_ranks, et->count);
+    return 0;
+}
+
+void esidx_free_name_rank(esidx_t *db)
+{
+    free(db->folded.buf);
+    free(db->rk_tab);
+    free(db->rk_off);
+    free(db->name_rank);
+    db->folded.buf = NULL;
+    db->folded.len = db->folded.cap = 0;
+    db->rk_tab = NULL; db->rk_off = NULL; db->name_rank = NULL;
+    db->rk_mask = 0; db->n_ranks = 0;
+}
+
+uint32_t esidx_name_rank(const esidx_t *db, eid_t id)
+{
+    if (!db->name_rank || id >= db->et.count) return 0;
+    return db->name_rank[id];
+}
+
 /* ------------------------------------------------------------ entry table */
 
 static int et_grow(entry_table_t *et, uint32_t ncap)
@@ -824,6 +965,7 @@ void esidx_free(esidx_t *db)
     sidx_free(&db->by_size); sidx_free(&db->by_mtime); sidx_free(&db->by_ctime);
     ext_index_free(&db->ext);
     tri_index_free(&db->tri);
+    esidx_free_name_rank(db);
     bs_free(&db->type.all); bs_free(&db->type.dirs); bs_free(&db->type.files);
     bs_free(&db->live);
     memset(db, 0, sizeof(*db));
@@ -952,6 +1094,12 @@ void esidx_finalize(esidx_t *db)
              "stay correct and stay slow");
     TSDONE2("finalize: name trigrams", t0, "(%u distinct, %u postings)",
             db->tri.n_slots, db->tri.n_postings);
+
+    /* The name rank has to exist before a query can sort by name as an integer, and
+     * esidx_build_name_rank() reports its own timing, so nothing is wrapped here. */
+    if (esidx_build_name_rank(db) != 0)
+        LOGE("finalize: continuing without the name rank; a name sort falls back "
+             "to comparing folded names");
 
     /* From here on esidx_add() has to keep every one of the above in step. */
     db->built = true;

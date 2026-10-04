@@ -788,7 +788,62 @@ the largest was three rows. On WSL2's `/etc` (1 622 entries) the allocations tot
 104 MB and succeed. It only bites above ~26 000 rows in the result set, which is
 exactly the regime AGENTS.md §2.4 says WSL2 is not. The assertion added for it runs
 the sort under `ulimit -v` so the old allocation path cannot be satisfied at all,
-and compares against `sort -f` — an independent implementation of the same order.
+and compares against `order_ref`.
+
+#### The sort, measured per key — and the two schemes that were tried
+
+`sortcmp.sh` (in the repo, per AGENTS.md §1.3) is the harness: same tree, one
+unfiltered sort per cell, interleaved, best of three. `r7000`, `/usr` = 372 084 rows,
+`-O2`. Three builds:
+
+- **base** — `d2cbd2b`, `strcasecmp` in the comparator
+- **A** — fold each key once per row into an arena, then `memcmp`
+- **B** — A, plus a dense rank over the distinct display names built in `finalize`,
+  so a *name* sort is an integer compare
+
+| sort key | base | A | B | gain/A | gain/B | comparisons |
+|---|---|---|---|---|---|---|
+| `name:ascending` | 166.1 | 166.9 | **68.6** | 1.00× | **2.42×** | 6 391 733 |
+| `name:descending` | 165.7 | 166.0 | **67.9** | 1.00× | **2.44×** | 6 381 346 |
+| `extension:ascending` | 239.5 | 182.1 | 181.9 | 1.32× | 1.32× | 6 341 436 |
+| `date_modified:descending` | 168.5 | 112.6 | 112.7 | 1.50× | 1.49× | 6 272 914 |
+| `size:descending` | 148.2 | 110.8 | 110.4 | 1.34× | 1.34× | 6 353 102 |
+| `attributes:ascending` | 167.0 | 146.8 | 146.3 | 1.14× | 1.14× | 6 375 785 |
+| `date_created:descending` | 172.2 | 114.0 | 114.3 | 1.51× | 1.51× | 6 243 046 |
+| `path:ascending` | **143.1** | 157.7 | 157.6 | 0.91× | 0.91× | 5 893 420 |
+| `path:descending` | **143.9** | 157.6 | 157.9 | 0.91× | 0.91× | 5 867 893 |
+
+Four things this settles, and one it does not:
+
+- **The two schemes are not competitors; only one of them does anything, and it is
+  not the one that looked like the point.** Folding every name per query and
+  `memcmp`-ing it (A) is **1.00×** on a name sort — no change at all. A name is ~20
+  bytes, so `memcmp` on it is no cheaper than `strcasecmp` on it, and the fold it
+  needs per query costs exactly what the vectorised compare saves. The rank (B) is
+  what makes it 2.42×, because it removes the comparison instead of making it
+  cheaper.
+- **What A *is* good for is the tie-break.** Every non-name key is an integer compare
+  that lands on `cmp_rec`'s display-name tie-break, and there the fold is amortised
+  over ~17 comparisons per row instead of paid once. That is the 1.14–1.51× on the
+  four keys above, and B keeps it.
+- **`path` is 9 % slower and neither scheme fixes it.** It keeps the baseline's
+  mechanism — an exact-sized copy per row, no arena — because both alternatives
+  measured worse (fold into the arena 190 ms, raw into the arena 218 ms). What is
+  left is the per-row `strrchr` for the tie-break pointer plus the copy itself.
+  Recorded rather than explained away: a path's primary key is unique, so it almost
+  never reaches that tie-break, which makes the `strrchr` pure overhead.
+- **The comparison count is the same in all three builds** (5.9–6.4 M), so every
+  number above is a per-comparison improvement and none of it is TopK. §6.2 step 4
+  would attack the *count*; the count was never the problem. What would attack it —
+  and has not been built — is a rank per numeric column, which would make the four
+  integer keys integer-only too.
+
+**What it costs.** `finalize: name rank: 75 ms` (179 786 distinct names of 372 084),
+paid again on every load: 276.6 ms → 352.7 ms. Memory ~1.4 MB of rank plus ~8 MB of
+folded names. Nothing is persisted (D4). A *name* sort is what the ETP client asks
+for by default — `SORT name_ascending` is in the trace in AGENTS.md §1.4 — so the
+trade is 75 ms of startup for 97 ms on every name-sorted query, which breaks even on
+a single page of an unfiltered search.
 
 ---
 

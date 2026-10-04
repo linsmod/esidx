@@ -1592,15 +1592,20 @@ static void apply_filter(qctx_t *c, bitset_t *set)
 
 /* ------------------------------------------------------------------ sorting */
 
-/* One row of the sort. `s` points into the string pool for name/ext -- no copy --
- * while a path sort owns a copy per row, because path_of() rebuilds the path from
- * the parent chain (design §12, risk 7) and the comparator needs it to outlive the
- * extraction loop. Those copies are exactly as long as the path and nothing more;
- * see sort_string(). */
+/* One row of the sort. Both strings are ASCII-folded already (design §10, and the
+ * note on ascii_fold below): `s` is the primary key, `dn` is the display name the
+ * tie-break reads. Folding once per row here is the whole point -- a sort performs
+ * ~log2(n) comparisons per row, so paying the fold once and memcmp-ing many times is
+ * the difference between 169 ms and rather less.
+ *
+ * `dn` is not a second copy where it can be a pointer into the first: for a name sort
+ * it is `s`, and for a path sort it is the tail of `s` after the last separator. Only
+ * the extension and numeric keys need a copy of their own. */
 typedef struct {
     eid_t       id;
     int64_t     num;
     const char *s;
+    const char *dn;
 } srec_t;
 
 typedef struct {
@@ -1611,8 +1616,129 @@ typedef struct {
      * 64 KiB all the way down the column instead of allocating per row. */
     char          *pathbuf;
     size_t         pathcap;
+    uint64_t       ncmp;      /* comparisons performed, for the sort breakdown */
+    int            ranked;    /* SORT_NAME reads name_rank, so `num` holds the rank */
 } sort_ctx_t;
 
+/* Everything sorts a name case-insensitively, and the sort was 6 M `strcasecmp`
+ * calls to say so (design §10: 169 ms of sort over an unfiltered `/usr`, 54 ms of
+ * `image:`). Two facts make that avoidable:
+ *
+ *   1. In the C locale -- the only locale this process ever has, because nothing
+ *      calls setlocale() -- `tolower()` maps A-Z and nothing else. So a
+ *      case-insensitive byte order *is* an ASCII fold, and a byte >= 0x80 compares
+ *      as itself. This is written out rather than borrowed precisely because that
+ *      is the assumption: under a real locale, or a UTF-8 case fold, it would order
+ *      names differently, and the result order is part of the contract (design §1.2,
+ *      22 sort names, and cmp_ref.sh compares ordered result sets).
+ *   2. `memcmp` on folded bytes is vectorised; `strcasecmp` cannot be, because it
+ *      has to fold as it goes.
+ *
+ * The same fold builds the trigram keys in trigram.c. That is not a coincidence to
+ * be tidy about: it is one definition of "case-insensitive" in the codebase, so the
+ * sort and the prefilter cannot disagree about it. */
+static inline unsigned char ascii_fold(unsigned char c)
+{
+    return (c >= 'A' && c <= 'Z') ? (unsigned char)(c - 'A' + 'a') : c;
+}
+
+static void fold_into(const char *s, char *out, size_t outsz)
+{
+    size_t i = 0;
+    for (; s[i] && i + 1 < outsz; i++) out[i] = (char)ascii_fold((unsigned char)s[i]);
+    out[i] = '\0';
+}
+
+/* Folded keys for one sort: a list of fixed-size blocks that are never moved.
+ *
+ * It was a single realloc-doubling buffer, which is wrong in a way -O2 hides: every
+ * pointer handed out for an earlier row points into the block that the doubling
+ * copied away and freed, so `rows[j].s` is dangling for every row extracted before the
+ * last growth. The order assertions pass at -O2 because the freed block still holds
+ * its bytes, and fail under AddressSanitizer, which is the only reason this was found
+ * before it shipped (AGENTS.md 3.1).
+ *
+ * Blocks rather than one realloc'd buffer because a sort hands out n pointers that all
+ * have to stay valid until it ends. A pointer per row is what makes the alternative --
+ * resolving an offset at compare time -- an extra indirection in the hot loop. */
+#define FA_BLOCK (256u * 1024u)
+
+typedef struct {
+    char   **blk;
+    size_t  *used;
+    uint32_t nblk, cblk;
+} foldarena_t;
+
+static void fa_init(foldarena_t *fa) { memset(fa, 0, sizeof(*fa)); }
+
+static void fa_done(foldarena_t *fa)
+{
+    for (uint32_t i = 0; i < fa->nblk; i++) free(fa->blk[i]);
+    free(fa->blk);
+    free(fa->used);
+    memset(fa, 0, sizeof(*fa));
+}
+
+/* Copy `s` into the arena, folded when `fold` is set. Returns a stable pointer the
+ * comparator can read, or "" when a block cannot be allocated -- which costs order,
+ * not correctness: those rows compare equal and the id tie-break decides.
+ *
+ * The flag is not a micro-optimisation. A path is ~70 bytes against a name's ~20, and
+ * the fold exists only so memcmp can be used; for a path it costs more than the
+ * vectorised compare saves -- measured over an unfiltered /usr, folding every path
+ * cost 25 % of the sort (144 ms -> 190 ms) while the same fold on a *name* is free,
+ * because a name sort does not compare names at all (it compares ranks). So each key
+ * gets the comparator its string length justifies, and which is which is recorded in
+ * the call site rather than re-derived here. */
+static const char *fa_put_x(foldarena_t *fa, const char *s, bool fold)
+{
+    size_t n = strlen(s) + 1;
+    if (n > FA_BLOCK) {           /* one path longer than a block: give it its own */
+        char *own = malloc(n);
+        if (!own) return "";
+        if (fold) fold_into(s, own, n); else memcpy(own, s, n);
+        if (fa->nblk == fa->cblk) {
+            uint32_t nc = fa->cblk ? fa->cblk * 2 : 8;
+            char **nb = realloc(fa->blk, (size_t)nc * sizeof(char *));
+            size_t *nu = realloc(fa->used, (size_t)nc * sizeof(size_t));
+            if (!nb || !nu) { free(own); free(nb); free(nu); return ""; }
+            fa->blk = nb; fa->used = nu; fa->cblk = nc;
+        }
+        fa->blk[fa->nblk] = own;
+        fa->used[fa->nblk] = n;
+        fa->nblk++;
+        return own;
+    }
+    if (fa->nblk == 0 || fa->used[fa->nblk - 1] + n > FA_BLOCK) {
+        char *b = malloc(FA_BLOCK);
+        if (!b) return "";
+        if (fa->nblk == fa->cblk) {
+            uint32_t nc = fa->cblk ? fa->cblk * 2 : 8;
+            char **nb = realloc(fa->blk, (size_t)nc * sizeof(char *));
+            size_t *nu = realloc(fa->used, (size_t)nc * sizeof(size_t));
+            if (!nb || !nu) { free(b); free(nb); free(nu); return ""; }
+            fa->blk = nb; fa->used = nu; fa->cblk = nc;
+        }
+        fa->blk[fa->nblk] = b;
+        fa->used[fa->nblk] = 0;
+        fa->nblk++;
+    }
+    char *out = fa->blk[fa->nblk - 1] + fa->used[fa->nblk - 1];
+    if (fold) fold_into(s, out, FA_BLOCK - fa->used[fa->nblk - 1]);
+    else      memcpy(out, s, n);
+    fa->used[fa->nblk - 1] += n;
+    return out;
+}
+
+static const char *fa_put(foldarena_t *fa, const char *s)
+{
+    return fa_put_x(fa, s, true);
+}
+
+/* The primary key, raw. The caller folds it into the arena unless the key is
+ * numeric, so this function stays the single place that decides *what* the key is.
+ * For a path key it fills the shared scratch and returns that, which is why the
+ * caller must fold before asking again. */
 static const char *sort_string(sort_ctx_t *sc, eid_t id)
 {
     const esidx_t *db = sc->db;
@@ -1627,19 +1753,7 @@ static const char *sort_string(sort_ctx_t *sc, eid_t id)
         }
         if (!sc->pathbuf) return "";
         path_of(db, id, sc->pathbuf, sc->pathcap);
-        /* Sized to the path, not to the buffer. The obvious version -- one 64 KiB
-         * malloc per row, kept until the sort ends -- asks for 64 KiB x rows of
-         * *address space*, which is 23 GB over an unfiltered /usr. It looks like it
-         * works because only the first page of each buffer is ever touched, and it
-         * does not: where malloc refuses, this used to return "", every comparison
-         * tied, and cmp_rec's tie-break turned the path sort into a name sort with no
-         * error anywhere. A path is tens of bytes, so the whole column is now tens of
-         * bytes x rows. */
-        size_t n = strlen(sc->pathbuf) + 1;
-        char *out = malloc(n);
-        if (!out) return "";
-        memcpy(out, sc->pathbuf, n);
-        return out;
+        return sc->pathbuf;
     }
     case SORT_ATTRIBUTES:
     case SORT_RECENTLY_CHANGED:
@@ -1650,6 +1764,12 @@ static const char *sort_string(sort_ctx_t *sc, eid_t id)
     default:
         return display_name_of(db, id);
     }
+}
+
+static bool sort_key_is_numeric(sort_key_t k)
+{
+    return k == SORT_SIZE || k == SORT_MTIME || k == SORT_CTIME ||
+           k == SORT_ATTRIBUTES || k == SORT_RECENTLY_CHANGED;
 }
 
 static int64_t sort_number(sort_ctx_t *sc, eid_t id)
@@ -1667,24 +1787,66 @@ static int64_t sort_number(sort_ctx_t *sc, eid_t id)
     }
 }
 
+/* ---------------------------------------------------------------- name order */
+
+/* Order two folded strings: memcmp over the common prefix, then the length. That is
+ * exactly what strcasecmp does in the C locale and therefore the same total order --
+ * which matters, because cmp_ref.sh compares ordered result sets and a client pages
+ * by OFFSET. */
+static int cmp_folded(const char *a, const char *b)
+{
+    size_t la = strlen(a), lb = strlen(b);
+    size_t n = la < lb ? la : lb;
+    int r = n ? memcmp(a, b, n) : 0;
+    if (r == 0) r = (la < lb) ? -1 : (la > lb) ? 1 : 0;
+    return r;
+}
+
+/* Which keys compare raw and which compare folded. A path key does not fold, because
+ * measured on an unfiltered /usr the fold costs more than the memcmp saves (see
+ * fa_put_x); every other string key does, because it does. Recorded in one place so
+ * the comparator and the extraction loop cannot disagree about which is which -- the
+ * same reason leaf_mods() exists for the modifiers. */
+static bool sort_key_is_path(sort_key_t k)
+{
+    return k == SORT_PATH || k == SORT_FILE_LIST_FILENAME;
+}
+
 /* Multi-level chain: primary key, then name, then id. The id tiebreak is what
  * makes the order total, so two runs of the same query always cut their pages at
- * the same boundary (ref D3). */
+ * the same boundary (ref D3).
+ *
+ * Three comparators, one per kind of key, and all three produce strcasecmp's order:
+ *
+ *   name + rank   an integer compare. Equal names share a rank on purpose, so they
+ *                 fall through to the name tie-break and then the id exactly as they
+ *                 did when the name itself was compared (design §10).
+ *   path          strcasecmp, because the path is not folded (fa_put_x).
+ *   everything    memcmp over names folded once per row on the way in.
+ *
+ * The order is the contract, not an implementation detail: a client pages by OFFSET
+ * and cmp_ref.sh compares ordered result sets, so a different order is a different
+ * answer even when it looks like a reasonable one. */
 static int cmp_rec(const void *pa, const void *pb, void *arg)
 {
     const srec_t *a = pa, *b = pb;
     sort_ctx_t *sc = arg;
     int r = 0;
 
-    if (sc->key == SORT_SIZE || sc->key == SORT_MTIME || sc->key == SORT_CTIME ||
-        sc->key == SORT_ATTRIBUTES || sc->key == SORT_RECENTLY_CHANGED) {
+    sc->ncmp++;
+    if (sc->key == SORT_NAME && sc->ranked) {
+        r = (a->num < b->num) ? -1 : (a->num > b->num) ? 1 : 0;
+    } else if (sort_key_is_numeric(sc->key)) {
         int64_t x = a->num, y = b->num;
         r = (x < y) ? -1 : (x > y) ? 1 : 0;
+    } else if (sort_key_is_path(sc->key)) {
+        r = strcasecmp(a->s, b->s);
     } else {
-        r = strcasecmp(a->s ? a->s : "", b->s ? b->s : "");
+        r = cmp_folded(a->s, b->s);
     }
     if (r == 0)
-        r = strcasecmp(display_name_of(sc->db, a->id), display_name_of(sc->db, b->id));
+        r = sort_key_is_path(sc->key) ? strcasecmp(a->dn, b->dn)
+                                      : cmp_folded(a->dn, b->dn);
     if (r == 0) r = (a->id < b->id) ? -1 : (a->id > b->id);
     return sc->desc ? -r : r;
 }
@@ -1826,7 +1988,12 @@ int qexec(const esidx_t *db, const ast_t *ast_in, const match_opts_t *mo,
      * set is already a directory listing, and it would break the result cache,
      * which re-slices this array on a new OFFSET without re-running the query.
      * design.md §6.2 step 4 is therefore deferred with this reasoning recorded
-     * rather than implemented on speculation. */
+     * rather than implemented on speculation.
+     *
+     * What made the sort expensive was not the shape of it but the comparator: see
+     * ascii_fold. The stage is timed in two halves anyway, because "key extraction"
+     * and "comparison" are different fixes and reporting only their sum is what let
+     * a strcasecmp stay in here for this long. */
     uint64_t t_sort0 = ts_us();
     sort_ctx_t sc;
     memset(&sc, 0, sizeof(sc));
@@ -1837,34 +2004,80 @@ int qexec(const esidx_t *db, const ast_t *ast_in, const match_opts_t *mo,
         LOGD("sort: no date_recently_changed column; ordering by mtime instead");
 
     srec_t *rows = malloc((size_t)total * sizeof(srec_t));
-    if (!rows) { bs_free(&set); qctx_done(&c); sc_done(&sc); return -1; }
+    foldarena_t fa;
+    fa_init(&fa);
+    if (!rows) { bs_free(&set); qctx_done(&c); sc_done(&sc); fa_done(&fa); return -1; }
+
+    /* Extract and fold, once per row. `dn` is a pointer into `s` wherever the key
+     * already contains the name, so only the extension and numeric keys pay for a
+     * second copy -- and a name sort pays for neither, because the rank is already
+     * in the index. */
+    const int numeric = sort_key_is_numeric(sc.key);
+    const bool key_is_path = sort_key_is_path(sc.key);
+    sc.ranked = (sc.key == SORT_NAME && db->name_rank != NULL);
+    uint64_t t_key0 = ts_us();
     uint32_t ri = 0;
     for (uint32_t i = bs_next(&set, 0); i < c.n; i = bs_next(&set, i + 1)) {
-        rows[ri].id  = i;
-        rows[ri].num = sort_number(&sc, i);
-        rows[ri].s   = sort_string(&sc, i);
+        const char *name = display_name_of(db, i);
+        rows[ri].id = i;
+        rows[ri].dn = name;
+        rows[ri].s  = "";
+        if (sc.ranked) {
+            rows[ri].num = (int64_t)esidx_name_rank(db, i);
+        } else {
+            rows[ri].num = sort_number(&sc, i);
+            if (key_is_path) {
+                /* A path gets its own exact-sized copy and nothing else: no arena, no
+                 * fold. Both were tried and both measured worse over an unfiltered
+                 * /usr -- 190 ms folded into the arena, 218 ms unfolded into it,
+                 * against 144 ms for the plain copy this replaced. The arena's block
+                 * boundaries scatter 26 MB of path strings in a way a sequential
+                 * allocation does not, and a path sort's primary key is unique so it
+                 * almost never reaches the tie-break. Kept as its own branch because
+                 * that is a measurement, not a preference. */
+                const char *key = sort_string(&sc, i);
+                size_t n = strlen(key) + 1;
+                char *own = malloc(n);
+                if (own) { memcpy(own, key, n); rows[ri].s = own; }
+                const char *tail = strrchr(rows[ri].s, '/');
+                rows[ri].dn = tail ? tail + 1 : rows[ri].s;
+            } else if (!numeric) {
+                rows[ri].s = fa_put(&fa, sort_string(&sc, i));
+                rows[ri].dn = fa_put(&fa, name);
+            } else {
+                rows[ri].dn = fa_put(&fa, name);
+            }
+        }
         ri++;
     }
+    out->t_key_us = ts_us() - t_key0;
+
     if (total > 1) qsort_r(rows, total, sizeof(srec_t), cmp_plain, &sc);
     for (uint32_t i = 0; i < total; i++) ids[i] = rows[i].id;
 
     out->t_sort_us = ts_us() - t_sort0;
+    out->sort_ncmp = sc.ncmp;
     out->n = total;
     out->n_dir = ndir;
     out->n_file = nfile;
 
-    /* Only the path key owns its strings; for every other key `s` points into the
-     * pool and freeing it would be freeing the index. */
-    if (sc.key == SORT_PATH || sc.key == SORT_FILE_LIST_FILENAME)
-        for (uint32_t i = 0; i < total; i++) free((char *)rows[i].s);
+    if (key_is_path) for (uint32_t i = 0; i < total; i++) free((char *)rows[i].s);
     free(rows);
+    /* Only the path key owns its strings -- one exact-sized malloc per row, from the
+     * branch above. Everything else is either in the arena, which fa_done() releases,
+     * or a pointer into the name pool, which is the index. */
+    fa_done(&fa);
     bs_free(&set);
     qctx_done(&c);
     sc_done(&sc);
 
-    LOGD("exec: matched=%u (dirs=%u files=%u) of %u | plan=%.3f eval=%.3f sort=%.3f ms",
+    LOGD("exec: matched=%u (dirs=%u files=%u) of %u | plan=%.3f eval=%.3f "
+         "sort=%.3f ms (key %.3f ms, %llu comparisons, %.1f ns each)",
          total, ndir, nfile, c.n,
          (double)out->t_plan_us / 1000.0, (double)out->t_eval_us / 1000.0,
-         (double)out->t_sort_us / 1000.0);
+         (double)out->t_sort_us / 1000.0, (double)out->t_key_us / 1000.0,
+         (unsigned long long)out->sort_ncmp,
+         out->sort_ncmp ? (double)(out->t_sort_us - out->t_key_us) * 1000.0 /
+                          (double)out->sort_ncmp : 0.0);
     return 0;
 }

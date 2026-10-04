@@ -176,6 +176,15 @@ typedef struct {
     uint32_t n;
     uint32_t n_dir, n_file;
     uint64_t t_plan_us, t_eval_us, t_sort_us;
+    /* The sort stage split in two, because "sorting is slow" and "comparing is
+     * slow" call for different fixes and only one number was being reported.
+     * `t_key_us` is the per-row key extraction that has to happen before any
+     * comparison can; the rest of `t_sort_us` is the compare. `sort_ncmp` is how
+     * many comparisons actually ran, so ns-per-comparison is derivable rather than
+     * guessed -- which is what says whether the cost is the comparator or the row
+     * count (design §10). */
+    uint64_t t_key_us;
+    uint64_t sort_ncmp;
     uint32_t driver;    /* leaf that seeded the candidate bitmap, or UINT32_MAX */
     uint32_t seed;      /* candidates the driver produced */
     uint32_t leaf_cnt;  /* index-backed leaves the optimiser could have used */

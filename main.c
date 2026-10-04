@@ -198,18 +198,34 @@ static int cmd_query(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (!strncasecmp(a, "sort:", 5)) {
+            /* Route through the one name table rather than a second switch. The CLI
+             * used to spell the keys out here, and the two lists drifted: `attributes`
+             * and `inverse_size` were missing, so `sort:attributes:asc` fell through
+             * to `else sort.key = SORT_NAME` and answered with a *name* sort, silently,
+             * with nothing in the output to say so. The ETP path has always gone
+             * through sort_from_etp_name() and was right.
+             *
+             * An unknown key is now an error rather than a name sort: a query that
+             * does not do what it says is worse than one that refuses (design §5.3). */
             char key[32] = {0}, ord[32] = {0};
             sscanf(a + 5, "%31[^:]:%31s", key, ord);
-            if      (!strcasecmp(key, "size"))  sort.key = SORT_SIZE;
-            else if (!strcasecmp(key, "mtime") ||
-                     !strcasecmp(key, "date_modified")) sort.key = SORT_MTIME;
-            else if (!strcasecmp(key, "ctime") ||
-                     !strcasecmp(key, "date_created"))  sort.key = SORT_CTIME;
-            else if (!strcasecmp(key, "path"))  sort.key = SORT_PATH;
-            else if (!strcasecmp(key, "ext") ||
-                     !strcasecmp(key, "extension")) sort.key = SORT_EXT;
-            else sort.key = SORT_NAME;
-            sort.desc = (!strcasecmp(ord, "desc") || !strcasecmp(ord, "descending"));
+            const char *dir = (!strcasecmp(ord, "desc") ||
+                               !strcasecmp(ord, "descending")) ? "_descending"
+                                                              : "_ascending";
+            char name[80];
+            uint16_t k16 = 0;
+            int asc = 1;
+            snprintf(name, sizeof(name), "%s%s", key, dir);
+            if (!strcasecmp(key, "ext"))          /* the CLI's spelling */
+                snprintf(name, sizeof(name), "extension%s", dir);
+            if (sort_from_etp_name(name, &k16, &asc) != 0) {
+                fprintf(stderr, "unknown sort key '%s'\n", key);
+                free(expr);
+                esidx_free(&db);
+                return 1;
+            }
+            sort.key = (sort_key_t)(k16 & SORT_KEY_MASK);
+            sort.desc = !asc;
             continue;
         }
         if (!strncasecmp(a, "count:", 6))  { count  = (uint32_t)strtoul(a + 6, NULL, 10); continue; }

@@ -1,6 +1,6 @@
 # esidx -- ext4 search index engine. Refs: ../ext4_index_engine_design.md
 #
-#   make            optimised build of everything (esidx + etp-probe), warn
+#   make            optimised build of everything, warn: esidx, etp-probe, order-ref
 #   make DEBUG=1    -O0 -g -fsanitize=address,undefined, log level = debug
 #   make test       build + ./test.sh
 #   make test-all   build + both suites, index/language first
@@ -36,7 +36,7 @@ OBJS = store.o index.o scan.o trigram.o lexer.o parser.o regex.o query.o log.o e
 # like a broken checkout rather than a missing prerequisite. The probe is one
 # translation unit and ~1000 lines, so building it by default costs nothing next to
 # the server itself.
-all: esidx etp-probe
+all: esidx etp-probe order-ref
 
 esidx: $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
@@ -51,6 +51,11 @@ test: all
 # applies a real client's parsing rules. AGENTS.md 1.4 covers the second peer --
 # Everything itself, pointed at this server.
 etp-probe: tools/etp_probe.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+# The sort-order oracle for test.sh, and the reason it is a program rather than a
+# pipeline: `sort -f` is not a byte order and neither is `tr | sort`. See the header.
+order-ref: tools/order_ref.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 test-etp: all
@@ -68,6 +73,6 @@ uninstall:
 	rm -f "$(DESTDIR)$(BINDIR)/esidx"
 
 clean:
-	rm -f $(OBJS) esidx etp-probe
+	rm -f $(OBJS) esidx etp-probe order-ref
 
 .PHONY: all test test-etp test-all install uninstall clean

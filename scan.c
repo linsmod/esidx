@@ -596,6 +596,23 @@ int esidx_update(esidx_t *db, const char *root, unsigned flags, update_stats_t *
 
     update_merge(db);
 
+    /* The name rank is sorted position, so a name the index has never seen has
+     * nowhere to go until the order is recomputed (design §10). Doing that per added
+     * name would be O(n) renumbering each time; doing it once per pass that actually
+     * added something is one O(n log n) against a walk that already stat-ed every
+     * directory it descended. A pass that added nothing -- the idle case, 0.1 ms on
+     * an unchanged /usr -- does not pay it at all, which is the number design §7
+     * reports, so the rebuild is gated on `added` rather than run unconditionally. */
+    if (st->added && db->name_rank) {
+        uint64_t r0 = ts_us();
+        if (esidx_build_name_rank(db) == 0)
+            LOGD("update: name rank rebuilt over %u entries in %.3f ms",
+                 db->et.count, ts_ms_since(r0));
+        else
+            LOGW("update: name rank rebuild failed; a name sort will fall back to "
+                 "comparing folded names");
+    }
+
     /* Tombstones are not reclaimed in place (design §11 D8), so a tree that is
      * rewritten often enough would otherwise grow the id space without bound. At
      * a quarter of the table the memory and the per-query bitmap walk have grown

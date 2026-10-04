@@ -54,15 +54,19 @@ acceptance client, not a user-facing tool, so `make install` installs only
 
 ## Test
 
-Three suites, all runnable from a clean checkout:
+Suites and harnesses, all runnable from a clean checkout:
 
 ```sh
-./test.sh              # index and query correctness   (210 assertions)
+./test.sh              # index and query correctness   (219 assertions)
 ./test_etp.sh          # protocol acceptance           (213 assertions)
 make test-all          # both, in that order
 
 ./round.sh             # one full round on a real tree, with timings
 ./round.sh /usr        # ...on a bigger one
+
+./cmp_ref.sh           # re-measure every value quoted against the :21 server
+./sortcmp.sh -n 3 base=/path/to/old/esidx mine=./esidx -t /usr
+                      # per-sort-key cost for several builds at once
 ```
 
 - **`test.sh`** pins the *index*, with the expected numbers taken from `find(1)`
@@ -81,6 +85,11 @@ make test-all          # both, in that order
   are not merely self-consistent.
 - **`round.sh`** is not a test; it is the demonstration that the three layers fit
   together on data nobody curated, and it is where the numbers below come from.
+- **`cmp_ref.sh`** re-measures every expected value quoted against voidtools' own
+  server, and **`sortcmp.sh`** is its counterpart for the sort: it times every sort
+  key for as many builds as you hand it on one tree. Both exist because the
+  alternative is a number produced by a throwaway script — which is exactly how the
+  sort numbers in design §10 were first produced.
 
 Both suites pass under `make DEBUG=1` (ASan + UBSan, zero leaks) and run entirely
 inside a `mktemp` directory, leaving the source tree clean.
@@ -300,9 +309,12 @@ main.c         CLI: build / update / query / serve
 log.c log.h    leveled logging, runtime-switchable
 timer.h        monotonic phase timing helpers
 tools/etp_probe.c   the acceptance client (built by `make`, and by `make etp-probe`)
+tools/order_ref.c  the sort-order oracle: `strcasecmp`, in C, because `sort -f` is not
 test.sh        index and language suite
 test_etp.sh    protocol acceptance suite
 round.sh       one full round, with timings
+cmp_ref.sh     re-measures every number quoted against the reference server
+sortcmp.sh     per-sort-key cost for several builds at once (design §10)
 ```
 
 ## License

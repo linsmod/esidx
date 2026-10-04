@@ -349,6 +349,10 @@ Record that in the commit message. Examples from this codebase:
 | the 503 guard fired on an armed PASV | the guard was copied from a reference whose state variable means something slightly different |
 | `OPTS UTF8 ON` answered `501`, hanging the official client | the probe only ever sent what it had been taught to send, and that list had no `OPTS` — the verb was only on the wire when the real client was pointed at the server (§1.4). A rejection the client does not treat as fatal just stops it sending anything else, which looks like a hang with no error anywhere. |
 | the indexed root printed its own path as its name, with an empty PATH column, and `name:` matched the directories *above* the root | every other row's parent is in the index, so the root was the only row where the two spellings could differ — and no term read it. Fixed by `display_name_of()` + `dirname(path_of())` (design §12.12); found by diffing both servers' full result sets, which `cmp_ref.sh` now does whenever the index delta is not 0. |
+| a path sort allocated 64 KiB per row and, where malloc refused, silently became a **name** sort | every path-sort assertion sorted a *filtered* result set (the largest: three rows), and on WSL2's `/etc` the 104 MB of allocations succeed. It needs >26 000 rows in the result set, which is the regime §2.4 says WSL2 is not, and no `round.sh` drive sorted by path at all. The assertion for it runs the sort under `ulimit -v`, because without the cap the old code **passes** |
+| the sort's folded-key arena was one realloc-doubling buffer, so every pointer already handed to an earlier row dangled | **`-O2` hid it and the DEBUG build caught it** — the freed block still holds its bytes, so the order assertions passed at `-O2` and failed under ASan (§3.1). Fixed by never moving a block. Worth recording as a rule: an arena that hands out pointers must not grow by `realloc`, because the caller has already stored the old addresses |
+| `sort:attributes:` and `sort:inverse_size:` on the CLI silently sorted by **name** | `main.c` carried its own list of sort keys beside the 22-name table the ETP path uses, and the two drifted. The ETP wire was always right, so `test_etp.sh` could not see it; and a name sort and an attribute sort return the same *rows*, so a row count could not either. What found it was a measurement that made no sense — a numeric key 2.4x faster than the same key with an integer compare. The CLI now goes through `sort_from_etp_name()` and **refuses** an unknown key |
+| `sort -f` is not a case-insensitive byte order, and neither is `tr A-Z a-z \| sort` | GNU sort folds for *equality* but orders by the original bytes; under `LC_ALL=C` it compares bytes **signed** while `strcasecmp` compares unsigned, so any byte >= 0x80 lands in the other half of the order. Both agree with `strcasecmp` on a lower-case fixture, so an assertion written against them passes for the wrong reason — which is how a `sort -f` oracle survived a commit. The oracle is `tools/order_ref.c`, which *is* `strcasecmp` |
 
 ### 3.5 A test that cannot fail is worse than no test
 
@@ -411,12 +415,21 @@ Do not re-litigate these; they were measured and the conclusions are recorded:
   match, so intersecting can only drop rows `text_match()` rejects. That is why
   `tri_applies()` lists the shapes it may touch rather than the ones it may not: a
   refused prefilter is only slower, an accepted one that is wrong loses rows.
-- **`image:` is the largest cost on a real tree** — 55.7 ms on `r7000`, 54 of it the
-  sort over 55 229 rows. And the same sort over an unfiltered `/usr` is 169 ms over
-  372 084 rows, so it is not `image:` that is expensive: it is ~6 M `strcasecmp`
-  calls in `cmp_rec`, at ~28 ns each. An unfiltered path sort went from 1 310 ms to
-  169 ms of sort when the per-row buffer was fixed, which is what made the rest
-  legible. Both remaining costs are this one cost.
+- **`image:` is no longer the largest cost, and the sort was never the whole story.**
+  Every sort key over an unfiltered `/usr` cost 143–240 ms, and the cause was
+  `cmp_rec`'s comparator, not the sort's shape: ~6 M `strcasecmp` calls. Measured per
+  key with `./sortcmp.sh` (the harness is in the repo for this reason):
+  - folding each name per query and `memcmp`-ing it is **1.00×** on a name sort — a
+    name is ~20 bytes, so `memcmp` is no cheaper than `strcasecmp` and the fold costs
+    what it saves. A dense rank over the distinct display names, built in `finalize`,
+    is **2.42×** (166 → 69 ms), because it removes the comparison rather than
+    cheapening it.
+  - the fold *does* pay on the four keys whose primary compare is an integer and whose
+    tie-break is a string (extension 1.32×, date 1.50×, size 1.34×, attributes
+    1.14×) — there it is amortised over ~17 comparisons per row.
+  - `path` is **9 % slower** and recorded as such; both alternatives measured worse.
+  - The comparison count is unchanged, so §6.2 step 4 (TopK) is not the lever here.
+    What would be is a rank per *numeric* column, which is not built.
 - **The in-memory text scan is no longer the remaining cost, but it is still a cost
   on paths.** `path:` has no index yet; `path_of()` is O(depth) per call (§12 risk
   7), which is what the path half of §5.2 would fix. Measured first: a prefilter can
