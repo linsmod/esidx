@@ -66,7 +66,7 @@ Suites and harnesses, all runnable from a clean checkout:
 ```sh
 make check             # the gate: both suites x both builds, ~30 s
 
-./test.sh              # index and query correctness   (301 assertions)
+./test.sh              # index and query correctness   (314 assertions)
 ./test_etp.sh          # protocol acceptance           (217 assertions)
 make test-all          # both, in that order, optimised build only
 ESIDX_BUILD=dbg ./test.sh        # the sanitiser build
@@ -76,6 +76,7 @@ ESIDX_BUILD=dbg ./test.sh        # the sanitiser build
 
 ./cmp_ref.sh           # re-measure every value quoted against the :21 server
 ./ledger.sh /work      # the memory ledger + phase timings + the query shapes
+./tri-skip.sh /usr     # what each derived index costs to skip, and what it buys
 ./sortcmp.sh -n 3 base=/path/to/old/esidx mine=./esidx -t /usr
                       # per-sort-key cost for several builds at once
 ```
@@ -106,6 +107,11 @@ ESIDX_BUILD=dbg ./test.sh        # the sanitiser build
   shapes, so every "MiB touched" figure below has a command that reproduces it. It
   found its own reason to exist the moment a `/work` number was quoted from a
   script in `/tmp` that the next reader could not re-run.
+- **`tri-skip.sh`** is the same idea for the *derived indexes*: it answers the same
+  queries against the same snapshot twice, once with a derived index built and once
+  without, and prints the matched row count from both sides on every row — so a
+  configuration that is faster *and* wrong cannot pass for a trade. What each index
+  costs to skip is in design §5.3.1.
 
 `make check` runs both suites against both builds, and the sanitiser build is part
 of the gate rather than an extra step: it is the only thing that catches a
@@ -199,6 +205,31 @@ prints what the attribution itself cost. It has a level of its own because that 
 against HPET (1 222 ns, measured on `r7000`, where it made the split cost 36 % of the walk
 it was splitting). The per-directory trace stays at exactly `-v 4`, so `-v 5` does not drag
 651 894 `descend` lines along on a large tree.
+
+### Choosing which derived indexes to build
+
+The derived indexes are not in the snapshot (design D4), so which ones exist is a
+decision about one process, not about the file — and a snapshot written by a process
+that built everything answers queries for a process that built less:
+
+```sh
+ESIDX_SKIP_INDEX=size,mtime,ctime ./esidx serve /usr.idx -p 2121
+```
+
+Names are `size`, `mtime`, `ctime`, `trigram`, `rank` and `all`; an unrecognised one is a
+warning, a wrong case is not. `-v 3` prints what was left out at startup, and the leaf
+that had to scan instead says so per query at `-v 4`. **Every answer is identical either
+way** — that is an assertion in `test.sh`, not a claim: the same snapshot, the same six
+queries, two configurations. What each one buys is measured in design §5.3.1, and the
+short version is that `size:>10mb` is 10.5x slower without `by_size` while `size:>1k` is
+free without it — so a range index is worth its memory where the range is selective and
+nowhere else. On `/work` the three numeric arrays are 62.7 MiB each, the trigram index
+101.8 MiB and the name rank 63.8.
+
+This is a hook for tests and measurement, not the option itself: the option will be a
+flag and a config file over the same mask. It is not built yet on purpose, because
+building a switch on top of readers that do not degrade is how a fast answer becomes a
+wrong one.
 
 ## Architecture
 
@@ -421,6 +452,7 @@ test_etp.sh    protocol acceptance suite
 round.sh       one full round, with timings
 cmp_ref.sh     re-measures every number quoted against the reference server
 ledger.sh      the memory ledger, the snapshot size and the query shapes
+tri-skip.sh    what each derived index costs to skip, and what it buys (design §5.3.1)
 sortcmp.sh     per-sort-key cost for several builds at once (design §10)
 ```
 

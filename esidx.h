@@ -187,7 +187,13 @@ uint32_t bs_next(const bitset_t *b, uint32_t i);
  * index is also at its largest, which is the peak this is trying to reduce.
  *
  * Nothing outside store.c may read these: the query layer asks for a range or for a
- * count, and sidx_lower_bound() is the one place that knows the order. */
+ * count, and sidx_lower_bound() is the one place that knows the order.
+ *
+ * An empty array is legal and means "not built" -- and every reader has to say so out
+ * loud, because the alternative is the worst failure this codebase knows:
+ * sidx_range_to_bitset() over an empty array returns *no rows*, which is
+ * indistinguishable from a query that matched nothing. ESIDX_IX_* below is what turns
+ * one off, and query.c's range_on() is where the fallback that keeps it honest lives. */
 typedef struct {
     int64_t *v;           /* ascending */
     eid_t   *id;
@@ -197,6 +203,30 @@ typedef struct {
     eid_t   *did;
     uint32_t dn, dcap;
 } sidx_t;
+
+/* ------------------------------------------------- which derived indexes exist
+ *
+ * D4: the derived indexes are not in the snapshot, so "do not build this one" costs
+ * nothing to express and nothing to undo -- the next load rebuilds whatever this
+ * process did not ask for. That is a property a persisted index cannot have, and it is
+ * why these are a bitmask on the open index rather than a field in the file: the file
+ * is data, this is a choice about one process.
+ *
+ * The mask is a *skip* list, so 0 is everything on and a new bit defaults to built. */
+enum {
+    ESIDX_IX_SIZE    = 1u << 0,   /* by_size    -- size: ranges, 62.7 MiB on /work */
+    ESIDX_IX_MTIME   = 1u << 1,   /* by_mtime   -- dm: ranges */
+    ESIDX_IX_CTIME   = 1u << 2,   /* by_ctime   -- dc: ranges */
+    ESIDX_IX_TRIGRAM = 1u << 3,   /* name trigrams -- the text prefilter */
+    ESIDX_IX_RANK    = 1u << 4    /* name rank  -- SORT_NAME as an int compare */
+};
+
+/* Parse a skip list like "size,mtime" or "all". Returns 0 for nothing skipped. Read
+ * once per process from ESIDX_SKIP_INDEX (see store.c) -- a test and a diagnostic hook,
+ * not the user-facing option, which is a flag and a config file over this same mask. */
+uint32_t esidx_index_skip(const char *list);
+/* The bits in `mask` as the comma-separated names, for a log line or an error. */
+const char *esidx_index_names(uint32_t mask);
 
 void sidx_build(sidx_t *s, const int64_t *vals, uint32_t n);
 void sidx_free(sidx_t *s);
@@ -451,6 +481,12 @@ typedef struct {
      * them in step. A full scan appends with no derived indexes present and lets
      * finalize build them; a reconcile appends into a live index. */
     bool          built;
+    /* Which derived indexes esidx_finalize() must NOT build: the ESIDX_IX_* mask, read
+     * once by esidx_init(). Every *reader* of a skipped structure has to fall back to
+     * something slower and correct -- that is the whole contract, and `built` being
+     * true says nothing about it, which is why the mask is checked where it is used
+     * rather than being folded into it. */
+    uint32_t      skip;
     eid_t         root_eid; /* the scanned root; parent:"" and root: anchor here */
     scan_stats_t  scan;
 } esidx_t;

@@ -1833,6 +1833,56 @@ uint32_t ext_index_count(const ext_index_t *xi, uint16_t ext_id)
 
 /* --------------------------------------------------------------- database */
 
+/* ------------------------------------------------- which derived indexes exist */
+
+static const struct { const char *name; uint32_t bit; } ix_names[] = {
+    { "size",    ESIDX_IX_SIZE    },
+    { "mtime",   ESIDX_IX_MTIME   },
+    { "ctime",   ESIDX_IX_CTIME   },
+    { "trigram", ESIDX_IX_TRIGRAM },
+    { "rank",    ESIDX_IX_RANK    },
+};
+
+uint32_t esidx_index_skip(const char *list)
+{
+    if (!list || !*list) return 0;
+    uint32_t mask = 0;
+    /* strtok on a local copy: the caller's string is the environment block and
+     * modifying it is not something a library may do. */
+    char buf[128];
+    size_t n = strlen(list);
+    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+    memcpy(buf, list, n);
+    buf[n] = '\0';
+    for (char *tok = strtok(buf, ",: \t"); tok; tok = strtok(NULL, ",: \t")) {
+        if (!strcasecmp(tok, "all")) { mask |= ESIDX_IX_SIZE | ESIDX_IX_MTIME |
+                                           ESIDX_IX_CTIME | ESIDX_IX_TRIGRAM |
+                                           ESIDX_IX_RANK; continue; }
+        int known = 0;
+        for (size_t i = 0; i < sizeof(ix_names) / sizeof(ix_names[0]); i++)
+            if (!strcasecmp(tok, ix_names[i].name)) { mask |= ix_names[i].bit; known = 1; }
+        /* An unknown name is a typo, and a typo that silently built the index anyway is
+         * how a memory option ends up believed to be off when it is on. Case does *not*
+         * warn: refusing `siZE` would be the same trap the other way round. */
+        if (!known) LOGW("ESIDX_SKIP_INDEX: '%s' is not an index; known are "
+                         "size,mtime,ctime,trigram,rank,all", tok);
+    }
+    return mask;
+}
+
+const char *esidx_index_names(uint32_t mask)
+{
+    static char buf[128];
+    size_t at = 0;
+    buf[0] = '\0';
+    for (size_t i = 0; i < sizeof(ix_names) / sizeof(ix_names[0]); i++) {
+        if (!(mask & ix_names[i].bit)) continue;
+        at += (size_t)snprintf(buf + at, sizeof(buf) - at, "%s%s",
+                               at ? "," : "", ix_names[i].name);
+    }
+    return buf;
+}
+
 void esidx_init(esidx_t *db)
 {
     memset(db, 0, sizeof(*db));
@@ -1840,6 +1890,14 @@ void esidx_init(esidx_t *db)
     db->di.ht_val = calloc(1024, sizeof(eid_t));
     db->di.ht_mask = 1023;
     db->root_eid = EID_NONE;
+    /* A test and a diagnostic hook, not the user-facing option: the option is a flag
+     * and a config file over this same mask, and it is deliberately not built yet,
+     * because building it on top of a mask whose readers do not yet degrade correctly
+     * would be shipping a switch that turns a fast answer into a wrong one. Read here,
+     * once, so every caller of esidx_finalize() obeys it without a signature change. */
+    db->skip = esidx_index_skip(getenv("ESIDX_SKIP_INDEX"));
+    if (db->skip)
+        LOGI("indexes not built: %s", esidx_index_names(db->skip));
 }
 
 void esidx_free(esidx_t *db)
@@ -1986,19 +2044,36 @@ void esidx_finalize(esidx_t *db)
     TSDONE2("finalize: dir path hash", t0, "(dirs=%u table=%u slots)",
             db->di.ht_count, db->di.ht_mask + 1);
 
+    /* The three numeric arrays, and the skip mask that leaves one of them out. A
+     * skipped array is not an error and not a silent one: it prints its own line, so a
+     * memory measurement that turned one off says so in the same run that reports the
+     * saving. Which is also the only reason this is safe to expose as an option -- the
+     * reader has to degrade, and query.c's range_on() is where that is decided. */
     t0 = ts_us();
-    sidx_build(&db->by_size, db->et.size, db->et.count);
-    TSDONE("finalize: sorted index size", t0);
+    if (db->skip & ESIDX_IX_SIZE)
+        LOGI("finalize: sorted index size SKIPPED");
+    else {
+        sidx_build(&db->by_size, db->et.size, db->et.count);
+        TSDONE("finalize: sorted index size", t0);
+    }
 
     t0 = ts_us();
-    sidx_build(&db->by_mtime, db->et.mtime, db->et.count);
-    TSDONE("finalize: sorted index mtime", t0);
+    if (db->skip & ESIDX_IX_MTIME)
+        LOGI("finalize: sorted index mtime SKIPPED");
+    else {
+        sidx_build(&db->by_mtime, db->et.mtime, db->et.count);
+        TSDONE("finalize: sorted index mtime", t0);
+    }
 
     /* dc: needs its own sorted array; without it the leaf could only be a scan,
      * and the client asks for DATE_CREATED on every search */
     t0 = ts_us();
-    sidx_build(&db->by_ctime, db->et.ctime, db->et.count);
-    TSDONE("finalize: sorted index ctime", t0);
+    if (db->skip & ESIDX_IX_CTIME)
+        LOGI("finalize: sorted index ctime SKIPPED");
+    else {
+        sidx_build(&db->by_ctime, db->et.ctime, db->et.count);
+        TSDONE("finalize: sorted index ctime", t0);
+    }
 
     t0 = ts_us();
     ext_index_build(&db->ext, db);
@@ -2009,15 +2084,20 @@ void esidx_finalize(esidx_t *db)
     TSDONE("finalize: type bitmaps", t0);
 
     t0 = ts_us();
-    if (tri_index_build(&db->tri, db) != 0)
+    if (db->skip & ESIDX_IX_TRIGRAM)
+        LOGI("finalize: name trigrams SKIPPED");
+    else if (tri_index_build(&db->tri, db) != 0)
         LOGE("finalize: continuing without the name trigram index; text queries "
              "stay correct and stay slow");
-    TSDONE2("finalize: name trigrams", t0, "(%u distinct, %u postings)",
-            db->tri.n_slots, db->tri.n_postings);
+    if (!(db->skip & ESIDX_IX_TRIGRAM))
+        TSDONE2("finalize: name trigrams", t0, "(%u distinct, %u postings)",
+                db->tri.n_slots, db->tri.n_postings);
 
     /* The name rank has to exist before a query can sort by name as an integer, and
      * esidx_build_name_rank() reports its own timing, so nothing is wrapped here. */
-    if (esidx_build_name_rank(db) != 0)
+    if (db->skip & ESIDX_IX_RANK)
+        LOGI("finalize: name rank SKIPPED");
+    else if (esidx_build_name_rank(db) != 0)
         LOGE("finalize: continuing without the name rank; a name sort falls back "
              "to comparing folded names");
 

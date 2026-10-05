@@ -374,6 +374,59 @@ incremental updates cannot tolerate [F2]. Three options were weighed:
 
 See decision D3.
 
+#### 5.3.1 An empty sorted array is legal, and it used to answer zero rows
+
+`by_size`, `by_mtime` and `by_ctime` are derived (D4), so "do not build this one" costs
+nothing to express: the next load rebuilds whatever the process did not ask for, and the
+snapshot never has to be rewritten. `ESIDX_SKIP_INDEX` does it today as a mask on the open
+index — deliberately *not* a field in the file, because the file is data and this is a
+choice about one process.
+
+The price of that freedom is a contract: **every reader of a skipped structure must
+degrade to something slower and correct.** `sidx_range_to_bitset()` over an empty array
+sets no bits, so a valid `size:>1k` answered **zero rows**, with no error, no warning and
+exit status 0 — indistinguishable from a search that matched nothing, which is the failure
+class §5.3 of AGENTS.md calls the worst. It was worse than a plain bug because the two
+halves disagreed: `est_leaf()` already refused to seed a candidate set from an empty array
+(`if (!ok || !s->n) return UINT32_MAX`), so the optimiser knew the leaf was unusable while
+the executor went ahead and emptied the answer. **Partial correctness reads as robustness.**
+
+`range_on()` now falls back to the column, which is the same shape `depth:`/`len:`/
+`child-count:` have always used — the value is in the column whatever the array did — and
+logs the degradation per query at DEBUG, because an answer that is right for the wrong
+reason is exactly what this section is about. §10 has the measurements.
+
+| skipped | query on /usr | rows | eval | sort | total |
+|---|---|---|---|---|---|
+| — | `size:>10mb` | 426 | 0.029 → **1.273** | 0.065 → 0.064 | 0.13 → 1.37 ms |
+| — | `size:<1k` | 138 984 | 0.619 → 1.949 | 23.54 → 23.74 | 24.5 → 25.7 ms |
+| — | `size:>1k` | 233 021 | 1.169 → 2.342 | 41.36 → 40.49 | 43.1 → 42.9 ms |
+| — | `dm:today` | 4 | 0.024 → **1.270** | — | 0.11 → 1.35 ms |
+| — | `dc:>2000` | 372 084 | 1.783 → 2.079 | 68.46 → 67.66 | 70.3 → 69.8 ms |
+| trigram | `conf` | 8 484 | 2.597 → **27.994** | 0.847 → 0.932 | 3.5 → 29.0 ms |
+| trigram | `path:/usr *.conf size:>1k` | 466 | 20.661 → 44.762 | — | 21.3 → 45.4 ms |
+| rank | `image: sort:name:asc` | 55 229 | 0.181 → 0.179 | 7.550 → **21.225** | 7.8 → 21.5 ms |
+
+(r7000, best of 5, `./tri-skip.sh /usr 5`, one snapshot serving both configurations. The
+harness prints the matched count from both sides on every row precisely so a "faster" row
+that answered something else could not pass for a trade.)
+
+Three things fall out of that table, and they are why the option is worth having rather
+than a fixed default:
+
+- **A range index is worth its memory only where the range is selective.**
+  `size:>10mb` is 10.5x without it; `size:>1k`, which matches 233 021 of 372 084 rows,
+  is **free** without it — the 41 ms sort over the whole table dwarfs the 1.2 ms the
+  range saved, and the total actually came out 0.2 ms *faster*. So "12.8 MiB for
+  `by_size` on /usr" is not a cost that has to be justified in general; it buys the
+  selective shapes and nothing else.
+- **A selective range pays twice.** The seeding is what keeps the *sort* small as well as
+  the eval, so removing the array costs twice over on `size:>10mb` — though on a 426-row
+  result the second term is only 0.065 ms.
+- **The rank is a sort cost, not an eval cost**, so its 2.8x is invisible in eval
+  (0.181 → 0.179) and all of it is in the sort (7.55 → 21.2 ms). A harness that printed
+  only plan/eval would have reported this option as free.
+
 ### 5.4 Enum bitmaps
 
 `is_dir`, `ext_id`, each `attrib` bit, `index_type` each get a bitmap. The set
@@ -722,13 +775,13 @@ Each row: source → what was taken → how it lands here → why it changed.
 | 4.2 | extension-name interning | `store.c` | **done** — an open-addressed table over the name, so `ext_intern()` is O(1) instead of a scan of every name interned so far: 519 string compares per call down to 1.16 on /work, which is 5.8 s of user time on a build that is otherwise I/O-bound. Derived, so no snapshot mentions it (§4.2 for the two off-by-ones it took to get right) |
 | 5.1 | `dir_id -> children`, `path -> eid` hash | `store.c` | **done** — the children are one flat array grouped by directory ordinal (a CSR): exact extents, 100 % occupancy, one allocation for 630 472 directories, where the per-directory vectors were at 53 % in 630 472 allocations. It is rebuilt from the columns once per build and once per reconcile that added something, because a shared array has no room in the middle |
 | 5.2 | trigram index, sorted/reversed name arrays | `trigram.c` | **name half done** — `trigram.c`, byte trigrams over the display name, 33 727 keys / 4.83 M postings at 3.7 × 10⁵ entries; §5.2.1 for what was deliberately left out and why. **Postings are delta-varint encoded** (318.6 → 101.8 MiB on /work, §10). **Path half and the sorted/reversed name arrays not started** |
-| 5.3 | sorted array + delta buffer | `store.c` | **done** — `sidx_update`/`sidx_erase` write the delta, D3's 1%/60 s merge is implemented, and the range read honours the retractions. Two arrays (`int64`, `eid`) rather than one of structs: 12 bytes a row against 16, of which 4 were padding — 62.7 MiB on /work. The build sorts the ids against the value column and gathers; the merge is a linear merge of two sorted runs. Nothing outside `store.c` reads the layout |
+| 5.3 | sorted array + delta buffer | `store.c` | **done** — `sidx_update`/`sidx_erase` write the delta, D3's 1%/60 s merge is implemented, and the range read honours the retractions. Two arrays (`int64`, `eid`) rather than one of structs: 12 bytes a row against 16, of which 4 were padding — 62.7 MiB on /work. The build sorts the ids against the value column and gathers; the merge is a linear merge of two sorted runs. Nothing outside `store.c` reads the layout. **Empty is legal and means "not built"**, and `range_on()` scans the column instead — see §5.3.1 |
 | 5.4 | dense bitset | `index.c` | done; CRoaring at P4 (D7). Set algebra lives here, not in the executor |
 | 5.4 | ext bitmaps, file:/folder: bitmaps | `store.c` | done — built in `finalize`, so the snapshot format is unchanged |
 | 5.5 | aggregate columns + bubbling | `store.c` | **first aggregate done** — `nchild`, the child count, stored rather than derived and maintained in the same two functions that maintain the children vectors. It exists because those vectors are indexed by directory ordinal and `child-count:` reads the value once per candidate row: measured over 372 084 rows, reading the count out of the vector cost 2.4 -> 6.4 ms of eval. Not persisted (the load path rebuilds the vectors and the count together, D4). The remaining aggregates, and bubbling them to ancestors, are not started |
 | 5.6-5.8 | content, dupe, sparse metadata | — | not started (P6) |
 | 6.1 | lexer → parser → AST | `lexer.c`, `parser.c` | **done**. A term's value is bounded by `SYNTAX_VALUE_MAX` (8192), which is the longest control line the ETP layer will hand over — deliberately *not* smaller, because a value that arrives cut is a query that answers something else, and three buffers on the way in used to cut one (this one at 2047; the other two in the protocol layer) |
-| 6.2 | optimiser: selectivity estimate, driver selection | `query.c` | **done** for step 1-2 (exact cardinality per leaf, no histogram yet). Step 3 ordering and step 4 TopK not started — see below. The `size:`/`dm:`/`dc:` estimates are now upper bounds once the D3 delta is non-empty, because they count the main array without the retractions. A text leaf can be costed from its shortest trigram posting list (§5.2) but is **still not a driver**: the filter narrows eval, not the candidate count |
+| 6.2 | optimiser: selectivity estimate, driver selection | `query.c` | **done** for step 1-2 (exact cardinality per leaf, no histogram yet). Step 3 ordering and step 4 TopK not started — see below. The `size:`/`dm:`/`dc:` estimates are now upper bounds once the D3 delta is non-empty, because they count the main array without the retractions. A text leaf can be costed from its shortest trigram posting list (§5.2) but is **still not a driver**: the filter narrows eval, not the candidate count. An empty array reports itself unusable here and `range_on()` scans the column instead (§5.3.1) |
 | 6.3 | execution: candidates → bitmaps → matchers → sort → slice | `query.c` | **done**, including the second-stage FILTER_* pass. The text matcher implements Everything's rule for *what a term reads* — the filename, or the path once the value carries a separator or says `path:` — verified shape by shape against voidtools' server; §12.10 has the table and the two shapes still open. An `ext:` term's id list is sized by the term, not by a fixed 256 (§6.3, and the reason is in the code): a longer list used to be cut with no complaint |
 | 6.4 | result cache | `etp.c` | **done** — the full sorted set is kept and re-sliced, and invalidated by the index epoch |
 | 7 | full scan | `scan.c` | done; concurrency (D6) not started |

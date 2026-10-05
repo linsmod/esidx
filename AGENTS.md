@@ -510,6 +510,19 @@ Do not re-litigate these; they were measured and the conclusions are recorded:
 - **`path_of()` is O(depth) and does not allocate** (§12 risk 7, corrected). It was
   the *sort* that allocated per row; there is no path-sort cache left, because there
   was never a second call to cache.
+- **A derived index that is not built must answer slower, never differently**, and the
+  reason it is worth stating is that two halves disagreed: `est_leaf()` already refused
+  to seed from an empty sorted array while `range_on()` went ahead and emptied the
+  answer, so `size:`/`dm:`/`dc:` returned **zero rows** for a valid query with no error
+  and exit status 0. Partial correctness reads as robustness. `ESIDX_SKIP_INDEX` and
+  `./tri-skip.sh` exist so this is checkable rather than asserted: the harness prints
+  the matched count from both configurations on every row, because a skip index is worth
+  nothing if the two sides may disagree. Three things fall out of the numbers (design
+  §5.3.1): a range index pays **only where the range is selective** (`size:>10mb` 10.5x
+  slower without it, `size:>1k` free without it — a 41 ms sort dwarfs the 1.2 ms it
+  saved); a missing index costs twice, since seeding is what keeps the *sort* small too;
+  and the **name rank is a sort cost, not an eval cost** (2.8x, all of it in sort), so a
+  harness that printed only plan/eval would have called it free.
 
 ### 4.4 Do not optimise on a guess
 

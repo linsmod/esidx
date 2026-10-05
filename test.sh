@@ -1534,6 +1534,112 @@ else
 fi
 cat "$TMP/err" >>"$DIAG"
 
+# ------------------------------------------- a derived index that is not there
+#
+# D4 says the derived indexes are not in the snapshot, which is what makes "do not build
+# this one" free: the same file serves a process that built it and a process that did
+# not. The price of that freedom is that every reader has to degrade to something
+# *slower and correct*, because an empty sorted array answers a range with no rows at
+# all -- and a range answered with no rows is indistinguishable from a search that
+# matched nothing. That is not a theoretical concern: it is what `size:`, `dm:` and
+# `dc:` did, and est_leaf() already refused to seed from an empty array while the
+# executor went ahead and emptied the answer, so the two halves disagreed.
+#
+# So this is an invariance check, and the strongest form of it: **the same snapshot file,
+# the same queries, two configurations, identical answers.** Not "the degraded answer
+# looks plausible" -- identical. A fixture where the two can differ is a fixture where
+# the check cannot fail.
+#
+# The env var goes on the *query*, not on the build, which is the property itself: the
+# snapshot was written by a process that built every index and knows nothing about which
+# ones this one wants.
+say "a derived index that is not there"
+
+SKIP_DB="$TMP/skip.idx"
+build "$TREE" "$SKIP_DB" >/dev/null
+DB="$SKIP_DB"
+
+# qd <expr...> -- the same query with the arrays absent. Identical plumbing to q() on
+# purpose: an earlier version of this wrote to stdout and the results landed in the
+# suite's own output, which is a reminder that a helper which does not capture is a
+# helper whose comparison is against nothing.
+qd() { ESIDX_SKIP_INDEX="$DEGRADED" "$BIN" query "$SKIP_DB" "$@" >"$TMP/out" 2>>"$DIAG"
+       LAST=$(cat "$TMP/out"); }
+DEGRADED=size,mtime,ctime
+
+# The shapes are chosen so the missing array is the *only* thing that can decide them:
+# a bare range (so the driver would have been the array), a range ANDed with a column
+# leaf, and the two date forms. `dc:` is here because by_ctime is its only index and it
+# is the one Everything leaves off by default.
+for shape in "size:>1k" "size:1000..5000" "size:>1k ext:conf" "dm:today" "dm:>2000" "dc:>2000"; do
+    # shellcheck disable=SC2086
+    set -- $shape
+    q "$@"
+    full=$(n "$LAST"); full_paths=$(paths "$LAST")
+    qd "$@"
+    bare=$(n "$LAST"); bare_paths=$(paths "$LAST")
+    if [ "$full" = "$bare" ] && [ "$full_paths" = "$bare_paths" ]; then
+        ok "'$shape' answers the same $full row(s) with no sorted array"
+    else
+        bad "'$shape' answers the same with no sorted array" \
+            "with: $full rows [$full_paths]  without: $bare rows [$bare_paths]"
+    fi
+done
+
+# ...and the degradation is *visible*. An answer that is right for the wrong reason is
+# the failure this whole section is about, so "it agreed" is not enough -- there has to
+# be a line saying the column was scanned instead, or a query that never reached
+# range_on() would pass the four above silently. DEBUG, not INFO: this is per query and
+# it says which leaf did it, which is the pair an INFO line cannot carry (AGENTS.md 2.3).
+ESIDX_SKIP_INDEX=size "$BIN" -v 4 query "$SKIP_DB" "size:>1k" >/dev/null 2>"$TMP/err"
+cat "$TMP/err" >>"$DIAG"
+if grep -q 'sorted index size SKIPPED' "$TMP/err"; then
+    ok "the skipped index says so in the log rather than going missing"
+else
+    bad "the skipped index says so in the log" \
+        "$(grep -E 'not built|SKIPPED' "$TMP/err" || echo 'no line at all')"
+fi
+if grep -q "text: size has no sorted array .*; scanning the column instead" "$TMP/err"; then
+    ok "...and so does the leaf that had to scan instead"
+else
+    bad "...and so does the leaf that had to scan instead" \
+        "$(grep -F 'no sorted array' "$TMP/err" || echo 'no degraded line: the range leaf never ran, so the four assertions above proved less than they look')"
+fi
+
+# The mask is a list of names. Two ways to get one you did not ask for, and both have to
+# be handled: a name that does not exist at all, and one that exists in a different
+# case. The first is reported, because a typo that silently built the index anyway is
+# how a memory option ends up believed to be off while it is on; the second is honoured,
+# because refusing it would be the same trap wearing the other hat -- the user asked for
+# less memory and got all of it, with a warning they could have read either way.
+if ESIDX_SKIP_INDEX=siz ./esidx -v 3 build "$TREE" -o "$TMP/typo.idx" 2>&1 >/dev/null \
+        | grep -q "is not an index"; then
+    ok "a misspelled index name in the skip list is reported"
+else
+    bad "a misspelled index name in the skip list is reported" "no warning; it was ignored"
+fi
+if ESIDX_SKIP_INDEX=siZE ./esidx -v 3 build "$TREE" -o "$TMP/typo.idx" 2>&1 >/dev/null \
+        | grep -q 'indexes not built: size'; then
+    ok "a name in the wrong case is honoured rather than refused"
+else
+    bad "a name in the wrong case is honoured rather than refused" \
+        "the mask came out empty, so the index was built"
+fi
+
+# The trigram index and the name rank are the other two bits, and they already had
+# their fallbacks (tri_index_filter() refuses on an empty table; SORT_NAME reads
+# name_rank only if it is non-NULL). Pinned here so that "already worked" is a
+# measurement rather than a memory, and so a third derived index added later has
+# somewhere to be added.
+for bit in trigram rank; do
+    a=$(DB="$SKIP_DB"; "$BIN" query "$SKIP_DB" "conf" 2>/dev/null | paths)
+    b=$(ESIDX_SKIP_INDEX=$bit "$BIN" query "$SKIP_DB" "conf" 2>/dev/null | paths)
+    expect "'conf' is unaffected by dropping the $bit index" "$b" "$a"
+done
+a=$("$BIN" query "$SKIP_DB" "ext:conf" "sort:name:asc" 2>/dev/null | paths)
+b=$(ESIDX_SKIP_INDEX=rank "$BIN" query "$SKIP_DB" "ext:conf" "sort:name:asc" 2>/dev/null | paths)
+expect "a name sort still orders correctly without the rank" "$b" "$a"
+
 # --------------------------------------------------------------- logging
 
 say "instrumentation"

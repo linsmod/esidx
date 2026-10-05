@@ -961,11 +961,65 @@ static int64_t parse_time_adapter(const char *s, int *ok, int64_t *span)
     return v.at;
 }
 
-/* One numeric range leaf over a sorted array, shared by size:, dm:, dc: ...
- * `allow_dash` is false for dates, where a dash is part of YYYY-MM-DD. */
-static int range_on(qctx_t *c, const ast_t *t, bitset_t *out,
-                    const sidx_t *sidx, int is_time)
+/* which plain column range_on_column() reads */
+enum { COL_SIZE, COL_MTIME, COL_CTIME, COL_CHILDREN, COL_DEPTH, COL_LEN };
+
+static int64_t column_value(const esidx_t *db, int column, uint32_t i)
 {
+    switch (column) {
+    case COL_DEPTH:   return db->et.depth[i];
+    case COL_LEN:     return db->et.name[i].len;
+    case COL_SIZE:    return db->et.size[i];
+    case COL_MTIME:   return db->et.mtime[i];
+    case COL_CTIME:   return db->et.ctime[i];
+    default:          return di_child_count(db, i);   /* COL_CHILDREN */
+    }
+}
+
+/* The same bounds, evaluated against a plain column instead of a sorted array:
+ * depth:, len:, child-count:, and -- the reason this took a `column` -- size:, dm: and
+ * dc: when their sorted array is not built (ESIDX_IX_SIZE and friends).
+ *
+ * `is_time` picks the value parser, because a dash is part of YYYY-MM-DD and not a
+ * range separator. */
+static int range_on_column(qctx_t *c, const ast_t *t, bitset_t *out,
+                           int column, int is_time)
+{
+    int64_t lo, hi;
+    int ok = 0;
+    parse_range2(t->val, t->cmp, &lo, &hi,
+                 is_time ? parse_time_adapter : parse_size_value, &ok, is_time ? 0 : 1);
+    if (!ok) { bs_clear(out); return 0; }
+    const esidx_t *db = c->db;
+    for (uint32_t i = 0, nn = c->n; i < nn; i++) {
+        if (!bs_test(out, i)) continue;
+        int64_t v = column_value(db, column, i);
+        if (v >= lo && v <= hi) continue;
+        bs_clear_bit(out, i);
+    }
+    return 0;
+}
+
+/* One numeric range leaf over a sorted array, shared by size:, dm:, dc: ...
+ * `allow_dash` is false for dates, where a dash is part of YYYY-MM-DD.
+ *
+ * With no array, this falls back to the column. That branch is not an optimisation
+ * choice, it is the difference between a slow answer and a wrong one: sidx_range_to_
+ * bitset() over an empty array sets no bits at all, so without the fallback a valid
+ * `size:>1k` answers zero rows with no error and no warning -- indistinguishable from a
+ * search that genuinely matched nothing. The estimator already refuses an empty array
+ * (`est_leaf`: `if (!ok || !s->n) return UINT32_MAX`), so before this the two halves
+ * disagreed: the optimiser knew the leaf was unusable and would not seed from it, while
+ * the executor went ahead and emptied the answer. */
+static int range_on(qctx_t *c, const ast_t *t, bitset_t *out,
+                    const sidx_t *sidx, int column, int is_time)
+{
+    if (!sidx->n) {
+        LOGD("text: %s has no sorted array (ESIDX_IX_*); scanning the column instead",
+             t->fn ? t->fn : "?");
+        return range_on_column(c, t, out, column, is_time);
+    }
+
     int64_t lo, hi;
     int ok = 0;
     parse_range2(t->val, t->cmp, &lo, &hi,
@@ -985,45 +1039,19 @@ static int range_on(qctx_t *c, const ast_t *t, bitset_t *out,
     return 0;
 }
 
-/* which plain column range_on_column() reads */
-enum { COL_CHILDREN, COL_DEPTH, COL_LEN };
-
-/* The same bounds, evaluated against a plain column instead of a sorted array:
- * depth:, len:, child-count:. */
-static int range_on_column(qctx_t *c, const ast_t *t, bitset_t *out, int column)
-{
-    int64_t lo, hi;
-    int ok = 0;
-    parse_range2(t->val, t->cmp, &lo, &hi, parse_size_value, &ok, 1);
-    if (!ok) { bs_clear(out); return 0; }
-    const entry_table_t *et = &c->db->et;
-    for (uint32_t i = 0, nn = c->n; i < nn; i++) {
-        if (!bs_test(out, i)) continue;
-        int64_t v;
-        switch (column) {
-        case COL_DEPTH:   v = et->depth[i]; break;
-        case COL_LEN:     v = (int64_t)et->name[i].len; break;
-        default:          v = di_child_count(c->db, i); break;   /* COL_CHILDREN */
-        }
-        if (v >= lo && v <= hi) continue;
-        bs_clear_bit(out, i);
-    }
-    return 0;
-}
-
 static int m_size(qctx_t *c, const ast_t *t, bitset_t *out)
 {
-    return range_on(c, t, out, &c->db->by_size, 0);
+    return range_on(c, t, out, &c->db->by_size, COL_SIZE, 0);
 }
 
 static int m_mtime(qctx_t *c, const ast_t *t, bitset_t *out)
 {
-    return range_on(c, t, out, &c->db->by_mtime, 1);
+    return range_on(c, t, out, &c->db->by_mtime, COL_MTIME, 1);
 }
 
 static int m_ctime(qctx_t *c, const ast_t *t, bitset_t *out)
 {
-    return range_on(c, t, out, &c->db->by_ctime, 1);
+    return range_on(c, t, out, &c->db->by_ctime, COL_CTIME, 1);
 }
 
 /* depth: is a plain column scan today (design §2, L0 calls it inline O(1)); it is
@@ -1031,7 +1059,7 @@ static int m_ctime(qctx_t *c, const ast_t *t, bitset_t *out)
  * pass with no allocation, so it can seed the candidate set. */
 static int m_depth(qctx_t *c, const ast_t *t, bitset_t *out)
 {
-    return range_on_column(c, t, out, COL_DEPTH);
+    return range_on_column(c, t, out, COL_DEPTH, 0);
 }
 
 /* attrib: on ext4 only H (leading dot) and D (from d_type) exist; everything
@@ -1090,12 +1118,12 @@ static int m_empty(qctx_t *c, const ast_t *t, bitset_t *out)
 
 static int m_child_count(qctx_t *c, const ast_t *t, bitset_t *out)
 {
-    return range_on_column(c, t, out, COL_CHILDREN);
+    return range_on_column(c, t, out, COL_CHILDREN, 0);
 }
 
 static int m_len(qctx_t *c, const ast_t *t, bitset_t *out)
 {
-    return range_on_column(c, t, out, COL_LEN);
+    return range_on_column(c, t, out, COL_LEN, 0);
 }
 
 /* -------------------------------------------------------------- SCAN leaves */
