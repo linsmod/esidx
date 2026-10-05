@@ -1202,6 +1202,22 @@ Six things it says that no document recorded, and what has been done about each:
   touched for 318.6 MiB of ids. Now counted first and sized exactly, at the cost of a second
   walk over the names: −85 MiB of peak rss for +21 % on `finalize`, which is +5 % of a /work
   build and is re-run by every load.
+- **The trigram posting lists are a third of the index and nothing had measured their
+  shape.** 318.6 MiB, a mean of 15.2 postings an entry, and a mean cannot decide anything.
+  `esidx_log_mem()` now prints the length distribution and the gap distribution, because
+  the two fixes anyone would reach for want opposite numbers and neither was available
+  (`log_tri_shape()`, and the measurement is its own commit rather than a footnote to
+  one). On /work: 62 476 lists over 83 507 488 postings, and the volume is not spread —
+  **142 lists (0.2 % of the keys) hold 17 039 716 postings, 20 % of all of them**, while
+  4 731 lists hold one posting each. Nothing reaches 10 % of the table, so a stop list has
+  exactly one interesting threshold on this tree, and it is the 1 % one: dropping those
+  142 keys would remove 63.7 MiB, and a pattern that used one of them as its filter would
+  fall back to its other trigrams — a filter may always be dropped, never required
+  (§5.2's allowlist argument, run in the other direction). The gaps say the other thing:
+  ids inside a list ascend, so **1.27 bytes a gap against 4 for a raw id, 3.13x over the
+  whole set — 318.6 MiB would become ~102 MiB**, at the cost of decoding every posting
+  the prefilter reads. That is the larger prize and it is on the query path, so it is not
+  a decision this paragraph makes; it is the decision the next one has to measure.
 - **`di.child` was indexed by entry id.** 651 897 of 8 388 608 slots were a directory's, and the
   growth path memsets every new range, so all 128 MiB was resident. It is indexed by a dense
   **directory ordinal** now, with an open-addressed eid → ordinal map (6.4 MiB) beside it:
@@ -1250,7 +1266,7 @@ Where the ledger stands after the commits that acted on it, `/work` again:
 
 | | touched | address | |
 |---|---|---|---|
-| name trigram lists | 318.6 | 320.3 | exact-sized |
+| name trigram lists | 318.6 | 320.3 | exact-sized; 20 % of the postings sit in 142 of the lists |
 | entry columns | 282.0 | 282.0 | 261.1 + the `nchild` aggregate |
 | sorted arrays ×3 | 188.0 | 188.0 | **split into two arrays** — was 250.7 with 62.7 of padding |
 | names pool | 37.3 | 64.0 | **interned** — was 96.0 / 128.0 |

@@ -1403,6 +1403,17 @@ set -- $SIDX_ROWS
 expect "three sorted arrays of $(find "$TREE" | wc -l) rows" "${1:-0}" "$(( $(find "$TREE" | wc -l) * 3 ))"
 expect "at 12 bytes a row, with no padding" "${2:-0}" "12.0"
 
+# The trigram shape lines have to agree with the number the build counted as it filled
+# the lists, and those are two different code paths: `finalize` counts a posting per
+# trigram it writes, the ledger recounts them by walking the lists afterwards. If they
+# disagree then one of the two is lying, and every decision about that 318 MiB would be
+# made on the wrong number.
+"$BIN" -v 3 build "$TREE" -o "$TMP/tri.idx" >/dev/null 2>"$TMP/err"
+TRI_BUILT=$(sed -n 's/.*name trigrams: [0-9.]* ms (\([0-9]*\) distinct, \([0-9]*\) postings).*/\1 \2/p' "$TMP/err" | head -1)
+TRI_SHAPE=$(sed -n 's/.*mem trigram shape: \([0-9]*\) lists, \([0-9]*\) postings.*/\1 \2/p' "$TMP/err" | head -1)
+expect "the ledger recounts the trigram lists the build filled" \
+    "$TRI_SHAPE" "$TRI_BUILT"
+
 # --------------------------------------------------------------- logging
 
 say "instrumentation"
