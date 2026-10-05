@@ -399,10 +399,9 @@ static void ctab_load(upd_t *u, uint32_t depth, eid_t dir)
     t->dead = false;
     t->mask = t->cap - 1;
 
-    const childvec_t *cv = di_children(db, dir);
-    if (!cv) return;
-    for (uint32_t i = 0; i < cv->n; i++) {
-        eid_t kid = cv->items[i];
+    children_t cv = di_children(db, dir);
+    for (uint32_t i = 0; i < cv.n; i++) {
+        eid_t kid = cv.items[i];
         uint32_t h = name_hash(name_of(db, kid)) & t->mask;
         while (t->tab[h].name_off) h = (h + 1) & t->mask;
         t->tab[h].name_off = db->et.name[kid].off + 1;
@@ -675,6 +674,22 @@ int esidx_update(esidx_t *db, const char *root, unsigned flags, update_stats_t *
         else
             LOGW("update: name rank rebuild failed; a name sort will fall back to "
                  "comparing folded names");
+    }
+
+    /* The children, for the same reason and behind the same gate. An addition cannot go
+     * into the flat array in the middle, so di_add_child() only marked it stale -- and
+     * without this the in-memory index would answer `parent:` without the rows this
+     * pass just added. Every assertion in the suite would still pass, because each one
+     * reads the snapshot this pass writes and the load rebuilds the array: the same
+     * blindness design §3.4 records for the aggregate column. */
+    if (st->added && db->di.c_dirty) {
+        uint64_t r0 = ts_us();
+        if (esidx_build_children(db) == 0)
+            LOGD("update: children array rebuilt (%u ids in %u ranges) in %.3f ms",
+                 db->di.cn, db->di.ord_count, ts_ms_since(r0));
+        else
+            LOGW("update: children array rebuild failed; `parent:` will not see rows "
+                 "this pass added");
     }
 
     /* Tombstones are not reclaimed in place (design §11 D8), so a tree that is

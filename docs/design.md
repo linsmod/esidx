@@ -710,7 +710,7 @@ Each row: source → what was taken → how it lands here → why it changed.
 | 4.1 | name interning | `store.c` | **done** — the pool holds one copy per *distinct* name rather than one per entry: 96.0 → 37.3 MiB on /work for a 5.7 MiB table, and −61.6 MB of snapshot with it. One hash and one probe per entry in the walk, which measures as a wash on CPU (§10's ledger) |
 | 4.2 | `path_of()` parent-chain rebuild | `store.c` | done; path materialisation pending §4.2 |
 | 4.2 | extension-name interning | `store.c` | **done** — an open-addressed table over the name, so `ext_intern()` is O(1) instead of a scan of every name interned so far: 519 string compares per call down to 1.16 on /work, which is 5.8 s of user time on a build that is otherwise I/O-bound. Derived, so no snapshot mentions it (§4.2 for the two off-by-ones it took to get right) |
-| 5.1 | `dir_id → children`, `path → eid` hash | `store.c` | done |
+| 5.1 | `dir_id -> children`, `path -> eid` hash | `store.c` | **done** — the children are one flat array grouped by directory ordinal (a CSR): exact extents, 100 % occupancy, one allocation for 630 472 directories, where the per-directory vectors were at 53 % in 630 472 allocations. It is rebuilt from the columns once per build and once per reconcile that added something, because a shared array has no room in the middle |
 | 5.2 | trigram index, sorted/reversed name arrays | `trigram.c` | **name half done** — `trigram.c`, byte trigrams over the display name, 33 727 keys / 4.83 M postings at 3.7 × 10⁵ entries; §5.2.1 for what was deliberately left out and why. **Path half and the sorted/reversed name arrays not started** |
 | 5.3 | sorted array + delta buffer | `store.c` | **done** — `sidx_update`/`sidx_erase` write the delta, D3's 1%/60 s merge is implemented, and the range read honours the retractions. Two arrays (`int64`, `eid`) rather than one of structs: 12 bytes a row against 16, of which 4 were padding — 62.7 MiB on /work. The build sorts the ids against the value column and gathers; the merge is a linear merge of two sorted runs. Nothing outside `store.c` reads the layout |
 | 5.4 | dense bitset | `index.c` | done; CRoaring at P4 (D7). Set algebra lives here, not in the executor |
@@ -1289,6 +1289,29 @@ Where the ledger stands after the commits that acted on it, `/work` again:
 | dir path hash | 5.0 | 16.0 | load factor 0.31 |
 | dir paths pool | 56.6 | 64.0 | 651 897 whole paths, 91 bytes a directory |
 | **total** | **1 032.5** | 1 579 | **peak rss 1 114.1**, was 1 418.4 at the first ledger |
+
+The children are one array now, so the last table's two rows above are history: the ledger
+after the CSR reads
+
+| | touched | address | |
+|---|---|---|---|
+| dir range table | 8.0 | 8.0 | 1 048 576 slots × 2 uint32, for 630 472 directories |
+| dir children array | 20.9 | 20.9 | **5 476 484 ids in 5 476 484 slots — 100 %** |
+| **total** | **1 006.0** | 1 547 | **peak rss 1 078.0** |
+
+which is −26.5 MiB accounted and −36.1 MiB of peak: the extra 9.6 is the per-block
+overhead of 630 472 allocations, which the accounted figure never had and the kernel
+always did. It costs **+810 ms on `finalize` over 5 476 485 entries (+13 %, and +5.6 % of
+a /work build's user time)**: the build is now three passes over the columns with two
+`di_ord()` probes an entry, and the probes are the price of not keeping a 22 MiB ordinal
+column. Half of it could be had by maintaining the per-range counts in `di_add_child()`
+instead of recomputing them, which would leave two counters for one number and rely on the
+ledger's cross-check to catch them disagreeing — measured, declined, and recorded here so
+the next reader does not have to re-derive it.
+
+The walk never allocates a per-directory vector at all now. That was not a goal; it is what
+happened when the shape stopped being a vector, and it is why a fresh build's peak drops by
+the same 36 MiB rather than only its steady state.
 
 The `dir paths pool` row is new and the total moved with it, which is the point: the row was
 already being printed, carrying the reason "it is part of the names pool above, so it does

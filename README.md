@@ -279,7 +279,7 @@ Building it, on the same host:
 | **build, total** | **1 492 ms** | **59 456 ms** |
 | load | 327 ms | 5 664 ms |
 | snapshot | 20.8 MiB | 298 MiB |
-| peak rss | 76.3 MiB | **1 114 MiB** |
+| peak rss | 74.2 MiB | **1 078 MiB** |
 
 The `/work` column is one run of `./ledger.sh /work`, so its walk figure moves with the
 page cache by several seconds between runs — 53.1 s here against the 55.7 s the same
@@ -300,7 +300,7 @@ building); the only lever left on that walk is D6's concurrency.
 each — and it is the only way to tell a structure that is too big from one that is merely
 sized by the wrong number. `./ledger.sh <tree>` prints it together with the snapshot size
 and the query shapes, so a figure quoted from it can be re-measured with one command. On
-`/work` (1 114 MiB peak, **1 033 MiB accounted** — the total includes the 56.6 MiB of
+`/work` (1 078 MiB peak, **1 006 MiB accounted** — the total includes the 56.6 MiB of
 directory paths the ledger spent two commits displaying without counting):
 
 | | touched | address | |
@@ -310,24 +310,23 @@ directory paths the ledger spent two commits displaying without counting):
 | sorted arrays ×3 | 188.0 | 188.0 | 16 429 455 rows at 12 bytes, no padding |
 | names pool | 37.3 | 64.0 | one copy per distinct name: 1 499 995 of them |
 | name intern table | 5.7 | 8.0 | 2 097 152 slots for those names |
-| dir vector headers | 16.0 | 16.0 | indexed by directory ordinal, not by id |
+| dir range table | 8.0 | 8.0 | a start and a count per directory ordinal |
+| dir children array | 20.9 | 20.9 | 5 476 484 ids in 5 476 484 slots — one allocation |
 | eid → dir ordinal map | 6.4 | 6.4 | 2 097 152 slots for 630 472 directories |
 | name rank | 63.8 | 122.6 | 1 493 203 distinct folded names |
-| dir children vectors | 39.4 | 39.4 | 5 476 484 ids in 10 324 800 slots |
 | ext index | 15.1 | 11.5 | 16 384 slots for 6 765 extensions |
 | dir path hash | 5.0 | 16.0 | load factor 0.31 |
 | dir paths pool | 56.6 | 64.0 | 651 897 whole paths, 91 bytes a directory |
 
-What is left, largest first: the children vectors are at 53 % occupancy, 56.6 MiB of
-directory paths sit in a pool at all when the parent chain already rebuilds them, and the
-three sorted arrays carry a `{int64}` and an `{eid}` per row where a `{int64, eid}` struct
-was 4 bytes of padding wider — that one was 62.7 MiB until the split, and the names pool
-was 96 MiB of duplicated names until the intern table beside it. Both of those were on this
-list a few commits ago; what they bought is in the table above, and the numbers to re-run
-them with are in `docs/design.md` §10. The extension pool's own lookup was a scan of every
-extension interned so far until recently: 519 string compares per intern on `/work`,
-2.19 G of them per build, now 1.16 per intern — 5.8 s of user time on a build that is
-otherwise I/O-bound.
+What is left, largest first: 56.6 MiB of directory paths sit in a pool at all when the
+parent chain already rebuilds them. Three items that were on this list a few commits ago
+are not — the sorted arrays' 62.7 MiB of struct padding (two arrays now), the names pool's
+96 MiB of duplicated names (an intern table beside it), and the children's 53 % occupancy
+across 630 472 allocations (one array, 100 %). What they bought is in the table above, and
+the numbers to re-run them with are in `docs/design.md` §10. The extension pool's own
+lookup was a scan of every extension interned so far until recently: 519 string compares
+per intern on `/work`, 2.19 G of them per build, now 1.16 per intern — 5.8 s of user time
+on a build that is otherwise I/O-bound.
 
 Query cost on `/usr`:
 

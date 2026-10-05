@@ -85,26 +85,47 @@ typedef struct {
 
 /* --------------------------------------------------------- directory tree */
 
+/* A directory's children, as a view into one flat array. Returned by value because
+ * there is nothing to own: the storage is `dir_index_t`'s, and this type exists only so
+ * that a caller can read `items`/`n` without knowing that. */
 typedef struct {
-    eid_t    *items;
-    uint32_t  n, cap;
-} childvec_t;
+    const eid_t *items;
+    uint32_t     n;
+} children_t;
 
 typedef struct {
-    /* Indexed by *directory ordinal*, not by entry id. It used to be indexed by
-     * eid, which spends a 16-byte vector header on every id in the table when 12 %
-     * of them are directories: 8 388 608 headers on /work, of which 651 897 are
-     * live, and the growth path memsets every new range, so all 128 MiB of it was
-     * resident -- the largest single piece of pure waste in the index (design §10,
-     * "the memory ledger"). `di_ord()` is the reverse map, and it is a hash rather
-     * than a column because a column would be four bytes on every row -- 22 MiB on
-     * /work, and 22 MiB more in the snapshot -- to serve the 12 % that are
-     * directories. It is a hash rather than rank/select because a reconcile
-     * inserts directories one at a time and every rank structure that is not a
-     * Fenwick tree costs O(n) to repair. */
-    childvec_t *child;
-    uint32_t    child_n;      /* ordinals in use: one per indexed directory */
-    uint32_t    child_cap;
+    /* The children of every directory, in ONE array, grouped by *directory ordinal* --
+     * a compressed sparse row. Two things were wrong with the shape this replaced and
+     * both were measured on /work:
+     *
+     *   - it was indexed by *entry id*, which spends a vector header on every id in the
+     *     table when 12 % of them are directories: 8 388 608 headers of which 651 897
+     *     are live, and the growth path memsets every new range, so all 128 MiB of it
+     *     was resident. `di_ord()` is the reverse map, and it is a hash rather than a
+     *     column because a column would be four bytes on every row -- 22 MiB on /work,
+     *     and 22 MiB more in the snapshot -- to serve the 12 % that are directories. It
+     *     is a hash rather than rank/select because a reconcile inserts directories one
+     *     at a time and every rank structure that is not a Fenwick tree costs O(n) to
+     *     repair.
+     *   - each directory's vector grew by doubling, so the array was at 53 %
+     *     occupancy: 10 324 800 slots for 5 476 484 ids. One array with exact extents is
+     *     100 % by construction, and it is one allocation rather than 651 897 of them.
+     *
+     * The cost of the shape is that a directory's children cannot be appended to: a
+     * shared array does not have room in the middle. So additions do not write here --
+     * they set `c_dirty` and esidx_build_children() rebuilds the whole thing from the
+     * columns, which is the same bargain esidx_build_name_rank() makes and for the same
+     * reason: a rank is a sorted position, a CSR range is a sorted position, and neither
+     * can be maintained one element at a time in the middle. Nothing *reads* a stale
+     * range in between: the only reader during a pass is di_lookup_name(), and a name
+     * that was just added in this burst cannot be looked up again in the same burst.
+     */
+    eid_t      *citems;       /* every directory's children, grouped by ordinal */
+    uint32_t    cn, ccap;     /* cn == ccap after a build: the extents are exact */
+    uint32_t   *cstart;       /* ordinal -> first index into citems */
+    uint32_t   *ccount;       /* ordinal -> length; 0 for a directory with none */
+    uint32_t    ord_cap;      /* slots in cstart/ccount */
+    bool        c_dirty;      /* an addition arrived; rebuild before serving */
 
     /* eid -> ordinal, open addressing, value = ordinal + 1 so that 0 means empty.
      * The same convention as the other three open-addressed tables here. Keys are
@@ -467,13 +488,20 @@ void esidx_finalize(esidx_t *db);   /* build dir paths hash + sorted indexes */
 
 /* child count of a directory entry (design §5.5 aggregate, derived not stored) */
 uint32_t di_child_count(const esidx_t *db, eid_t dir);
-/* The children vector of a directory, or NULL if it is not an indexed directory.
- * Every reader goes through this so the ordinal lookup lives in one place. The
- * `mutable` variant exists for the two callers that shrink a vector in place
- * (esidx_remove walking a subtree, and the reconcile's claim of a new child);
- * passing a const one to them is a compile error rather than a silent no-op. */
-const childvec_t *di_children(const esidx_t *db, eid_t dir);
-childvec_t       *di_children_mut(esidx_t *db, eid_t dir);
+/* The children of a directory, as a view into the one flat array; `{NULL, 0}` for an id
+ * that is not an indexed directory, or for one with no children. Every reader goes
+ * through this so the ordinal lookup lives in one place.
+ *
+ * The view is const, which is the point of it: a caller cannot shrink a range in place,
+ * because the array is shared and a range's neighbours do not move. esidx_remove() walks
+ * a subtree through di_remove_child() instead, which is the only thing that may shrink
+ * one, and it says so. */
+children_t di_children(const esidx_t *db, eid_t dir);
+/* Rebuild the flat array from the columns: exact extents, one allocation. Called from
+ * esidx_finalize() (which covers a fresh build and a snapshot load) and at the end of a
+ * reconcile that added something -- the one bargain the shape costs, and the reason is
+ * on dir_index_t above. */
+int  esidx_build_children(esidx_t *db);
 /* Is this directory empty? A bit, because `empty:` asks it per candidate row. */
 bool di_is_empty(const esidx_t *db, eid_t dir);
 

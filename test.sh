@@ -1427,6 +1427,36 @@ LEDGER_ROWS=$(sed -n 's/.*: mem [a-z0-9 >-]* *[0-9.]* MiB touched *[0-9.]* MiB a
 expect "the accounted total is the sum of the rows that feed it" \
     "${LEDGER_TOTAL:-0}" "${LEDGER_ROWS:-x}"
 
+# 16. the children array, and the column it is built from. An addition cannot go into a
+#     shared array in the middle, so a refresh marks the array stale and rebuilds it from
+#     the columns -- and the window in between is *not* observable from outside, because
+#     every query reloads the snapshot and the load rebuilds the array anyway. So the
+#     check is the ledger's own: it prints the array's id count and what the child-count
+#     column says, side by side, and the two must be the same number. The first version
+#     of this section asserted only that the new file was findable, which passes with the
+#     rebuild removed -- the snapshot has the row either way, because it is written from
+#     the columns. `MISMATCH` in that line is the only place the staleness can show.
+say "incremental refresh: the children array and its column agree"
+CSRF="$TMP/csr"
+mkdir -p "$CSRF/d"
+printf 'x' >"$CSRF/d/one.txt"
+CSRF_DB="$TMP/csr.idx"
+build "$CSRF" "$CSRF_DB" >/dev/null
+printf 'y' >"$CSRF/d/two.txt"
+if "$BIN" -v 3 update "$CSRF_DB" >/dev/null 2>"$TMP/err"; then
+    ok "a refresh that adds a file succeeds"
+    grep -q 'MISMATCH' "$TMP/err" \
+        && bad "the children array and the child-count column agree after a refresh" \
+               "$(grep 'mem dir children' "$TMP/err")" \
+        || ok "the children array and the child-count column agree after a refresh"
+    kids=$(sed -n 's/.*mem dir children: \([0-9]*\) ids in one array.*/\1/p' "$TMP/err" | head -1)
+    expect "and the array holds every child but the root" "${kids:-0}" \
+        "$(( $(find "$CSRF" | wc -l) - 1 ))"
+else
+    bad "a refresh that adds a file" "see $TMP/err"
+fi
+cat "$TMP/err" >>"$DIAG"
+
 # --------------------------------------------------------------- logging
 
 say "instrumentation"

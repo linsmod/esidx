@@ -673,15 +673,15 @@ int esidx_remove(esidx_t *db, eid_t id)
     if (id >= et->count || (et->flags[id] & EF_DEAD)) return 0;
 
     /* Children first, so the tree is never left with a live row whose parent is
-     * a tombstone -- that combination is what path_of() would walk into. The
-     * ordinal and the vector are re-read every turn because the recursion removes
-     * from this very vector (di_remove_child swap-removes) and can reallocate it. */
-    const childvec_t *cv = di_children(db, id);
-    while (cv && cv->n) {
-        eid_t kid = cv->items[cv->n - 1];
-        di_children_mut(db, id)->n--;
+     * a tombstone -- that combination is what path_of() would walk into. The view is
+     * re-read every turn because the recursion removes from this very range
+     * (di_remove_child swap-removes) and the count it hands back is the current one. */
+    children_t ch = di_children(db, id);
+    while (ch.n) {
+        eid_t kid = ch.items[ch.n - 1];
+        if (di_remove_child(db, id, kid) != 0) break;
         esidx_remove(db, kid);
-        cv = di_children(db, id);
+        ch = di_children(db, id);
     }
     kill_one(db, id);
     return 0;
@@ -752,16 +752,23 @@ static int di_ord_add(dir_index_t *di, eid_t dir)
     return (int)ord;
 }
 
+/* Grow the per-ordinal arrays to cover `ord`. They are two uint32 per ordinal where the
+ * old shape spent a 16-byte vector header, and they are grown together because a start
+ * without a count is not a range. */
 static int di_ord_grow(dir_index_t *di, uint32_t ord)
 {
-    if (ord < di->child_cap) return 0;
-    uint32_t ncap = di->child_cap ? di->child_cap : 1024;
+    if (ord < di->ord_cap) return 0;
+    uint32_t ncap = di->ord_cap ? di->ord_cap : 1024;
     while (ord >= ncap) ncap *= 2;
-    childvec_t *nc = realloc(di->child, (size_t)ncap * sizeof(childvec_t));
+    uint32_t *ns = realloc(di->cstart, (size_t)ncap * sizeof(uint32_t));
+    if (!ns) return -1;
+    di->cstart = ns;
+    uint32_t *nc = realloc(di->ccount, (size_t)ncap * sizeof(uint32_t));
     if (!nc) return -1;
-    memset(nc + di->child_cap, 0, (size_t)(ncap - di->child_cap) * sizeof(childvec_t));
-    di->child = nc;
-    di->child_cap = ncap;
+    di->ccount = nc;
+    memset(di->cstart + di->ord_cap, 0, (size_t)(ncap - di->ord_cap) * sizeof(uint32_t));
+    memset(di->ccount + di->ord_cap, 0, (size_t)(ncap - di->ord_cap) * sizeof(uint32_t));
+    di->ord_cap = ncap;
     return 0;
 }
 
@@ -776,34 +783,100 @@ int di_add_child(esidx_t *db, eid_t dir, eid_t child)
     }
     if (di_ord_grow(di, ord) != 0) return -1;
 
-    childvec_t *cv = &di->child[ord];
-    if (cv->n == cv->cap) {
-        uint32_t ncap = cv->cap ? cv->cap * 2 : 8;
-        eid_t *ni = realloc(cv->items, (size_t)ncap * sizeof(eid_t));
-        if (!ni) return -1;
-        cv->items = ni;
-        cv->cap = ncap;
-    }
-    cv->items[cv->n++] = child;
-    /* The aggregate column moves with the vector, here and in di_remove_child and
-     * nowhere else: `child-count:` and `empty:` read it once per candidate row, and
-     * a count read out of the vector would mean an ordinal probe per row. */
+    /* Nothing is appended here. A directory's children cannot be added to a shared
+     * array in the middle, and the walk makes that the *normal* case rather than the
+     * exception: scan_dir() descends into a subdirectory as soon as it has added it, so
+     * a directory's children arrive interleaved with its grandchildren and never as one
+     * run. So an addition marks the flat array stale and esidx_build_children()
+     * recomputes it from the columns -- once per pass that changed something, which is
+     * the same bargain esidx_build_name_rank() makes.
+     *
+     * `child` is deliberately unused: the columns are the record of who is whose child,
+     * and reading them back is what makes the rebuild and this function agree. */
+    (void)child;
+    di->c_dirty = true;
+
+    /* The aggregate column moves here and in di_remove_child and nowhere else:
+     * `child-count:` and `empty:` read it once per candidate row, and a count read out
+     * of the flat array would mean an ordinal probe and a range lookup per row -- which
+     * is the 2.4 -> 6.4 ms that made the column necessary in the first place. */
     if (dir < db->et.count) db->et.nchild[dir]++;
     return 0;
 }
 
-const childvec_t *di_children(const esidx_t *db, eid_t dir)
+/* The whole flat array, from the columns, in one pass and then another.
+ *
+ * Pass one counts the live children of every directory that has an ordinal, pass two
+ * turns the counts into starts by prefix sum, pass three places each row. Exact extents
+ * by construction: 5 476 484 ids in 5 476 484 slots, where the per-directory vectors
+ * this replaces were at 53 %.
+ *
+ * `nchild` is recomputed here rather than carried, and zeroed first. That is the same
+ * lesson as the aggregate column that was briefly persisted in the snapshot and read as
+ * well as incremented (design §5.5): two writers for one value is how every parent ends
+ * up with double its real count. Here the rebuild is the only writer that runs over every
+ * row, so it owns the column outright.
+ *
+ * A tombstone is nobody's child, and a tombstoned directory keeps its ordinal with a
+ * count of zero -- ids are never reused (D8), so the ordinal it left behind must not be
+ * handed to a different directory. */
+int esidx_build_children(esidx_t *db)
 {
-    uint32_t ord = di_ord(&db->di, dir);
-    if (ord == EID_NONE || ord >= db->di.child_cap) return NULL;
-    return &db->di.child[ord];
+    dir_index_t *di = &db->di;
+    const entry_table_t *et = &db->et;
+
+    for (uint32_t i = 0; i < et->count && i < di->ord_cap; i++) di->ccount[i] = 0;
+    for (uint32_t i = 0; i < et->count; i++) {
+        if (et->flags[i] & EF_DEAD) continue;
+        uint32_t ord = di_ord(di, et->parent[i]);
+        if (ord == EID_NONE || ord >= di->ord_cap) continue;
+        di->ccount[ord]++;
+    }
+
+    /* prefix sum -> start, keeping a copy of it as the fill cursor */
+    uint64_t total = 0;
+    for (uint32_t o = 0; o < di->ord_cap; o++) {
+        uint32_t n = di->ccount[o];
+        di->cstart[o] = (uint32_t)total;
+        total += n;
+    }
+    if (total > UINT32_MAX) { LOGE("children: more than 2^32 ids in one array"); return -1; }
+    uint32_t *cursor = malloc((size_t)(di->ord_cap ? di->ord_cap : 1) * sizeof(uint32_t));
+    if (!cursor) return -1;
+    memcpy(cursor, di->cstart, (size_t)di->ord_cap * sizeof(uint32_t));
+
+    eid_t *items = malloc((total ? (size_t)total : 1) * sizeof(eid_t));
+    if (!items) { free(cursor); return -1; }
+    for (uint32_t i = 0; i < et->count; i++) {
+        if (et->flags[i] & EF_DEAD) continue;
+        uint32_t ord = di_ord(di, et->parent[i]);
+        if (ord == EID_NONE || ord >= di->ord_cap) continue;
+        items[cursor[ord]++] = i;
+    }
+    free(cursor);
+
+    free(di->citems);
+    di->citems = items;
+    di->cn = di->ccap = (uint32_t)total;
+    di->c_dirty = false;
+
+    /* and the column, from the counts this pass already produced rather than from a
+     * third walk over the entries */
+    for (uint32_t o = 0; o < di->ord_cap; o++) {
+        eid_t dir = o < di->ord_count ? di->ord_eid[o] : EID_NONE;
+        if (dir != EID_NONE && dir < et->count) et->nchild[dir] = di->ccount[o];
+    }
+    return 0;
 }
 
-childvec_t *di_children_mut(esidx_t *db, eid_t dir)
+children_t di_children(const esidx_t *db, eid_t dir)
 {
+    children_t none = { NULL, 0 };
     uint32_t ord = di_ord(&db->di, dir);
-    if (ord == EID_NONE || ord >= db->di.child_cap) return NULL;
-    return &db->di.child[ord];
+    if (ord == EID_NONE || ord >= db->di.ord_cap) return none;
+    uint32_t n = db->di.ccount[ord];
+    if (!n || !db->di.citems) return none;
+    return (children_t){ db->di.citems + db->di.cstart[ord], n };
 }
 
 bool di_is_empty(const esidx_t *db, eid_t dir)
@@ -814,17 +887,21 @@ bool di_is_empty(const esidx_t *db, eid_t dir)
 
 /* Swap-remove rather than preserve order: nothing depends on the order, and a
  * removal from a directory holding thousands of entries must not be O(n) memmove
- * on top of the O(n) search. */
+ * on top of the O(n) search. A range is contiguous inside the flat array, so this
+ * stays inside it -- the neighbours of the range do not move, which is the one
+ * property the shared array is built on. */
 int di_remove_child(esidx_t *db, eid_t dir, eid_t child)
 {
     dir_index_t *di = &db->di;
     uint32_t ord = di_ord(di, dir);
-    if (ord == EID_NONE || ord >= di->child_cap) return -1;
-    childvec_t *cv = &di->child[ord];
-    for (uint32_t i = 0; i < cv->n; i++) {
-        if (cv->items[i] != child) continue;
-        cv->items[i] = cv->items[cv->n - 1];
-        cv->n--;
+    if (ord == EID_NONE || ord >= di->ord_cap) return -1;
+    uint32_t n = di->ccount[ord];
+    if (!n || !di->citems) return -1;
+    uint32_t start = di->cstart[ord];
+    for (uint32_t i = 0; i < n; i++) {
+        if (di->citems[start + i] != child) continue;
+        di->citems[start + i] = di->citems[start + n - 1];
+        di->ccount[ord] = n - 1;
         if (dir < db->et.count && db->et.nchild[dir]) db->et.nchild[dir]--;
         return 0;
     }
@@ -833,13 +910,18 @@ int di_remove_child(esidx_t *db, eid_t dir, eid_t child)
 
 /* One child's name, without materialising a path. The reconcile matches a
  * getdents entry against the stored children of the same directory on every
- * single entry, and path_of() there would be O(depth) per lookup. */
+ * single entry, and path_of() there would be O(depth) per lookup.
+ *
+ * It reads the flat array, which a pass that has just added a name has not caught up
+ * with. That is safe for one reason and it is worth stating: a name added in this burst
+ * cannot be looked up again in the same burst, because a directory cannot hold two
+ * entries with one name. So the only names this fails to find are the ones it has
+ * already handled. */
 eid_t di_lookup_name(const esidx_t *db, eid_t dir, const char *name)
 {
-    const childvec_t *cv = di_children(db, dir);
-    if (!cv) return EID_NONE;
-    for (uint32_t i = 0; i < cv->n; i++) {
-        eid_t id = cv->items[i];
+    children_t ch = di_children(db, dir);
+    for (uint32_t i = 0; i < ch.n; i++) {
+        eid_t id = ch.items[i];
         if (strcmp(name_of(db, id), name) == 0) return id;
     }
     return EID_NONE;
@@ -1768,8 +1850,7 @@ void esidx_free(esidx_t *db)
     free(db->et.parent); free(db->et.depth); free(db->et.flags);
     free(db->et.size); free(db->et.mtime); free(db->et.ctime); free(db->et.stamp);
     free(db->et.ext_id); free(db->et.name); free(db->et.nchild);
-    for (uint32_t i = 0; i < db->di.child_cap; i++) free(db->di.child[i].items);
-    free(db->di.child);
+    free(db->di.citems); free(db->di.cstart); free(db->di.ccount);
     free(db->di.ord_slot);
     free(db->di.ord_eid);
     free(db->di.ht_off); free(db->di.ht_val);
@@ -1886,6 +1967,19 @@ void esidx_finalize(esidx_t *db)
     t0 = ts_us();
     live_build(db);
     TSDONE("finalize: live set", t0);
+
+    /* The children, once, from the columns. Both callers of this that add entries --
+     * the walk and the reconcile -- only mark the flat array stale, because a directory's
+     * children cannot be appended to a shared array and the walk interleaves a
+     * directory's children with its grandchildren rather than delivering them in one run.
+     * So this is where they are laid out, and it is why a fresh build never allocates a
+     * per-directory vector at all: /work went from 651 897 of them to one array. */
+    t0 = ts_us();
+    if (esidx_build_children(db) == 0)
+        TSDONE2("finalize: children array", t0, "(%u ids in %u ranges)",
+                db->di.cn, db->di.ord_count);
+    else
+        LOGE("finalize: cannot build the children array");
 
     t0 = ts_us();
     di_hash_build(db);
@@ -2202,32 +2296,43 @@ void esidx_log_mem(const esidx_t *db, const char *phase)
              db->nm_mask + 1);
     }
 
-    /* The header array is indexed by directory ordinal, so its capacity tracks the
-     * number of directories rather than the number of ids -- which is the whole
-     * point of the change, and the row states both so the ratio stays checkable. */
-    if (db->di.child) {
+    /* The children live in one flat array with a start and a count per directory
+     * ordinal, so both rows are exact by construction -- which is the point of the
+     * change and the reason the occupancy column is gone rather than improved. The
+     * start/count arrays are indexed by ordinal, so their capacity tracks the number of
+     * directories rather than the number of ids. */
+    if (db->di.ord_count) {
         uint32_t ndirs = db->di.ord_count;
-        uint64_t hdr = (uint64_t)db->di.child_cap * sizeof(childvec_t);
-        mem_row(phase, "dir vector headers", hdr, hdr, &total);
-        LOGI("%s: mem dir headers: %u directories, %u slots (%.0f%%), eid->ordinal "
-             "map %u slots", phase, ndirs, db->di.child_cap,
-             db->di.child_cap ? 100.0 * (double)ndirs / (double)db->di.child_cap : 0.0,
+        uint64_t rng = (uint64_t)db->di.ord_cap * 2 * sizeof(uint32_t);
+        mem_row(phase, "dir range table", rng, rng, &total);
+        LOGI("%s: mem dir ranges: %u directories, %u slots (%.0f%%), eid->ordinal "
+             "map %u slots", phase, ndirs, db->di.ord_cap,
+             db->di.ord_cap ? 100.0 * (double)ndirs / (double)db->di.ord_cap : 0.0,
              db->di.ord_mask + 1);
 
-        uint64_t items_used = 0, items_bytes = 0;
-        for (uint32_t d = 0; d < db->di.child_cap; d++) {
-            items_used  += (uint64_t)db->di.child[d].n * sizeof(eid_t);
-            items_bytes += (uint64_t)db->di.child[d].cap * sizeof(eid_t);
-        }
-        mem_row(phase, "dir children vectors", items_bytes, items_bytes, &total);
+        uint64_t items = (uint64_t)db->di.cn * sizeof(eid_t);
+        uint64_t live = 0;
+        for (uint32_t d = 0; d < db->di.ord_count; d++) live += db->di.ccount[d];
+        live *= sizeof(eid_t);
+        /* and what the column says, which is the third number and the only one that can
+         * catch a stale array: the flat array is rebuilt from the columns, so the two
+         * must agree, and they do not agree in the one window where the array is marked
+         * dirty -- a pass that has added something and not yet rebuilt. That window is
+         * not observable from outside (every query reloads the snapshot, which
+         * rebuilds), so this line is where it is checked. */
+        uint64_t col = 0;
+        for (uint32_t i = 0; i < et->count; i++)
+            if (!(et->flags[i] & EF_DEAD)) col += et->nchild[i];
+        mem_row(phase, "dir children array", items, db->di.ccap * sizeof(eid_t), &total);
         mem_row(phase, "eid -> dir ordinal map",
                 ((uint64_t)db->di.ord_mask + 1 + db->di.ord_count) * sizeof(uint32_t),
                 ((uint64_t)db->di.ord_mask + 1 + db->di.ord_count) * sizeof(uint32_t),
                 &total);
-        LOGI("%s: mem dir children: %llu of %llu ids in vectors (%.0f%%)",
-             phase, (unsigned long long)(items_used / 4),
-             (unsigned long long)(items_bytes / 4),
-             items_bytes ? 100.0 * (double)items_used / (double)items_bytes : 0.0);
+        LOGI("%s: mem dir children: %llu ids in one array for %llu slots (100%%), "
+             "the child-count column says %llu%s -- one allocation instead of %u",
+             phase, (unsigned long long)(live / 4),
+             (unsigned long long)(items / 4), (unsigned long long)col,
+             col * 4 == live ? "" : "  MISMATCH", ndirs);
     }
     if (db->di.ht_off) {
         uint64_t slots = (uint64_t)db->di.ht_mask + 1;
