@@ -85,13 +85,40 @@ typedef struct {
 
 /* --------------------------------------------------------- directory tree */
 
-/* A directory's children, as a view into one flat array. Returned by value because
- * there is nothing to own: the storage is `dir_index_t`'s, and this type exists only so
- * that a caller can read `items`/`n` without knowing that. */
+/* A directory's children, as up to two contiguous runs: the flat array's range for it,
+ * and -- for a directory that has gained a child since the last esidx_build_children()
+ * -- the overlay's block for it. Returned by value because there is nothing to own: the
+ * storage is `dir_index_t`'s, and this type exists only so that a caller can iterate
+ * without knowing that.
+ *
+ * Two runs, not one, because a shared array has no room in the middle (design §5.1).
+ * The alternative shape -- reserved slack at the end of each range, so an addition
+ * appends in place -- keeps a single run and needs no overlay at all, and it does not
+ * work: a directory created by a bulk copy is empty, so its slack is empty too, and
+ * measured on /work a pass that added 2 000 files to one new directory blew through any
+ * fixed slack and paid the full 487 ms rebuild anyway (design §10). The overlay absorbs
+ * a burst of any size in one directory for the price of the ids themselves.
+ *
+ * So the rule is that no caller reads `.items`/`.n` alone: `di_children_n()` and
+ * `di_child_at()` are the accessors, and a loop written against `.n` would compile and
+ * silently skip every child added since the last rebuild -- which is the shape of bug
+ * this file keeps having to record. */
 typedef struct {
     const eid_t *items;
     uint32_t     n;
+    const eid_t *more;      /* the overlay block: NULL when there is nothing pending */
+    uint32_t     nmore;
 } children_t;
+
+/* One directory's pending children, in `dir_index_t`'s overlay. In the header because
+ * the overlay is part of the shape a caller has to know about, not an implementation
+ * detail of store.c. */
+typedef struct {
+    uint32_t ord;        /* directory ordinal; OV_EMPTY in an unused slot */
+    uint32_t n, cap;
+    eid_t   *ids;
+} ovslot_t;
+#define OV_EMPTY 0xFFFFFFFFu
 
 typedef struct {
     /* The children of every directory, in ONE array, grouped by *directory ordinal* --
@@ -112,20 +139,24 @@ typedef struct {
      *     100 % by construction, and it is one allocation rather than 651 897 of them.
      *
      * The cost of the shape is that a directory's children cannot be appended to: a
-     * shared array does not have room in the middle. So additions do not write here --
-     * they set `c_dirty` and esidx_build_children() rebuilds the whole thing from the
-     * columns, which is the same bargain esidx_build_name_rank() makes and for the same
-     * reason: a rank is a sorted position, a CSR range is a sorted position, and neither
-     * can be maintained one element at a time in the middle. Nothing *reads* a stale
-     * range in between: the only reader during a pass is di_lookup_name(), and a name
-     * that was just added in this burst cannot be looked up again in the same burst.
-     */
+     * shared array does not have room in the middle. So additions go to an *overlay* --
+     * an append-only per-directory block, drained into this array by
+     * esidx_build_children() when it grows past ESIDX_CHILD_OVERLAY_DIV -- and
+     * di_children() hands back both runs so no reader can see one without the other.
+     * The same bargain esidx_build_name_rank() makes, and the threshold is a fraction of
+     * the entry count for the same reason: both rebuilds are O(n), so the question is
+     * never *whether* to rebuild but how many additions to let accumulate first. */
     eid_t      *citems;       /* every directory's children, grouped by ordinal */
     uint32_t    cn, ccap;     /* cn == ccap after a build: the extents are exact */
     uint32_t   *cstart;       /* ordinal -> first index into citems */
     uint32_t   *ccount;       /* ordinal -> length; 0 for a directory with none */
     uint32_t    ord_cap;      /* slots in cstart/ccount */
-    bool        c_dirty;      /* an addition arrived; rebuild before serving */
+    /* Children added since the last build, one block per directory, keyed by ordinal, so
+     * that a directory's pending children are contiguous and di_children() can return
+     * them as a second run. */
+    ovslot_t   *ov_slot;
+    uint32_t    ov_mask, ov_count, ov_ids;   /* table; live slots; ids held in them */
+    bool        c_dirty;       /* the overlay is non-empty: drain before serving */
 
     /* eid -> ordinal, open addressing, value = ordinal + 1 so that 0 means empty.
      * The same convention as the other three open-addressed tables here. Keys are
@@ -568,20 +599,42 @@ void esidx_finalize(esidx_t *db);   /* build dir paths hash + sorted indexes */
 
 /* child count of a directory entry (design §5.5 aggregate, derived not stored) */
 uint32_t di_child_count(const esidx_t *db, eid_t dir);
-/* The children of a directory, as a view into the one flat array; `{NULL, 0}` for an id
- * that is not an indexed directory, or for one with no children. Every reader goes
- * through this so the ordinal lookup lives in one place.
+/* The children of a directory, as a view into the one flat array *and* the overlay;
+ * `{NULL, 0, NULL, 0}` for an id that is not an indexed directory, or for one with no
+ * children. Every reader goes through this so the two lookups live in one place, and
+ * every iteration goes through di_children_n()/di_child_at() so that neither run can be
+ * read without the other.
  *
  * The view is const, which is the point of it: a caller cannot shrink a range in place,
  * because the array is shared and a range's neighbours do not move. esidx_remove() walks
  * a subtree through di_remove_child() instead, which is the only thing that may shrink
  * one, and it says so. */
 children_t di_children(const esidx_t *db, eid_t dir);
-/* Rebuild the flat array from the columns: exact extents, one allocation. Called from
- * esidx_finalize() (which covers a fresh build and a snapshot load) and at the end of a
- * reconcile that added something -- the one bargain the shape costs, and the reason is
- * on dir_index_t above. */
+/* How many children that view holds, both runs. `nchild` says the same thing and is what
+ * `child-count:` reads (design §5.5 measured the column against the vector), so
+ * di_children_n() == di_child_count() is an invariant -- and the two are maintained by
+ * the same two functions, which is the only reason it holds. */
+static inline uint32_t di_children_n(children_t c) { return c.n + c.nmore; }
+static inline eid_t     di_child_at(children_t c, uint32_t i)
+{
+    return i < c.n ? c.items[i] : c.more[i - c.n];
+}
+/* Rebuild the flat array from the columns: exact extents, one allocation, overlay
+ * dropped. Called from esidx_finalize() (which covers a fresh build and a snapshot load)
+ * and from esidx_drain() when the overlay has grown past its threshold. */
 int  esidx_build_children(esidx_t *db);
+/* How many additions may accumulate before that rebuild, as a fraction of the entry
+ * count: a twelfth. The rebuild is O(n) and measured at 487 ms over 5.5 M entries, and
+ * the overlay costs 4 bytes an id, so letting a twelfth of the index accumulate turns
+ * 487 ms per pass into 487 ms per 456 000 additions -- while bounding the overlay at
+ * 2.7 MiB there and at 1/12 of the CSR's own size everywhere. On a small index the
+ * threshold is small too, which is why a 1 622-entry fixture still exercises both the
+ * overlay path and the drain in one pass. */
+#define ESIDX_CHILD_OVERLAY_DIV 12u
+/* Drain whichever overlays are over their threshold. Called at the end of a reconcile
+ * (scan.c), and the one place a future event-driven path will call after applying a
+ * batch -- so "when do the O(n) rebuilds happen" has one answer. */
+int  esidx_drain(esidx_t *db);
 /* Is this directory empty? A bit, because `empty:` asks it per candidate row. */
 bool di_is_empty(const esidx_t *db, eid_t dir);
 

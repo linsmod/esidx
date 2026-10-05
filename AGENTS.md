@@ -515,15 +515,33 @@ Do not re-litigate these; they were measured and the conclusions are recorded:
   is not proportional to the change.** `esidx serve --refresh=SECS` runs the names pass in
   the serving process (design §7 "In place"), so freshness is a knob rather than a restart.
   Measured with `./refresh.sh` on `r7000` (real ext4 NVMe, `hpet`, so these are syscall
-  times): an **idle** pass is **0.9 ms over 5 476 485 entries** — the walk stops at the
+  times): an **idle** pass is **0.4-0.9 ms over 5 476 485 entries** — the walk stops at the
   first unchanged directory stamp, so it is proportional to the *root's* fanout, not to the
-  tree — and a snapshot write is **538 ms** for a 313 MB file, which is why `--save` is a
-  separate coarse knob and is skipped entirely when the epoch has not moved. A pass that
-  adds 2000 rows costs **2.26 s**, of which **96 % is the two O(n) rebuilds** (1362 ms name
-  rank over 5.48 M rows, 487 ms children array over 630 473 ranges) and none of it scales
-  with the 2000. Removing is the cheap direction: 2001 tombstoned ids cost 1.0 ms, because
-  a removal needs neither structure. So an add-heavy tree needs an interval longer than
-  that pass until the overlay exists, and this measurement is the argument for it.
+  tree — and a snapshot write is **538-563 ms** for a 313 MB file, which is why `--save` is
+  a separate coarse knob and is skipped entirely when the epoch has not moved. A pass that
+  adds rows costs **1.85 s**, of which **76 % is the name-rank rebuild** (1413 ms over
+  5.48 M rows) and none of it scales with the change: two runs of the same command added
+  1220 and 2001 rows and cost 2.38 s and 1.85 s. Removing stays cheap — 2001 tombstoned
+  ids cost 5-6 ms, because no name changed and the CSR swap-removes in place.
+- **A structure that cannot be appended to in the middle costs O(n) per pass, and the fix
+  is a threshold on a second structure rather than a cheaper rebuild.** The children array
+  is a compressed sparse row, so an addition cannot go into it; it goes to an append-only
+  overlay that `esidx_drain()` folds in once it passes **a twelfth of the entry count**
+  (497 ms per 456 000 additions on `/work`, instead of per pass). Three things about that
+  number, all of them measured or refuted rather than argued:
+  - **A per-directory slack does not work, and the reason is the case that matters.** Slack
+    at the end of each range keeps `di_children()` a single view and needs no overlay at
+    all — but a directory created by a bulk copy is *empty*, so its slack is empty too, and
+    the measured 2000-files-into-one-new-directory blew through any fixed slack and paid the
+    full 497 ms anyway.
+  - **Two views are the price of the overlay, so the accessors are the contract.**
+    `di_children_n()` / `di_child_at()` exist because a caller reading `.items`/`.n` alone
+    compiles and silently skips every child added since the last rebuild — the exact shape
+    of bug §3.4 keeps recording. There are five call sites and all five were changed.
+  - **`child-count:` is the invariant that catches it.** It reads the `nchild` column while
+    `parent:` reads the two runs, the two are maintained by the same two functions, and
+    test_etp.sh 11c asserts they agree at every step — which is the only assertion that
+    notices a caller reading one run and missing the other.
 - **A promise in a header is not an implementation, and the process that runs daily can be
   why the gap stays invisible.** Three defects survived 337 index assertions and 217
   protocol ones because the only caller of the mutation path was `esidx update`, which

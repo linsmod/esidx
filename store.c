@@ -713,10 +713,12 @@ int esidx_remove(esidx_t *db, eid_t id)
     /* Children first, so the tree is never left with a live row whose parent is
      * a tombstone -- that combination is what path_of() would walk into. The view is
      * re-read every turn because the recursion removes from this very range
-     * (di_remove_child swap-removes) and the count it hands back is the current one. */
+     * (di_remove_child swap-removes) and the count it hands back is the current one.
+     * Both runs count: a child added since the last build is only in the overlay, and
+     * one this loop cannot see stays live under a dead parent. */
     children_t ch = di_children(db, id);
-    while (ch.n) {
-        eid_t kid = ch.items[ch.n - 1];
+    for (uint32_t n = di_children_n(ch); n > 0; n--) {
+        eid_t kid = di_child_at(ch, n - 1);
         if (di_remove_child(db, id, kid) != 0) break;
         esidx_remove(db, kid);
         ch = di_children(db, id);
@@ -810,6 +812,119 @@ static int di_ord_grow(dir_index_t *di, uint32_t ord)
     return 0;
 }
 
+/* ------------------------------------------------------ children overlay
+ *
+ * Children added since the last esidx_build_children(), keyed by directory ordinal.
+ *
+ * One malloc per directory that has any, rather than a shared arena with regions: the
+ * overlay is bounded at a twelfth of the entry count, so the number of live blocks is
+ * bounded too (a few thousand at the largest index measured), and a per-directory block
+ * needs no chunk bookkeeping at all. Each block doubles in place rather than being
+ * copied into a new region, which is safe because nothing iterates a directory's pending
+ * children across an addition to that same directory: ctab_load() copies what it needs
+ * out before reconcile_dir() adds anything, and esidx_remove() shrinks rather than grows.
+ *
+ * The alternative -- reserved slack at the end of each CSR range, so an addition appends
+ * in place and di_children() keeps returning a single run -- is simpler and does not
+ * work: a directory created by a bulk copy is empty, so its slack is empty too, and the
+ * measured case (2 000 files into one new directory on /work) blew through any fixed
+ * slack and paid the full 487 ms rebuild anyway. */
+
+static void ov_clear(dir_index_t *di)
+{
+    if (di->ov_slot)
+        for (uint32_t i = 0; i <= di->ov_mask; i++)
+            if (di->ov_slot[i].ord != OV_EMPTY) free(di->ov_slot[i].ids);
+    free(di->ov_slot);
+    di->ov_slot = NULL;
+    di->ov_mask = di->ov_count = di->ov_ids = 0;
+    di->c_dirty = false;
+}
+
+static ovslot_t *ov_find(dir_index_t *di, uint32_t ord, bool create)
+{
+    if (!di->ov_slot) {
+        if (!create) return NULL;
+        uint32_t cap = 256;
+        di->ov_slot = malloc((size_t)cap * sizeof(ovslot_t));
+        if (!di->ov_slot) return NULL;
+        for (uint32_t i = 0; i < cap; i++) di->ov_slot[i].ord = OV_EMPTY;
+        di->ov_mask = cap - 1;
+    }
+    uint32_t h = ord & di->ov_mask;
+    for (;;) {
+        ovslot_t *s = &di->ov_slot[h];
+        if (s->ord == OV_EMPTY) {
+            if (!create) return NULL;
+            /* All four, not the three that are read on the first push: `cap` left as
+             * whatever the allocator handed over makes `n == cap` false, so the block is
+             * never allocated and the first append writes through a NULL ids. */
+            s->ord = ord; s->n = 0; s->cap = 0; s->ids = NULL;
+            di->ov_count++;
+            return s;
+        }
+        if (s->ord == ord) return s;
+        h = (h + 1) & di->ov_mask;
+    }
+}
+
+/* The same lookup for a reader, and const because that is what di_children() is: a
+ * query must not be able to allocate, and casting the const away to reuse ov_find()
+ * would be the kind of cast that hides a write later. */
+static const ovslot_t *ov_peek(const dir_index_t *di, uint32_t ord)
+{
+    if (!di->ov_slot) return NULL;
+    uint32_t h = ord & di->ov_mask;
+    for (;;) {
+        const ovslot_t *s = &di->ov_slot[h];
+        if (s->ord == OV_EMPTY) return NULL;
+        if (s->ord == ord) return s;
+        h = (h + 1) & di->ov_mask;
+    }
+}
+
+/* Grow the table and rehash. Only the slot structs move; the id blocks stay where they
+ * are, so a `children_t` a caller is holding is unaffected. */
+static int ov_grow(dir_index_t *di)
+{
+    uint32_t cap = (di->ov_mask + 1) * 2;
+    ovslot_t *ns = malloc((size_t)cap * sizeof(ovslot_t));
+    if (!ns) return -1;
+    for (uint32_t i = 0; i < cap; i++) ns[i].ord = OV_EMPTY;
+    uint32_t oldcap = di->ov_mask + 1;
+    ovslot_t *os = di->ov_slot;
+    di->ov_slot = ns;
+    di->ov_mask = cap - 1;
+    for (uint32_t i = 0; i < oldcap; i++) {
+        if (os[i].ord == OV_EMPTY) continue;
+        uint32_t h = os[i].ord & di->ov_mask;
+        while (ns[h].ord != OV_EMPTY) h = (h + 1) & di->ov_mask;
+        ns[h] = os[i];
+    }
+    free(os);
+    return 0;
+}
+
+/* Append one child to `ord`'s pending block. The block doubles in place, which moves the
+ * ids a previous di_children() handed out -- safe because nothing iterates one
+ * directory's pending children across an addition to that directory (see above). */
+static int ov_push(dir_index_t *di, uint32_t ord, eid_t child)
+{
+    if (di->ov_slot && di->ov_count * 2 > di->ov_mask + 1 && ov_grow(di) != 0) return -1;
+    ovslot_t *s = ov_find(di, ord, true);
+    if (!s) return -1;
+    if (s->n == s->cap) {
+        uint32_t ncap = s->cap ? s->cap * 2 : 4;
+        eid_t *nb = realloc(s->ids, (size_t)ncap * sizeof(eid_t));
+        if (!nb) return -1;
+        s->ids = nb;
+        s->cap = ncap;
+    }
+    s->ids[s->n++] = child;
+    di->ov_ids++;
+    return 0;
+}
+
 int di_add_child(esidx_t *db, eid_t dir, eid_t child)
 {
     dir_index_t *di = &db->di;
@@ -820,18 +935,7 @@ int di_add_child(esidx_t *db, eid_t dir, eid_t child)
         ord = (uint32_t)added;
     }
     if (di_ord_grow(di, ord) != 0) return -1;
-
-    /* Nothing is appended here. A directory's children cannot be added to a shared
-     * array in the middle, and the walk makes that the *normal* case rather than the
-     * exception: scan_dir() descends into a subdirectory as soon as it has added it, so
-     * a directory's children arrive interleaved with its grandchildren and never as one
-     * run. So an addition marks the flat array stale and esidx_build_children()
-     * recomputes it from the columns -- once per pass that changed something, which is
-     * the same bargain esidx_build_name_rank() makes.
-     *
-     * `child` is deliberately unused: the columns are the record of who is whose child,
-     * and reading them back is what makes the rebuild and this function agree. */
-    (void)child;
+    if (ov_push(di, ord, child) != 0) return -1;
     di->c_dirty = true;
 
     /* The aggregate column moves here and in di_remove_child and nowhere else:
@@ -896,7 +1000,10 @@ int esidx_build_children(esidx_t *db)
     free(di->citems);
     di->citems = items;
     di->cn = di->ccap = (uint32_t)total;
-    di->c_dirty = false;
+    /* Every pending child is now in the array, so the overlay has nothing left to say.
+     * Dropping it here rather than at the end of the drain is what makes this one
+     * function the whole of "catch the flat array up". */
+    ov_clear(di);
 
     /* and the column, from the counts this pass already produced rather than from a
      * third walk over the entries */
@@ -907,14 +1014,48 @@ int esidx_build_children(esidx_t *db)
     return 0;
 }
 
+/* Drain whichever overlays are over their threshold. Returns 0 whether or not anything
+ * was rebuilt, so a caller does not have to care. The rank half is the same bargain and
+ * lands here too when it exists; for now this is the children one, and the reason the
+ * decision lives in one function rather than at the two call sites is that "when do the
+ * O(n) rebuilds happen" is a question with one answer.
+ *
+ * INFO, not DEBUG, because the line is also how a reader tells *which* of the two
+ * mechanisms answered `parent:` -- the overlay or the rebuilt array -- and that
+ * distinction is the whole content of the test that covers this (test_etp.sh 11c). It is
+ * rare by construction: once per threshold's worth of additions, so 487 ms per 456 000
+ * additions on /work, and never at all on an index that is not changing. */
+int esidx_drain(esidx_t *db)
+{
+    if (!db->di.c_dirty) return 0;
+    uint32_t limit = db->et.count / ESIDX_CHILD_OVERLAY_DIV;
+    if (db->di.ov_ids <= limit) return 0;
+
+    uint64_t t0 = ts_us();
+    uint32_t pending = db->di.ov_ids;
+    if (esidx_build_children(db) == 0)
+        LOGI("drain: children array rebuilt over %u entries from %u pending ids in %.1f ms",
+             db->et.count, pending, (double)(ts_us() - t0) / 1000.0);
+    else
+        LOGW("drain: children array rebuild failed; the overlay answers `parent:` until "
+             "the next one");
+    return 0;
+}
+
 children_t di_children(const esidx_t *db, eid_t dir)
 {
-    children_t none = { NULL, 0 };
-    uint32_t ord = di_ord(&db->di, dir);
-    if (ord == EID_NONE || ord >= db->di.ord_cap) return none;
-    uint32_t n = db->di.ccount[ord];
-    if (!n || !db->di.citems) return none;
-    return (children_t){ db->di.citems + db->di.cstart[ord], n };
+    children_t none = { NULL, 0, NULL, 0 };
+    const dir_index_t *di = &db->di;
+    uint32_t ord = di_ord(di, dir);
+    if (ord == EID_NONE || ord >= di->ord_cap) return none;
+    uint32_t n = di->ccount[ord];
+    children_t c = { di->citems && n ? di->citems + di->cstart[ord] : NULL, n, NULL, 0 };
+    /* The overlay run, if this directory has children the flat array has not caught up
+     * with -- which is the state every pass that added something leaves behind until
+     * esidx_drain() folds them in. */
+    const ovslot_t *s = ov_peek(di, ord);
+    if (s && s->n) { c.more = s->ids; c.nmore = s->n; }
+    return c;
 }
 
 bool di_is_empty(const esidx_t *db, eid_t dir)
@@ -927,12 +1068,30 @@ bool di_is_empty(const esidx_t *db, eid_t dir)
  * removal from a directory holding thousands of entries must not be O(n) memmove
  * on top of the O(n) search. A range is contiguous inside the flat array, so this
  * stays inside it -- the neighbours of the range do not move, which is the one
- * property the shared array is built on. */
+ * property the shared array is built on.
+ *
+ * Both runs are searched, because a child added since the last build exists only in
+ * the overlay, and esidx_remove() walks a subtree through this call: a child it cannot
+ * find stays a live row whose parent is a tombstone, which is the one state path_of()
+ * would walk into. The overlay shrinks in place rather than being compacted, so the
+ * pointer di_children() handed out stays valid. */
 int di_remove_child(esidx_t *db, eid_t dir, eid_t child)
 {
     dir_index_t *di = &db->di;
     uint32_t ord = di_ord(di, dir);
     if (ord == EID_NONE || ord >= di->ord_cap) return -1;
+
+    ovslot_t *s = ov_find(di, ord, false);
+    if (s) {
+        for (uint32_t i = 0; i < s->n; i++) {
+            if (s->ids[i] != child) continue;
+            s->ids[i] = s->ids[s->n - 1];
+            s->n--;
+            di->ov_ids--;
+            if (dir < db->et.count && db->et.nchild[dir]) db->et.nchild[dir]--;
+            return 0;
+        }
+    }
     uint32_t n = di->ccount[ord];
     if (!n || !di->citems) return -1;
     uint32_t start = di->cstart[ord];
@@ -950,16 +1109,17 @@ int di_remove_child(esidx_t *db, eid_t dir, eid_t child)
  * getdents entry against the stored children of the same directory on every
  * single entry, and path_of() there would be O(depth) per lookup.
  *
- * It reads the flat array, which a pass that has just added a name has not caught up
- * with. That is safe for one reason and it is worth stating: a name added in this burst
- * cannot be looked up again in the same burst, because a directory cannot hold two
- * entries with one name. So the only names this fails to find are the ones it has
- * already handled. */
+ * It reads the flat array and the overlay, which a pass that has just added a name may
+ * not have caught up with -- the overlay is why they are caught up at all, so reading
+ * both is not an extra case, it is the same case. That is safe for one reason and it is
+ * worth stating: a name added in this burst cannot be looked up again in the same burst,
+ * because a directory cannot hold two entries with one name. So the only names this
+ * fails to find are the ones it has already handled. */
 eid_t di_lookup_name(const esidx_t *db, eid_t dir, const char *name)
 {
     children_t ch = di_children(db, dir);
-    for (uint32_t i = 0; i < ch.n; i++) {
-        eid_t id = ch.items[i];
+    for (uint32_t i = 0, n = di_children_n(ch); i < n; i++) {
+        eid_t id = di_child_at(ch, i);
         if (strcmp(name_of(db, id), name) == 0) return id;
     }
     return EID_NONE;
@@ -2007,6 +2167,7 @@ void esidx_free(esidx_t *db)
     free(db->et.size); free(db->et.mtime); free(db->et.ctime); free(db->et.stamp);
     free(db->et.ext_id); free(db->et.name); free(db->et.nchild);
     free(db->di.citems); free(db->di.cstart); free(db->di.ccount);
+    ov_clear(&db->di);
     free(db->di.ord_slot);
     free(db->di.ord_eid);
     free(db->di.ht_off); free(db->di.ht_val);
@@ -2450,6 +2611,20 @@ void esidx_log_mem(const esidx_t *db, const char *phase)
              phase, (unsigned long long)(live / 4),
              (unsigned long long)(items / 4), (unsigned long long)col,
              col * 4 == live ? "" : "  MISMATCH", ndirs);
+        /* The overlay, and the count the drain decides on. Both are zero on a fresh build
+         * and after a snapshot load -- it is a function of the columns, not part of them
+         * (D4) -- so this row is here for the refresh path, where the number that decides
+         * an O(n) rebuild should be visible rather than inferred. */
+        uint64_t ovb = 0;
+        if (db->di.ov_slot)
+            for (uint32_t i = 0; i <= db->di.ov_mask; i++)
+                if (db->di.ov_slot[i].ord != OV_EMPTY) ovb += db->di.ov_slot[i].cap * 4;
+        mem_row(phase, "children overlay", ovb, ovb, &total);
+        LOGI("%s: mem children overlay: %u pending ids in %u blocks (%llu bytes), "
+             "drain at %u (entries/%u) -- 0 on a fresh build, and the window between a "
+             "reconcile and its drain is where `parent:` reads two runs",
+             phase, db->di.ov_ids, db->di.ov_count, (unsigned long long)ovb,
+             et->count / ESIDX_CHILD_OVERLAY_DIV, ESIDX_CHILD_OVERLAY_DIV);
     }
     if (db->di.ht_off) {
         uint64_t slots = (uint64_t)db->di.ht_mask + 1;

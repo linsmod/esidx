@@ -775,8 +775,8 @@ static void do_list(const esidx_t *db, client_t *c, const char *arg, bool longfm
 
     c_reply(c, "150 Opening data connection for %s.\r\n", path);
     children_t cv = di_children(db, id);
-    for (uint32_t i = 0; i < cv.n; i++) {
-        eid_t k = cv.items[i];
+    for (uint32_t i = 0, cn = di_children_n(cv); i < cn; i++) {
+        eid_t k = di_child_at(cv, i);
         struct stat sb;
         char full[16384];
         snprintf(full, sizeof(full), "%s/%s", path, display_name_of(db, k));

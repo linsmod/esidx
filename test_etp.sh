@@ -69,8 +69,9 @@ SRV_PID=""
 SRV_PID2=""
 SRV_PID3=""
 SRV_PID4=""
+SRV_PID5=""
 cleanup() {
-    for p in "$SRV_PID" "$SRV_PID2" "$SRV_PID3" "$SRV_PID4"; do
+    for p in "$SRV_PID" "$SRV_PID2" "$SRV_PID3" "$SRV_PID4" "$SRV_PID5"; do
         [ -n "$p" ] && kill "$p" 2>/dev/null
     done
     rm -rf "$TMP"
@@ -173,6 +174,7 @@ start_server() {
         auth)     SRV_PID2=$pid; SRV_PORT2=$port; SRV2_ERR=$err ;;
         refresha) SRV_PID3=$pid; SRV_PORTA=$port; SRVA_ERR=$err ;;
         refreshb) SRV_PID4=$pid; SRV_PORTB=$port; SRVB_ERR=$err ;;
+        overlay)  SRV_PID5=$pid; SRV_PORTO=$port; SRVO_ERR=$err ;;
         *) echo "unknown server tag '$tag'"; exit 1 ;;
     esac
     echo "   server '$tag': pid $pid on 127.0.0.1:$port"
@@ -1009,6 +1011,108 @@ if grep -q 'sorted index size SKIPPED' "$SRVB_ERR"; then
 else
     bad "  B really did run without the size index" "no SKIPPED line in the log"
 fi
+
+say "11c. a directory that gained children: the overlay answers, and the drain folds it in"
+
+# `parent:` reads a compressed sparse row, and a shared array has no room in the middle
+# (design §5.1) -- so a child added since the last rebuild went into an append-only
+# overlay, and di_children() returns both runs. Neither half is observable from the index
+# suite, for the reason 11b names: `esidx update` exits and the next process rebuilds the
+# array from the columns, so an overlay bug would be invisible there. It needs a process
+# that adds and answers in the same breath, which is a server.
+#
+# The fixture is 48 files rather than the three elsewhere because the drain threshold is
+# a *fraction* of the entry count (a twelfth, esidx.h): on a tiny index every addition
+# crosses it, so the overlay is emptied before any query could see it and the mechanism
+# under test never runs. 48 entries put the threshold at 4, which leaves room for a
+# handful of additions to accumulate -- and the "no drain happened" assertion below is
+# what proves they did.
+OTREE="$TMP/ovl"
+OMIT=48
+mkdir -p "$OTREE"
+i=0; while [ "$i" -lt "$OMIT" ]; do : >"$OTREE/o$i.dat"; i=$((i + 1)); done
+ODB="$TMP/ovl.idx"
+"$BIN" build "$OTREE" -o "$ODB" 2>/dev/null || { echo "cannot build $ODB"; exit 1; }
+
+SRV_DB="$ODB" start_server overlay "--refresh=$REFRESH_SECS"
+OUT_O="$TMP/out-o"
+
+# kids <search>: the row count of one query, run on a fresh connection
+kids() {
+    cat >"$TMP/script-o" <<EOF
+send USER anonymous
+send EVERYTHING SORT name_ascending
+send EVERYTHING COUNT 1
+send EVERYTHING SEARCH $1
+sendraw EVERYTHING QUERY
+query
+EOF
+    timeout 30 "$PROBE" "$SRV_PORTO" "$TMP/script-o" >"$OUT_O" 2>&1 || {
+        echo "probe failed on '$1'" >&2; return 1; }
+    pcount "$OUT_O"
+}
+
+# What the filesystem says, so the expected number is not this script's arithmetic.
+ofiles() { find "$OTREE" -maxdepth 1 -type f | wc -l; }
+
+expect "  the index starts with the fixture's files" "$(kids "parent:\"$OTREE\" !folder:")" "$(ofiles)"
+
+# --- three additions, under the threshold: the overlay answers, and nothing was rebuilt
+for n in 1 2 3; do : >"$OTREE/new$n.dat"; done
+sleep $((REFRESH_SECS * 2 + 1))
+expect "  three new files are visible to parent:" "$(kids "parent:\"$OTREE\" !folder:")" "$(ofiles)"
+# nchild is the count column `child-count:` reads and di_children_n() sums the two runs
+# over; they are maintained by the same two functions, so this is the invariant between
+# them, and it is the one thing that fails if a caller reads only one of the runs.
+expect "  child-count: agrees with parent: on the same directory" \
+    "$(kids "child-count:$(ofiles)")" "1"
+if grep -q 'drain: children array rebuilt' "$SRVO_ERR"; then
+    bad "  the three additions stayed in the overlay (no rebuild ran)" \
+        "$(grep -m1 'drain: children array rebuilt' "$SRVO_ERR")"
+else
+    ok "  the three additions stayed in the overlay, so parent: read both runs"
+fi
+
+# --- and removing one that only exists in the overlay. This is the case with a worse
+# failure than a wrong count: esidx_remove() walks a subtree through di_remove_child(),
+# and a child it cannot find stays a *live* row under a dead parent, which is the one
+# state path_of() walks into. No drain has run yet, so the overlay is the only place the
+# id can be.
+rm -f "$OTREE"/new1.dat "$OTREE"/new2.dat "$OTREE"/new3.dat
+sleep $((REFRESH_SECS * 2))
+expect "  removing a child that only exists in the overlay" \
+    "$(kids "parent:\"$OTREE\" !folder:")" "$(ofiles)"
+if grep -q 'drain: children array rebuilt' "$SRVO_ERR"; then
+    bad "  the removals were answered from the overlay, not from a rebuild" \
+        "$(grep -m1 'drain: children array rebuilt' "$SRVO_ERR")"
+else
+    ok "  the removals were answered from the overlay, so di_remove_child read it too"
+fi
+
+# --- now far past any threshold: the drain folds the overlay into the array, and the
+# answers must not move. The count is compared against find(1), not against what the
+# server said a moment ago, so a wrong answer cannot agree with itself.
+BULK=$((OMIT * 4))
+i=0; while [ "$i" -lt "$BULK" ]; do : >"$OTREE/bulk$i.dat"; i=$((i + 1)); done
+echo "   $BULK files created under $OTREE"
+sleep $((REFRESH_SECS * 3))
+expect "  after a bulk create the count is the filesystem's" \
+    "$(kids "parent:\"$OTREE\" !folder:")" "$(ofiles)"
+if grep -q 'drain: children array rebuilt' "$SRVO_ERR"; then
+    ok "  the drain ran once the overlay passed its threshold ($(grep -c 'drain: children array rebuilt' "$SRVO_ERR") times)"
+else
+    bad "  the drain ran once the overlay passed its threshold" "no drain line in the log"
+fi
+expect "  child-count: still agrees after the drain" \
+    "$(kids "child-count:$(ofiles)")" "1"
+
+# --- and removals, which never needed the overlay: they swap-remove in place
+rm -f "$OTREE"/bulk*.dat
+sleep $((REFRESH_SECS * 2))
+expect "  after removing the bulk the count is the filesystem's" \
+    "$(kids "parent:\"$OTREE\" !folder:")" "$(ofiles)"
+expect "  child-count: agrees after the removals" \
+    "$(kids "child-count:$(ofiles)")" "1"
 
 say "12. nothing in the exchange was unparseable"
 

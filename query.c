@@ -852,7 +852,7 @@ static int m_parent(qctx_t *c, const ast_t *t, bitset_t *out)
     }
     bs_clear(out);
     children_t cv = di_children(c->db, id);
-    for (uint32_t i = 0; i < cv.n; i++) bs_set(out, cv.items[i]);
+    for (uint32_t i = 0, n = di_children_n(cv); i < n; i++) bs_set(out, di_child_at(cv, i));
     return 0;
 }
 
@@ -863,7 +863,7 @@ static int m_root(qctx_t *c, const ast_t *t, bitset_t *out)
     bs_clear(out);
     if (r == EID_NONE) return 0;
     children_t cv = di_children(c->db, r);
-    for (uint32_t i = 0; i < cv.n; i++) bs_set(out, cv.items[i]);
+    for (uint32_t i = 0, n = di_children_n(cv); i < n; i++) bs_set(out, di_child_at(cv, i));
     return 0;
 }
 

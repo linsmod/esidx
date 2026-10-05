@@ -124,11 +124,17 @@ if [ "$ADD" -gt 0 ]; then
     hr "add $ADD files, and the pass that finds them"
     CHURN=1
     mkdir -p "$ROOT/.esidx-refresh-churn"
+    # One file per iteration, and *not* a stride: a loop that steps i by more than 1
+    # creates fewer files than it says, which is how a first version of this script
+    # reported "add 2000 files" while adding two -- and the totals it then printed (the
+    # two O(n) rebuilds) were identical either way, because they do not depend on how
+    # many rows were added. The row count is what the delta measurement needs to be real.
     i=0
     while [ "$i" -lt "$ADD" ]; do
-        printf 'x%.0s' $(seq 1 100) >"$ROOT/.esidx-refresh-churn/f$i.txt"
-        i=$((i + 1000))
+        printf 'x%.0s' $(seq 1 100) >"$ROOT/.esidx-refresh-churn/f$i.dat"
+        i=$((i + 1))
     done
+    ls "$ROOT/.esidx-refresh-churn" | wc -l | sed 's/^/  files created: /'
     sleep $((SECS * 2))
     passes 2
     grep -E 'name rank rebuilt|children array rebuilt' "$TMP/srv.err" | tail -2 | sed 's/^/  /'
