@@ -712,7 +712,7 @@ Each row: source → what was taken → how it lands here → why it changed.
 | 4.2 | extension-name interning | `store.c` | **done** — an open-addressed table over the name, so `ext_intern()` is O(1) instead of a scan of every name interned so far: 519 string compares per call down to 1.16 on /work, which is 5.8 s of user time on a build that is otherwise I/O-bound. Derived, so no snapshot mentions it (§4.2 for the two off-by-ones it took to get right) |
 | 5.1 | `dir_id → children`, `path → eid` hash | `store.c` | done |
 | 5.2 | trigram index, sorted/reversed name arrays | `trigram.c` | **name half done** — `trigram.c`, byte trigrams over the display name, 33 727 keys / 4.83 M postings at 3.7 × 10⁵ entries; §5.2.1 for what was deliberately left out and why. **Path half and the sorted/reversed name arrays not started** |
-| 5.3 | sorted array + delta buffer | `store.c` | **done** — `sidx_update`/`sidx_erase` write the delta, D3's 1%/60 s merge is implemented, and the range read honours the retractions |
+| 5.3 | sorted array + delta buffer | `store.c` | **done** — `sidx_update`/`sidx_erase` write the delta, D3's 1%/60 s merge is implemented, and the range read honours the retractions. Two arrays (`int64`, `eid`) rather than one of structs: 12 bytes a row against 16, of which 4 were padding — 62.7 MiB on /work. The build sorts the ids against the value column and gathers; the merge is a linear merge of two sorted runs. Nothing outside `store.c` reads the layout |
 | 5.4 | dense bitset | `index.c` | done; CRoaring at P4 (D7). Set algebra lives here, not in the executor |
 | 5.4 | ext bitmaps, file:/folder: bitmaps | `store.c` | done — built in `finalize`, so the snapshot format is unchanged |
 | 5.5 | aggregate columns + bubbling | `store.c` | **first aggregate done** — `nchild`, the child count, stored rather than derived and maintained in the same two functions that maintain the children vectors. It exists because those vectors are indexed by directory ordinal and `child-count:` reads the value once per candidate row: measured over 372 084 rows, reading the count out of the vector cost 2.4 -> 6.4 ms of eval. Not persisted (the load path rebuilds the vectors and the count together, D4). The remaining aggregates, and bubbling them to ancestors, are not started |
@@ -1222,9 +1222,29 @@ Six things it says that no document recorded, and what has been done about each:
   built by `esidx_add()` as names arrive and once on the first add after a load, lazily,
   so a server that is only served from never pays for the pass.
 
-`sidx_ent_t`'s 62.7 MiB of padding and the 56.6 MiB of directory paths copied into the pool are
-in the same category and equally unfixed; the paths are derived data (D4) and should not be in
-a persisted pool at all, which is why they now live in one of their own.
+**`sidx_ent_t`'s padding is gone too**, and the sort is why that was free rather than
+merely smaller. The struct was `{int64 v; eid_t id}` — 16 bytes, 4 of them padding, 62.7
+MiB of it across the three arrays on /work — and the array is now an `int64` and an `eid`
+per row, 12 bytes. Sorting a 16-byte struct and splitting it afterwards would have needed
+88 MiB of scratch at the moment the trigram index is also at its largest; instead `id`
+starts out as 0..n-1 and the values come from a column, so the array is built by sorting
+the *ids* against that column with `qsort_r` and gathering afterwards — nothing transient
+at all. The merge became a linear merge of two sorted runs, which is both O(n) instead of
+O(n log n) and 12 bytes a row of output while holding 12 a row of input, where the old
+code held 16 and allocated 16. 250.7 → 188.0 MiB, peak rss 1 173.7 → 1 114.1.
+
+That merge rewrite also fixed a bug the split introduced and the sanitiser build caught
+within the hour: `cmp_id_by_val` reads a value *by id* out of the array it is handed,
+which holds in `sidx_build` (id *is* the index) and does not hold in a merge, where the
+ids in the array are not indices into it — a heap-buffer-overflow inside `qsort_r`, on a
+tree of nine files, in the one path the index suite exercises hardest. It showed up as 33
+assertions failing *downstream* of an `esidx update` that died, which is the shape
+AGENTS.md §3.1 warns about: the abort leaves a stale snapshot and every assertion after it
+is reading yesterday's index.
+
+The 56.6 MiB of directory paths copied into the dir hash's pool is the next one, and it is
+a different animal: derived data (D4) that should not be in a persisted pool at all, which
+is why it lives in one of its own until it does not.
 
 Where the ledger stands after the commits that acted on it, `/work` again:
 
@@ -1232,7 +1252,7 @@ Where the ledger stands after the commits that acted on it, `/work` again:
 |---|---|---|---|
 | name trigram lists | 318.6 | 320.3 | exact-sized |
 | entry columns | 282.0 | 282.0 | 261.1 + the `nchild` aggregate |
-| sorted arrays ×3 | 250.7 | 250.7 | 62.7 MiB of that is `sidx_ent_t` padding |
+| sorted arrays ×3 | 188.0 | 188.0 | **split into two arrays** — was 250.7 with 62.7 of padding |
 | names pool | 37.3 | 64.0 | **interned** — was 96.0 / 128.0 |
 | name intern table | 5.7 | 8.0 | 2 097 152 slots for 1 499 995 distinct names |
 | dir vector headers | 16.0 | 16.0 | indexed by directory ordinal |
@@ -1240,7 +1260,7 @@ Where the ledger stands after the commits that acted on it, `/work` again:
 | dir children vectors | 39.4 | 39.4 | 5 476 484 ids in 10 324 800 slots |
 | eid → dir ordinal map | 6.4 | 6.4 | 2 097 152 slots for 630 472 directories |
 | dir path hash | 5.0 | 16.0 | load factor 0.31 |
-| **total** | **1 038.6** | 1 578 | **peak rss 1 173.7**, was 1 418.4 at the first ledger |
+| **total** | **975.9** | 1 515 | **peak rss 1 114.1**, was 1 418.4 at the first ledger |
 
 ---
 

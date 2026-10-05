@@ -1043,20 +1043,30 @@ void path_of(const esidx_t *db, eid_t id, char *out, size_t outsz)
 
 /* ---------------------------------------------------------------- sorting */
 
-static int cmp_sidx(const void *a, const void *b)
+/* Order by value, then by id. The tie-break is not observable from outside -- a range
+ * query answers with a bitset, and the executor's own order is the id order -- but a
+ * merge has to produce a *deterministic* array or two merges of the same delta would
+ * differ, so it stays. */
+static int cmp_id_by_val(const void *pa, const void *pb, void *arg)
 {
-    const sidx_ent_t *x = a, *y = b;
-    if (x->v < y->v) return -1;
-    if (x->v > y->v) return 1;
-    return (x->id < y->id) ? -1 : (x->id > y->id);
+    const int64_t *vals = arg;
+    eid_t a = *(const eid_t *)pa, b = *(const eid_t *)pb;
+    if (vals[a] < vals[b]) return -1;
+    if (vals[a] > vals[b]) return 1;
+    return (a < b) ? -1 : (a > b);
 }
 
 void sidx_build(sidx_t *s, const int64_t *vals, uint32_t n)
 {
-    s->a = malloc(n ? n * sizeof(sidx_ent_t) : 1);
-    s->n = n; s->cap = n;
-    for (uint32_t i = 0; i < n; i++) { s->a[i].v = vals[i]; s->a[i].id = i; }
-    qsort(s->a, n, sizeof(sidx_ent_t), cmp_sidx);
+    s->v  = malloc((n ? n : 1) * sizeof(int64_t));
+    s->id = malloc((n ? n : 1) * sizeof(eid_t));
+    if (!s->v || !s->id) { LOGE("sidx: cannot allocate %u rows", n); sidx_free(s); return; }
+    s->n = s->cap = n;
+    for (uint32_t i = 0; i < n; i++) s->id[i] = i;
+    /* Sort the ids against the *column*, then gather: the values never need an array of
+     * their own before this point, which is the whole reason the split is free. */
+    qsort_r(s->id, n, sizeof(eid_t), cmp_id_by_val, (void *)vals);
+    for (uint32_t i = 0; i < n; i++) s->v[i] = vals[s->id[i]];
 }
 
 /* D3's O(1) writer. `del` marks the entry as a retraction of `v` rather than an
@@ -1065,13 +1075,16 @@ static void sidx_push(sidx_t *s, int64_t v, eid_t id, bool del)
 {
     if (s->dn == s->dcap) {
         uint32_t ncap = s->dcap ? s->dcap * 2 : 256;
-        sidx_ent_t *nb = realloc(s->delta, ncap * sizeof(sidx_ent_t));
-        if (!nb) { LOGE("sidx: cannot grow the delta buffer"); return; }
-        s->delta = nb;
+        int64_t *nv = realloc(s->dv, (size_t)ncap * sizeof(int64_t));
+        if (!nv) { LOGE("sidx: cannot grow the delta values"); return; }
+        s->dv = nv;
+        eid_t *ni = realloc(s->did, (size_t)ncap * sizeof(eid_t));
+        if (!ni) { LOGE("sidx: cannot grow the delta ids"); return; }
+        s->did = ni;
         s->dcap = ncap;
     }
-    s->delta[s->dn].v = v;
-    s->delta[s->dn].id = del ? (id | SIDX_DEL) : id;
+    s->dv[s->dn] = v;
+    s->did[s->dn] = del ? (id | SIDX_DEL) : id;
     s->dn++;
 }
 
@@ -1087,7 +1100,18 @@ void sidx_erase(sidx_t *s, int64_t v, eid_t id)  { sidx_push(s, v, id, true); }
  * merge, so it is not enough to append every SET entry: id 7 updated twice has
  * two assertions, and keeping both would leave the intermediate value in the
  * array where a range query covering it would still match. Only the *last* action
- * per id survives, so the delta is grouped by id first. */
+ * per id survives, so the delta is grouped by id first.
+ *
+ * The array is already sorted and the surviving delta rows are sorted here, so the
+ * two are *merged* rather than the result re-sorted. That is O(n) instead of
+ * O(n log n), and it is what makes the split into two arrays affordable here: the old
+ * code allocated a whole second array of 16-byte structs while the first was still
+ * alive -- 32 bytes a row at the peak -- where this allocates 12 while holding 12.
+ * It also removes the trap the first version of this function fell into, which is that
+ * `cmp_id_by_val` reads a value *by id* out of the array it was given, and in a merge
+ * that array is positional: the ids in it are not indices into it. The sanitiser build
+ * found that as a heap-buffer-overflow inside qsort_r, on a tree of nine files, in the
+ * one path the index suite exercises hardest. */
 typedef struct {
     eid_t    id;
     int64_t  v;
@@ -1101,79 +1125,128 @@ static int cmp_dsort(const void *a, const void *b)
     return x->pos < y->pos ? -1 : (x->pos > y->pos);
 }
 
+/* value order, then id -- the order the main array is in */
+static int cmp_keep(const void *a, const void *b)
+{
+    const dsort_t *x = a, *y = b;
+    if (x->v != y->v) return x->v < y->v ? -1 : 1;
+    return x->id < y->id ? -1 : (x->id > y->id);
+}
+
 int sidx_merge(sidx_t *s)
 {
     if (!s->dn) return 0;
 
     dsort_t *d = malloc((size_t)s->dn * sizeof(dsort_t));
+    dsort_t *keep = malloc((size_t)s->dn * sizeof(dsort_t));
     bitset_t touched;
-    if (!d) return -1;
-    if (bs_init(&touched, s->n ? s->n : 1) != 0) { free(d); return -1; }
+    if (!d || !keep) { free(d); free(keep); return -1; }
+    if (bs_init(&touched, s->n ? s->n : 1) != 0) { free(d); free(keep); return -1; }
     for (uint32_t i = 0; i < s->dn; i++) {
-        d[i].id = s->delta[i].id & ~SIDX_DEL;
-        d[i].v = s->delta[i].v;
+        d[i].id = s->did[i] & ~SIDX_DEL;
+        d[i].v = s->dv[i];
         d[i].pos = i;
     }
     qsort(d, s->dn, sizeof(dsort_t), cmp_dsort);
 
-    uint32_t nnew = s->n;
+    uint32_t nnew = s->n, nk = 0;
     for (uint32_t i = 0; i < s->dn; ) {
         uint32_t j = i + 1;
         while (j < s->dn && d[j].id == d[i].id) j++;
         const dsort_t *last = &d[j - 1];
         bool drop = (last->id < s->n);
-        bool keep = !(s->delta[last->pos].id & SIDX_DEL);
+        bool keep_it = !(s->did[last->pos] & SIDX_DEL);
         if (drop) { bs_set(&touched, last->id); nnew--; }
-        if (keep) nnew++;
-        i = j;
-    }
-
-    sidx_ent_t *na = malloc((nnew ? nnew : 1) * sizeof(sidx_ent_t));
-    if (!na) { free(d); bs_free(&touched); return -1; }
-    uint32_t k = 0;
-    for (uint32_t i = 0; i < s->n; i++)
-        if (!bs_test(&touched, s->a[i].id)) na[k++] = s->a[i];
-    for (uint32_t i = 0; i < s->dn; ) {
-        uint32_t j = i + 1;
-        while (j < s->dn && d[j].id == d[i].id) j++;
-        const dsort_t *last = &d[j - 1];
-        if (!(s->delta[last->pos].id & SIDX_DEL)) {
-            na[k].v = last->v;
-            na[k].id = last->id;
-            k++;
+        if (keep_it) {
+            keep[nk].id = last->id;
+            keep[nk].v = last->v;
+            nk++;
+            nnew++;
         }
         i = j;
     }
-    free(d);
-    bs_free(&touched);
-    qsort(na, k, sizeof(sidx_ent_t), cmp_sidx);
+    qsort(keep, nk, sizeof(dsort_t), cmp_keep);
 
-    free(s->a);
-    free(s->delta);
-    s->a = na;
+    int64_t *nv = malloc((nnew ? nnew : 1) * sizeof(int64_t));
+    eid_t   *ni = malloc((nnew ? nnew : 1) * sizeof(eid_t));
+    if (!nv || !ni) {
+        free(d); free(keep); free(nv); free(ni); bs_free(&touched);
+        LOGE("sidx: cannot allocate %u rows for a merge", nnew);
+        return -1;
+    }
+
+    uint32_t i = 0, j = 0, k = 0;
+    while (i < s->n || j < nk) {
+        int take_main;
+        if (j >= nk)      take_main = 1;
+        else if (i >= s->n) take_main = 0;
+        else {
+            /* ids are unique across the two runs -- a delta id is either still in the
+             * main array (and marked) or beyond it -- so this is a strict order */
+            take_main = (s->v[i] < keep[j].v) ||
+                        (s->v[i] == keep[j].v && s->id[i] < keep[j].id);
+        }
+        if (take_main) {
+            if (bs_test(&touched, s->id[i])) { i++; continue; }
+            nv[k] = s->v[i];
+            ni[k] = s->id[i];
+            i++;
+        } else {
+            nv[k] = keep[j].v;
+            ni[k] = keep[j].id;
+            j++;
+        }
+        k++;
+    }
+    free(d);
+    free(keep);
+    bs_free(&touched);
+
+    free(s->v); free(s->id); free(s->dv); free(s->did);
+    s->v = nv; s->id = ni;
     s->n = s->cap = k;
-    s->delta = NULL;
+    s->dv = NULL; s->did = NULL;
     s->dn = s->dcap = 0;
     return 0;
 }
 
 void sidx_free(sidx_t *s)
 {
-    free(s->a); free(s->delta);
-    s->a = s->delta = NULL; s->n = s->cap = s->dn = s->dcap = 0;
+    free(s->v); free(s->id); free(s->dv); free(s->did);
+    s->v = NULL; s->id = NULL; s->dv = NULL; s->did = NULL;
+    s->n = s->cap = s->dn = s->dcap = 0;
+}
+
+uint32_t sidx_lower_bound(const sidx_t *s, int64_t lo)
+{
+    uint32_t a = 0, b = s->n;
+    while (a < b) {
+        uint32_t m = a + (b - a) / 2;
+        if (s->v[m] < lo) a = m + 1; else b = m;
+    }
+    return a;
+}
+
+/* The count a range would produce, without building the bitset. This is what the
+ * optimiser asks (design §6.2 step 1) and it used to open-code the same binary search
+ * over the old struct array -- two places that knew the layout, which is how the two
+ * could drift. The delta contributes nothing here, exactly as it contributes no
+ * *set* membership: it is a set of corrections, and a count of the main array is an
+ * upper bound, which is what an estimate is allowed to be. */
+uint32_t sidx_count_range(const sidx_t *s, int64_t lo, int64_t hi)
+{
+    uint32_t a = sidx_lower_bound(s, lo);
+    uint32_t cnt = 0;
+    for (uint32_t i = a; i < s->n && s->v[i] <= hi; i++) cnt++;
+    return cnt;
 }
 
 uint32_t sidx_range_to_bitset(const sidx_t *s, int64_t lo, int64_t hi, bitset_t *out)
 {
     uint32_t cnt = 0;
-    /* binary search first index with v >= lo */
-    uint32_t a = 0, b = s->n;
-    while (a < b) {
-        uint32_t m = a + (b - a) / 2;
-        if (s->a[m].v < lo) a = m + 1; else b = m;
-    }
-    for (uint32_t i = a; i < s->n && s->a[i].v <= hi; i++) {
-        bs_set(out, s->a[i].id);
+    uint32_t a = sidx_lower_bound(s, lo);
+    for (uint32_t i = a; i < s->n && s->v[i] <= hi; i++) {
+        bs_set(out, s->id[i]);
         cnt++;
     }
     /* The delta is walked in append order, which is chronological, so a
@@ -1182,11 +1255,11 @@ uint32_t sidx_range_to_bitset(const sidx_t *s, int64_t lo, int64_t hi, bitset_t 
      * for that id, and the main array set the bit because that value was in the
      * range -- which says nothing about whether the id's current value is. */
     for (uint32_t i = 0; i < s->dn; i++) {
-        eid_t id = s->delta[i].id;
+        eid_t id = s->did[i];
         if (id & SIDX_DEL) {
             id &= ~SIDX_DEL;
             if (bs_test(out, id)) { bs_clear_bit(out, id); cnt--; }
-        } else if (s->delta[i].v >= lo && s->delta[i].v <= hi) {
+        } else if (s->dv[i] >= lo && s->dv[i] <= hi) {
             if (!bs_test(out, id)) cnt++;
             bs_set(out, id);
         }
@@ -2046,18 +2119,24 @@ void esidx_log_mem(const esidx_t *db, const char *phase)
              db->di.ht_count);
     }
 
-    /* sidx_ent_t is {int64 v; eid_t id} -- 16 bytes, of which 4 are padding, and
-     * the array is written end to end so all of it is resident. */
+    /* Two arrays of {int64} and {eid_t}: 12 bytes a row with no padding, and the array
+     * is written end to end so all of it is resident. It used to be one array of
+     * {int64 v; eid_t id} -- 16 bytes of which 4 were padding, 62.7 MiB of it on /work,
+     * which is why this row now reports what it holds rather than what it would cost as
+     * two arrays. The delta rides along here too, so the number is the whole footprint. */
     const sidx_t *si[3] = { &db->by_size, &db->by_mtime, &db->by_ctime };
-    uint64_t sidx_bytes = 0, sidx_soa = 0;
+    uint64_t sidx_bytes = 0, sidx_rows = 0, sidx_delta = 0;
     for (int i = 0; i < 3; i++) {
-        sidx_bytes += ((uint64_t)si[i]->n + si[i]->dn) * sizeof(sidx_ent_t);
-        sidx_soa   += (uint64_t)si[i]->n * (sizeof(int64_t) + sizeof(eid_t));
+        sidx_bytes  += ((uint64_t)si[i]->n + si[i]->dn) * (sizeof(int64_t) + sizeof(eid_t));
+        sidx_rows   += si[i]->n;
+        sidx_delta  += si[i]->dn;
     }
     mem_row(phase, "sorted arrays x3", sidx_bytes, sidx_bytes, &total);
-    LOGI("%s: mem sorted arrays: %.1f MiB would be two arrays, %.1f MiB is padding",
-         phase, (double)sidx_soa / 1048576.0,
-         (double)(sidx_bytes - sidx_soa) / 1048576.0);
+    LOGI("%s: mem sorted arrays: %llu rows in %.1f MiB, %.1f bytes a row, %llu in the "
+         "delta", phase, (unsigned long long)(sidx_rows + sidx_delta),
+         (double)sidx_bytes / 1048576.0,
+         (sidx_rows + sidx_delta) ? (double)sidx_bytes / (double)(sidx_rows + sidx_delta) : 0.0,
+         (unsigned long long)sidx_delta);
 
     if (db->ext.n) {
         uint64_t set_bytes = 0, list_bytes = 0, list_used = 0;

@@ -1378,6 +1378,31 @@ expect "and the intern table holds one slot per name, not per entry" \
 q "name:n400.txt"
 expect "and both copies of one of them are still their own rows" "$(n "$LAST")" "2"
 
+# ------------------------------------------------------ sorted index layout
+#
+# The three numeric indexes are two arrays -- {int64} and {eid_t} -- because the struct
+# they were one array of was 16 bytes of which 4 were padding: 62.7 MiB of it on /work.
+# The width is the claim, so the width is what is asserted; there is nothing else to
+# assert, because a range query answers with a bitset and the order inside the array is
+# not observable from outside it. What *is* observable -- that a range still returns the
+# right rows, that a delta retraction is honoured, and that a merge produces an array
+# indistinguishable from a fresh build -- is what the incremental section above exercises,
+# and it is what caught the merge bug this change came with.
+#
+# The sort is the reason the split is free rather than merely smaller: `id` starts as
+# 0..n-1 and the values come from a column, so the array is built by sorting the ids
+# against that column and gathering afterwards. 12 bytes a row resident, nothing
+# transient, and no second copy of the array at the moment the trigram index is largest.
+
+say "sorted index layout"
+
+"$BIN" -v 3 build "$TREE" -o "$TMP/sidx.idx" >/dev/null 2>"$TMP/err"
+cat "$TMP/err" >>"$DIAG"
+SIDX_ROWS=$(sed -n 's/.*mem sorted arrays: \([0-9]*\) rows in [0-9.]* MiB, \([0-9.]*\) bytes a row.*/\1 \2/p' "$TMP/err" | head -1)
+set -- $SIDX_ROWS
+expect "three sorted arrays of $(find "$TREE" | wc -l) rows" "${1:-0}" "$(( $(find "$TREE" | wc -l) * 3 ))"
+expect "at 12 bytes a row, with no padding" "${2:-0}" "12.0"
+
 # --------------------------------------------------------------- logging
 
 say "instrumentation"

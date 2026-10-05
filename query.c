@@ -1448,13 +1448,10 @@ static uint32_t est_leaf(qctx_t *c, const ast_t *t)
         if (s == &c->db->by_size) parse_range2(t->val, cmp, &lo, &hi, parse_size_value, &ok, 1);
         else                     parse_range2(t->val, cmp, &lo, &hi, parse_time_adapter, &ok, 0);
         if (!ok || !s->n) return UINT32_MAX;
-        /* the same binary search the range query will do, so the estimate is
-         * exact rather than sampled */
-        uint32_t a = 0, b = s->n;
-        while (a < b) { uint32_t m = a + (b - a) / 2; if (s->a[m].v < lo) a = m + 1; else b = m; }
-        uint32_t cnt = 0;
-        for (uint32_t i = a; i < s->n && s->a[i].v <= hi; i++) cnt++;
-        return cnt;
+        /* the same count the range query will produce, from the same place that knows
+         * the array's order -- it used to open-code the binary search over the struct
+         * array, which is how two places knew the layout */
+        return sidx_count_range(s, lo, hi);
     }
     return UINT32_MAX;
 }

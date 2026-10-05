@@ -279,7 +279,7 @@ Building it, on the same host:
 | **build, total** | **1 492 ms** | **59 456 ms** |
 | load | 327 ms | 5 664 ms |
 | snapshot | 20.8 MiB | 298 MiB |
-| peak rss | 80.6 MiB | **1 174 MiB** |
+| peak rss | 76.3 MiB | **1 114 MiB** |
 
 The `/work` column is one run of `./ledger.sh /work`, so its walk figure moves with the
 page cache by several seconds between runs — 53.1 s here against the 55.7 s the same
@@ -300,13 +300,13 @@ building); the only lever left on that walk is D6's concurrency.
 each — and it is the only way to tell a structure that is too big from one that is merely
 sized by the wrong number. `./ledger.sh <tree>` prints it together with the snapshot size
 and the query shapes, so a figure quoted from it can be re-measured with one command. On
-`/work` (1 174 MiB peak, 1 039 MiB accounted):
+`/work` (1 114 MiB peak, 976 MiB accounted):
 
 | | touched | address | |
 |---|---|---|---|
 | name trigram lists | 318.6 MiB | 320.3 | 99 % of the posting-list capacity in use |
 | entry columns | 282.0 | 282.0 | trimmed to the entry count, incl. the `nchild` aggregate |
-| sorted arrays ×3 | 250.7 | 250.7 | 62.7 MiB of that is `sidx_ent_t` padding |
+| sorted arrays ×3 | 188.0 | 188.0 | 16 429 455 rows at 12 bytes, no padding |
 | names pool | 37.3 | 64.0 | one copy per distinct name: 1 499 995 of them |
 | name intern table | 5.7 | 8.0 | 2 097 152 slots for those names |
 | dir vector headers | 16.0 | 16.0 | indexed by directory ordinal, not by id |
@@ -316,11 +316,13 @@ and the query shapes, so a figure quoted from it can be re-measured with one com
 | ext index | 15.1 | 11.5 | 16 384 slots for 6 765 extensions |
 | dir path hash | 5.0 | 16.0 | load factor 0.31 |
 
-What is left, largest first: the three sorted arrays spend 62.7 MiB on `sidx_ent_t`
-padding, the children vectors are at 53 % occupancy, and 56.6 MiB of directory paths sit
-in a pool at all when the parent chain already rebuilds them. The names pool used to be
-the first item on that list — 3.65 copies of every name, 96 MiB — and is now 37.3 MiB
-with a 5.7 MiB table beside it. The extension pool's own lookup was a scan of every
+What is left, largest first: the children vectors are at 53 % occupancy, 56.6 MiB of
+directory paths sit in a pool at all when the parent chain already rebuilds them, and the
+three sorted arrays carry a `{int64}` and an `{eid}` per row where a `{int64, eid}` struct
+was 4 bytes of padding wider — that one was 62.7 MiB until the split, and the names pool
+was 96 MiB of duplicated names until the intern table beside it. Both of those were on this
+list a few commits ago; what they bought is in the table above, and the numbers to re-run
+them with are in `docs/design.md` §10. The extension pool's own lookup was a scan of every
 extension interned so far until recently: 519 string compares per intern on `/work`,
 2.19 G of them per build, now 1.16 per intern — 5.8 s of user time on a build that is
 otherwise I/O-bound.

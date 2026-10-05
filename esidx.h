@@ -148,29 +148,41 @@ uint32_t bs_next(const bitset_t *b, uint32_t i);
 
 /* ---------------------------------------------------------- sorted index */
 
-typedef struct {
-    int64_t v;
-    eid_t   id;
-} sidx_ent_t;
-
-/* The high bit of `sidx_ent_t.id` marks a delta entry as a *retraction* of the
- * value in `v`, not an assertion of one. It exists because the main array is
- * append-and-sort: an id whose size or mtime changed still has its old row
- * there, and a range query that covers the old value would report it. */
+/* The high bit of a delta entry's *id* marks it as a *retraction* of the value beside
+ * it, not an assertion of one. It exists because the main array is append-and-sort: an
+ * id whose size or mtime changed still has its old row there, and a range query that
+ * covers the old value would report it. */
 #define SIDX_DEL 0x80000000u
 
-/* Main sorted array, ascending by v. Incremental changes go to `delta`
- * (unsorted) and are merged periodically -- decision D3. */
+/* Two arrays, not an array of {int64 v; eid_t id}. That struct is 16 bytes of which 4
+ * are padding, and the padding is 62.7 MiB on /work -- the ledger's third-largest row,
+ * and pure waste: 5 476 485 rows of a value and an id need 12 bytes each, not 16.
+ *
+ * The sort is what makes this affordable rather than merely smaller. `id` starts out as
+ * 0..n-1 and the values come from a column, so the array can be built by sorting the
+ * *ids* against that column with qsort_r and gathering the values afterwards: 12 bytes
+ * per row resident and nothing transient at all. Sorting an array of 16-byte structs and
+ * splitting it afterwards would have needed 88 MiB of scratch at the moment the trigram
+ * index is also at its largest, which is the peak this is trying to reduce.
+ *
+ * Nothing outside store.c may read these: the query layer asks for a range or for a
+ * count, and sidx_lower_bound() is the one place that knows the order. */
 typedef struct {
-    sidx_ent_t *a;
-    uint32_t    n, cap;
+    int64_t *v;           /* ascending */
+    eid_t   *id;
+    uint32_t n, cap;
 
-    sidx_ent_t *delta;
-    uint32_t    dn, dcap;
+    int64_t *dv;          /* the delta: unsorted, append-only (D3) */
+    eid_t   *did;
+    uint32_t dn, dcap;
 } sidx_t;
 
 void sidx_build(sidx_t *s, const int64_t *vals, uint32_t n);
 void sidx_free(sidx_t *s);
+/* first index with v >= lo -- the one binary search over the array's order */
+uint32_t sidx_lower_bound(const sidx_t *s, int64_t lo);
+/* rows whose value is in [lo,hi], main array and delta both */
+uint32_t sidx_count_range(const sidx_t *s, int64_t lo, int64_t hi);
 /* append [lo,hi] matching ids into bitset */
 uint32_t sidx_range_to_bitset(const sidx_t *s, int64_t lo, int64_t hi, bitset_t *out);
 /* D3's writer. update() asserts the new value; erase() retracts the old one.
