@@ -289,7 +289,7 @@ if the load factor rises.
 |---|---|---|
 | Block size | 32 filenames per block | [A5] |
 | Trigram unit | **bytes**, not codepoints | [A13] |
-| Posting encoding | delta-1 + PForDelta 128 | [A10] |
+| Posting encoding | delta-1 + PForDelta 128, **of which only delta-1 is used** | [A10] |
 | Block layout | interleaved for full blocks, plain for the tail | [A11] |
 | Bit-width selection | histogram + byte-cost enumeration | [A14] |
 | Trigram generation | 4-byte `memcpy`, take the low 3, advance 1 | [A9] |
@@ -323,11 +323,12 @@ it would be cost without benefit:
 | **Byte** trigrams [A13] | the one rule with a correctness reason: it is what keeps a CJK filename from producing thousands of postings, and it is what makes a CJK term searchable at all |
 | The longest literal run of the pattern | Everything anchors a wildcard to the whole filename, so every literal run has to occur in the name. The longest one is a necessary condition, which is all a filter may be |
 | Full scan below 3 bytes [A9] | the fallback the threshold note above is about |
+| **delta-1 postings [A10]** | added after the first version of this table, and the reason it was left out is worth keeping because it was wrong. "Resident, so there is nothing to decompress" is true and is the wrong question at this size: on /work the posting lists were 318.6 MiB of a 1 006 MiB index, and what decides whether they are worth compressing is how many bytes a *query* touches, not how many a load inflates. The delta half needs no block to be useful — the gaps inside a list ascend, so a gap is usually one byte — and the one reader walks a list front to back, which is the shape delta-1 is best at. Measured: 318.6 → 101.8 MiB, and no query slower. The PForDelta half of [A10] still needs a block, so it is still dropped |
 
 | Dropped | Why |
 |---|---|
 | Blocks of 32 [A5], `docid` = block number [A7], interleaving [A11] | a unit of compression and of I/O; there is no I/O on the query path |
-| delta-1 + PForDelta [A10] | an encoding for a compressed column |
+| PForDelta, bit-width selection [A10][A14] | both need a block of postings to be worth anything, and a block is on the dropped list above. delta-1 with a varint width is the same idea one posting at a time, which is the granularity that exists here |
 | zstd dictionary [A6][A8] | deferred to P4 in the original table too, and D4 says why: nothing to decompress |
 | Robin Hood [A12] | the table holds ≤ 34 k keys at 3.7 × 10⁵ entries, so the longest probe is not worth an implementation; linear probing at a load factor of 0.75 keeps it short. The dir hash measures its probe length for the same reason (§5.1) |
 | CRoaring (D7) | a posting list is an ascending id array and the intersection is a merge; roaring accelerates set algebra on dense ids, not a sorted merge |
@@ -342,6 +343,15 @@ in order and `esidx_add` only ever hands out a larger one (D8). The intersection
 therefore a merge against the candidate bitmap rather than a sort. Removals are not
 unpublished — a dead id is stopped by the `live` set every query seeds from, and
 `esidx_compact()` rebuilds, which is the same bargain `ext_index_del()` makes.
+
+**The ids are delta-varint encoded**, and ascending is what makes that pay: a gap
+inside a list is usually one byte, so a posting costs 1.28 bytes against 4 on /work.
+The first posting of a list has no predecessor and is stored whole, as a varint like
+any other. The encoding is only affordable because the one reader never seeks —
+`tri_index_filter()` walks the chosen list with a cursor that moves forward — and it is
+also the only thing that reads the buffer; `esidx.h` holds the shape and `trigram.c`
+owns the format. §10 carries the measurements, the query cost and the test that reaches
+each varint width.
 
 **The path half is a separate index and is not built.** `path:` reads a path
 rebuilt from the parent chain, so materialising one trigram per path per entry is
@@ -711,7 +721,7 @@ Each row: source → what was taken → how it lands here → why it changed.
 | 4.2 | `path_of()` parent-chain rebuild | `store.c` | done; path materialisation pending §4.2 |
 | 4.2 | extension-name interning | `store.c` | **done** — an open-addressed table over the name, so `ext_intern()` is O(1) instead of a scan of every name interned so far: 519 string compares per call down to 1.16 on /work, which is 5.8 s of user time on a build that is otherwise I/O-bound. Derived, so no snapshot mentions it (§4.2 for the two off-by-ones it took to get right) |
 | 5.1 | `dir_id -> children`, `path -> eid` hash | `store.c` | **done** — the children are one flat array grouped by directory ordinal (a CSR): exact extents, 100 % occupancy, one allocation for 630 472 directories, where the per-directory vectors were at 53 % in 630 472 allocations. It is rebuilt from the columns once per build and once per reconcile that added something, because a shared array has no room in the middle |
-| 5.2 | trigram index, sorted/reversed name arrays | `trigram.c` | **name half done** — `trigram.c`, byte trigrams over the display name, 33 727 keys / 4.83 M postings at 3.7 × 10⁵ entries; §5.2.1 for what was deliberately left out and why. **Path half and the sorted/reversed name arrays not started** |
+| 5.2 | trigram index, sorted/reversed name arrays | `trigram.c` | **name half done** — `trigram.c`, byte trigrams over the display name, 33 727 keys / 4.83 M postings at 3.7 × 10⁵ entries; §5.2.1 for what was deliberately left out and why. **Postings are delta-varint encoded** (318.6 → 101.8 MiB on /work, §10). **Path half and the sorted/reversed name arrays not started** |
 | 5.3 | sorted array + delta buffer | `store.c` | **done** — `sidx_update`/`sidx_erase` write the delta, D3's 1%/60 s merge is implemented, and the range read honours the retractions. Two arrays (`int64`, `eid`) rather than one of structs: 12 bytes a row against 16, of which 4 were padding — 62.7 MiB on /work. The build sorts the ids against the value column and gathers; the merge is a linear merge of two sorted runs. Nothing outside `store.c` reads the layout |
 | 5.4 | dense bitset | `index.c` | done; CRoaring at P4 (D7). Set algebra lives here, not in the executor |
 | 5.4 | ext bitmaps, file:/folder: bitmaps | `store.c` | done — built in `finalize`, so the snapshot format is unchanged |
@@ -864,6 +874,13 @@ and `esidx_load` pays the same because it re-runs `finalize` — 276 ms becomes
 ~367 ms. Memory: ~20 MB of postings on a 372 k-entry index, against a 6.9 MB
 snapshot for 117 k entries on WSL2. Nothing is persisted (D4), so this is paid at
 startup and at every compaction and never on the query path.
+
+**What it costs, since the postings are encoded.** The 20 MB above was the plain
+array; delta-varint makes it **5.9 MiB** on the same tree (18.4 before, 3.15x) and
+101.8 MiB on /work against 318.6, for no measurable query cost — the numbers are in the
+memory findings below. The build price is also unchanged, because the two-pass build that
+sizes every list exactly had to learn to price *bytes* rather than postings, and pricing a
+posting is the same walk either way.
 
 #### A path sort was allocating 64 KiB per row, and failing silently
 
@@ -1219,6 +1236,54 @@ Six things it says that no document recorded, and what has been done about each:
   the prefilter reads. That is the larger prize and it is on the query path, so it is not
   a decision this paragraph makes; it is the decision the next one has to measure.
 
+- **The posting lists are delta-varint encoded, and the estimate above was right.**
+  **318.6 → 101.8 MiB on /work** (334 029 952 → 106 762 658 bytes, 3.13x, 1.28 bytes a
+  posting), which is 216.8 MiB off the accounted total — 1 006.0 → **789.2 MiB** — and
+  215.9 MiB off peak rss, **1 078.0 → 862.1 MiB**. On /usr, 18.4 → 5.9 MiB and
+  64.4 → 51.8 MiB accounted, 74.2 → 62.3 MiB peak. The snapshot does not move
+  (313 011 674 bytes on /work): the index is derived, rebuilt by every load, so there was
+  never a serialized copy to shrink. `finalize` is unchanged (6 750 → 6 706 ms on /work,
+  which is inside the run-to-run spread of a phase that walks 83 M postings).
+  **It cost nothing on the query path**, which is what the paragraph above said had to be
+  measured rather than argued: best of 7, alternating builds, on /usr —
+  `conf` plan 0.024 → 0.027 ms and eval 2.538 → 2.561 ms, `path:/usr *.conf size:>1k`
+  eval 20.296 → 20.104 ms, `ext:conf` 0.031 → 0.030 ms. The decode is free because the
+  reader walks one list front to back and never seeks, so it is the shape delta-1 exists
+  for; the +3 µs on `conf` is the whole cost of turning 4 800 000 array reads into
+  4 800 000 varint decodes.
+
+  On /work the same harness (best of 5) puts `conf`'s plan at 0.332 → 0.385 ms, which
+  reads like +53 µs until the shapes that *never touch* the trigram index are looked at:
+  browse 0.481 → 0.527, `ext:conf` 0.440 → 0.464, `image:` 0.527 → 0.544. So the noise
+  floor of that run is 24-46 µs on a box this size and the decode is inside it. Neither
+  tree shows a shape slower than it was, and eval is flat or better on both.
+
+  Two things about the code, both of which the sanitiser build found and `-O2` did not:
+  **`-O2` does not notice a read one byte past the end of a posting list.** The array
+  version tested `ids[k] < i` before it incremented `k` and so never read `ids[n]`; the
+  decode has to ask whether a next posting exists before reading it, and the first
+  version did not. Every list whose last id is below the largest candidate over-reads,
+  and the byte past the end decodes to *something* which is then compared only against
+  rows the list had already rejected — so all 301 assertions passed at `-O2` and the
+  sanitiser build reported a heap-buffer-overflow in `tri_vget`. And the same shape of
+  mistake with the index off by one in the other direction: counting postings read rather
+  than indexing them makes `k >= n` true on the first row of a one-entry list, and a
+  filter that clears everything answers **zero** for every literal whose shortest list
+  holds a single id. That one *was* visible at `-O2` — 38 assertions failed — because
+  most lists hold one id.
+
+  The test reaches the widths by construction rather than by luck, and the route to it is
+  the part worth recording: **a file's id is its position in the walk, which is readdir
+  order, so no fixture can place a wide posting by naming a file.** An id of 16 384 needs
+  a 16 384-entry tree and *the right end of it*, which naming does not choose. The
+  reconcile path does: `esidx update` appends ids and never reuses one (D8), so an entry
+  added to a 17 000-entry index is necessarily above 16 384 however readdir ordered the
+  directory. The fixture therefore builds 17 000 files and then adds `wibble.dat` (one
+  posting, the first of its list, so stored whole — three bytes) and `markaaa.dat` /
+  `markbbb.dat` with 200 files between them (a gap of 201, two bytes) in one update pass.
+  The fourth width needs a value of 2²¹ and no fixture here has the id space, so no
+  assertion claims to reach it.
+
   **And the stop list is not a threshold away, which reading the code settles.**
   `tri_index_filter()` treats "this literal's trigram has no posting list" as a narrowing
   all the way to zero (`trigram.c:331`), and that is sound only because *every* trigram a
@@ -1312,6 +1377,21 @@ the next reader does not have to re-derive it.
 The walk never allocates a per-directory vector at all now. That was not a goal; it is what
 happened when the shape stopped being a vector, and it is why a fresh build's peak drops by
 the same 36 MiB rather than only its steady state.
+
+The encoding takes the first row of the last table, and it is the largest single thing the
+ledger has ever named:
+
+| | touched | address | |
+|---|---|---|---|
+| name trigram lists | **101.8** | 104.1 | **delta-varint** — was 318.6 / 320.3, 3.13x |
+| everything else | as above | | unchanged; the snapshot is byte-identical |
+| **total** | **789.2** | 1 330 | **peak rss 862.1**, was 1 078.0 |
+
+Two thirds of one row and 216.8 MiB of the total. What it cost is 8 bytes a slot — the list
+grew from 16 to 24 bytes for `nb` and `last`, which is 0.5 MiB on /work against 216.8
+saved, and is why the *address* column falls by less than the *touched* one. The remaining
+item on the list is still the dir paths pool at 56.6 MiB, which is derived data in a
+persisted pool and a separate decision.
 
 The `dir paths pool` row is new and the total moved with it, which is the point: the row was
 already being printed, carrying the reason "it is part of the names pool above, so it does

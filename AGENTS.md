@@ -454,6 +454,17 @@ Do not re-litigate these; they were measured and the conclusions are recorded:
   itself is still a full scan, that is the unbuilt path half). It costs +90 ms of
   `finalize` and ~20 MB, and buys back 20 ms per query; `round.sh` carries the
   bare-word shape precisely because nothing measured it before.
+- **The trigram postings are delta-varint encoded, and it is free on the query path.**
+  318.6 → 101.8 MiB on /work (3.13x), 18.4 → 5.9 MiB on /usr, for +3 µs on a bare-word
+  query and nothing measurable anywhere else. The reason it is free is structural and
+  worth keeping: **a posting list's only reader walks one list front to back and never
+  seeks**, which is the shape delta-1 exists for. The reason it is worth it is that
+  "resident, so nothing to decompress" is the wrong question at 318 MiB — what decides
+  is how many bytes a *query* touches. The full numbers are in design §10; the two
+  traps are that `-O2` does not notice a one-byte over-read past a list (§3.1 caught
+  it), and that a file's id is its position in readdir order, so **no fixture can place
+  a wide posting by naming a file** — the reconcile path can, because `update` appends
+  ids and never reuses one.
 - **A filter must be provably a superset, and the allowlist is the proof.** The
   trigram set of a pattern's longest literal run is a *necessary* condition for a
   match, so intersecting can only drop rows `text_match()` rejects. That is why

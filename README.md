@@ -279,7 +279,7 @@ Building it, on the same host:
 | **build, total** | **1 492 ms** | **59 456 ms** |
 | load | 327 ms | 5 664 ms |
 | snapshot | 20.8 MiB | 298 MiB |
-| peak rss | 74.2 MiB | **1 078 MiB** |
+| peak rss | 74.2 MiB | **862 MiB** |
 
 The `/work` column is one run of `./ledger.sh /work`, so its walk figure moves with the
 page cache by several seconds between runs — 53.1 s here against the 55.7 s the same
@@ -300,12 +300,12 @@ building); the only lever left on that walk is D6's concurrency.
 each — and it is the only way to tell a structure that is too big from one that is merely
 sized by the wrong number. `./ledger.sh <tree>` prints it together with the snapshot size
 and the query shapes, so a figure quoted from it can be re-measured with one command. On
-`/work` (1 078 MiB peak, **1 006 MiB accounted** — the total includes the 56.6 MiB of
-directory paths the ledger spent two commits displaying without counting):
+`/work` (peak rss, **789 MiB accounted** — the total includes the 56.6 MiB of directory
+paths the ledger spent two commits displaying without counting):
 
 | | touched | address | |
 |---|---|---|---|
-| name trigram lists | 318.6 MiB | 320.3 | 99 % of the posting-list capacity in use |
+| name trigram lists | 101.8 MiB | 104.1 | 83 507 488 postings, 1.28 bytes each: delta-varint, was 318.6 |
 | entry columns | 282.0 | 282.0 | trimmed to the entry count, incl. the `nchild` aggregate |
 | sorted arrays ×3 | 188.0 | 188.0 | 16 429 455 rows at 12 bytes, no padding |
 | names pool | 37.3 | 64.0 | one copy per distinct name: 1 499 995 of them |
@@ -314,19 +314,19 @@ directory paths the ledger spent two commits displaying without counting):
 | dir children array | 20.9 | 20.9 | 5 476 484 ids in 5 476 484 slots — one allocation |
 | eid → dir ordinal map | 6.4 | 6.4 | 2 097 152 slots for 630 472 directories |
 | name rank | 63.8 | 122.6 | 1 493 203 distinct folded names |
-| ext index | 15.1 | 11.5 | 16 384 slots for 6 765 extensions |
+| ext index | 15.1 | 15.5 | 16 384 slots for 6 765 extensions |
 | dir path hash | 5.0 | 16.0 | load factor 0.31 |
 | dir paths pool | 56.6 | 64.0 | 651 897 whole paths, 91 bytes a directory |
 
 What is left, largest first: 56.6 MiB of directory paths sit in a pool at all when the
-parent chain already rebuilds them. Three items that were on this list a few commits ago
-are not — the sorted arrays' 62.7 MiB of struct padding (two arrays now), the names pool's
-96 MiB of duplicated names (an intern table beside it), and the children's 53 % occupancy
-across 630 472 allocations (one array, 100 %). What they bought is in the table above, and
-the numbers to re-run them with are in `docs/design.md` §10. The extension pool's own
-lookup was a scan of every extension interned so far until recently: 519 string compares
-per intern on `/work`, 2.19 G of them per build, now 1.16 per intern — 5.8 s of user time
-on a build that is otherwise I/O-bound.
+parent chain already rebuilds them. Two items that were on this list a few commits ago are
+not — the trigram posting lists, which were 318.6 MiB and are 101.8 because the ids inside
+a list ascend and so are stored as varint gaps, and the names pool's 96 MiB of duplicated
+names (an intern table beside it). What they bought is in the table above, and the numbers
+to re-run them with are in `docs/design.md` §10. The extension pool's own lookup was a scan
+of every extension interned so far until recently: 519 string compares per intern on
+`/work`, 2.19 G of them per build, now 1.16 per intern — 5.8 s of user time on a build
+that is otherwise I/O-bound.
 
 Query cost on `/usr`:
 
@@ -347,7 +347,9 @@ The two arrows are the name trigram index (`trigram.c`, design §5.2): a *filter
 not a decision — the trigram set of a pattern's longest literal run is a necessary
 condition for a match, so intersecting the candidate set can only drop rows the
 matcher was going to reject. It costs +90 ms of `finalize` (paid again at load and
-at compaction, never on the query path) and ~20 MB.
+at compaction, never on the query path) and 5.9 MiB — the postings are delta-varint
+encoded, which is 18.4 MiB as a plain array and 3.15x smaller for no measurable
+query cost.
 
 The largest cost on a real tree is now the wildcard scan: `path:/usr *.conf size:>1k`
 spends 41 of its 43 ms in `eval` over 233 021 candidates, which is the in-memory text

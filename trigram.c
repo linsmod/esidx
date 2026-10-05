@@ -15,9 +15,13 @@
  *
  * Deliberately *not* here, and why (design §5.2 lists the format, D4 says why the
  * format is not the one plocate uses):
- *   - block compression, PForDelta postings, a zstd dictionary. Those belong to a
- *     persisted index; this one is resident, so there is nothing to decompress on
- *     the query path and plain ascending arrays are the cheapest representation.
+ *   - block compression, PForDelta postings, a zstd dictionary. This says the index is
+ *     resident so there is nothing to decompress in bulk, which is true and is also the
+ *     wrong question at this size: on /work the posting lists were 318.6 MiB of a
+ *     1 006 MiB index, and what decides whether they are worth compressing is how many
+ *     bytes a *query* has to touch, not how many a load has to inflate. So the one
+ *     encoding whose cost is paid a byte at a time by the caller is here, and the ones
+ *     that need a block before they pay are not (design §10).
  *   - CRoaring. A posting list is an ascending id array, and the sets here are
  *     intersected by a merge, which a roaring bitmap does not accelerate.
  *   - the path index. `path:` reads a path rebuilt from the parent chain
@@ -26,13 +30,19 @@
  *
  * Invariants worth stating, because both are load-bearing:
  *   - a posting list is strictly ascending, and holds an id at most once. Ascend-
- *     ing holds because finalize walks ids in order and esidx_add only ever hands
- *     out a larger one (D8); at-most-once because tri_index_add() drops a trigram
- *     a name already contributed. The filter's merge depends on both.
+ *     ing holds because finalize walks ids in order and esidx_add only ever hands out
+ *     a larger one (D8); at-most-once because tri_index_add() drops a trigram a name
+ *     already contributed. The filter's merge depends on both.
  *   - the index is keyed on ASCII-lowercased bytes and nothing else. wc_eq() folds
  *     case with tolower() in the C locale, which is ASCII-only, so folding a
  *     non-ASCII byte here would desynchronise the filter from the matcher it
  *     feeds: it would drop rows the matcher accepts.
+ *   - the ids are delta-varint encoded, and *only* this file reads them. Ascending is
+ *     what makes the encoding pay (a gap is usually one byte) and it is also what makes
+ *     the decode a forward walk: tri_index_filter() reads the chosen list with a
+ *     cursor that only moves forward, so it never has to seek into a list it cannot
+ *     index directly. That is the property the whole encoding rests on, and it is why
+ *     a varint decode is affordable here at all.
  */
 
 #include <stdlib.h>
@@ -187,16 +197,63 @@ static int tri_intern(tri_index_t *ti, uint32_t key)
     return (int)ti->n_slots++;
 }
 
+/* -------------------------------------------------------- the posting codec */
+
+/* LEB128: seven bits per byte, low group first, the high bit set on every byte but
+ * the last. Chosen over the alternatives because the *length* is knowable without
+ * decoding, which the two-pass build needs -- pass one has to size every list
+ * exactly, and that is only possible if it can price a posting before writing it.
+ *
+ * A gap is never zero (ids ascend, and the first posting of a list is stored whole),
+ * so a list of n postings is at least n bytes and the buffer can never be shorter
+ * than the count it claims. */
+static inline uint32_t tri_vlen(uint32_t v)
+{
+    uint32_t n = 1;
+    while (v >= 0x80u) { v >>= 7; n++; }
+    return n;
+}
+
+static inline uint32_t tri_vput(uint8_t *p, uint32_t v)
+{
+    uint32_t n = 0;
+    while (v >= 0x80u) { p[n++] = (uint8_t)(v | 0x80u); v >>= 7; }
+    p[n++] = (uint8_t)v;
+    return n;
+}
+
+static inline uint32_t tri_vget(const uint8_t **pp)
+{
+    const uint8_t *p = *pp;
+    uint32_t v = 0, s = 0;
+    for (;;) {
+        uint8_t b = *p++;
+        v |= (uint32_t)(b & 0x7fu) << s;
+        if (!(b & 0x80u)) { *pp = p; return v; }
+        s += 7;
+    }
+}
+
 static int tri_post(tri_index_t *ti, uint32_t slot, eid_t id)
 {
     tri_list_t *l = &ti->list[slot];
-    if (l->n == l->cap) {
-        uint32_t ncap = l->cap ? l->cap * 2 : 4;
-        eid_t *ni = realloc(l->ids, ncap * sizeof(eid_t));
-        if (!ni) return -1;
-        l->ids = ni; l->cap = ncap;
+    /* The first posting of a list has no predecessor, so it stores the id whole and
+     * every later one stores the gap -- which is what makes a list of ids that
+     * ascend by one cost one byte each. `last` is kept in the list rather than
+     * decoded back out of the buffer, because an append that walked the buffer to
+     * find its own tail would make the build quadratic in the length of a list. */
+    uint32_t v = l->n ? id - l->last : id;
+    uint32_t need = l->nb + tri_vlen(v);
+    if (need > l->cap) {
+        uint32_t ncap = l->cap ? l->cap * 2 : 16;
+        while (ncap < need) ncap *= 2;
+        uint8_t *nb = realloc(l->buf, ncap);
+        if (!nb) return -1;
+        l->buf = nb; l->cap = ncap;
     }
-    l->ids[l->n++] = id;
+    l->nb += tri_vput(l->buf + l->nb, v);
+    l->last = id;
+    l->n++;
     ti->n_postings++;
     return 0;
 }
@@ -251,45 +308,65 @@ int tri_index_build(tri_index_t *ti, const esidx_t *db)
      * that a different growth policy would remove either -- it is whatever each
      * list's length happened to be modulo its power of two.
      *
-     * So: count first, allocate exactly, then fill. The counting pass interns the
+     * So: price first, allocate exactly, then fill. The pricing pass interns the
      * same keys into the same slots, so pass two can reuse the slot table without
      * a lookup of its own; only the append is left, and it never has to grow.
      * ext_index_build() does this in the same function family, for the same
-     * reason, with the comment "sized exactly" already written there. */
-    uint32_t *cnt = NULL;
-    uint32_t cnt_n = 0;                  /* allocated slots, always == cap_slots */
+     * reason, with the comment "sized exactly" already written there.
+     *
+     * What pass one prices is *bytes*, not postings, which is the one thing the
+     * encoding decides: a posting costs tri_vlen() of them, and pass one has to
+     * reach the same number pass two will write or the exact sizing is a fiction
+     * and tri_post() quietly doubles the buffer instead. So `prev` is carried here
+     * too -- the gap is what gets priced, and a gap needs the previous id. */
+    uint32_t *sz = NULL, *prev = NULL;
+    uint32_t acc_n = 0;                   /* allocated slots, always == cap_slots */
     for (uint32_t i = 0; i < n; i++) {
         if (db->et.flags[i] & EF_DEAD) continue;
         uint32_t nk = tri_keys_of(display_name_of(db, i), keys);
         for (uint32_t k = 0; k < nk; k++) {
             int slot = tri_intern(ti, keys[k]);
-            if (slot < 0) { free(keys); free(cnt); tri_index_free(ti); return -1; }
-            /* Grown here rather than sized once up front: the counting pass is what
+            if (slot < 0) goto fail;
+            /* Grown here rather than sized once up front: the pricing pass is what
              * interns the keys, so `cap_slots` keeps doubling underneath it and a
              * count array sized before the loop is a heap overflow on any tree with
              * more distinct trigrams than the first name contributes. */
-            if ((uint32_t)slot >= cnt_n) {
-                uint32_t *nc = realloc(cnt, (size_t)ti->cap_slots * sizeof(uint32_t));
-                if (!nc) { free(keys); free(cnt); tri_index_free(ti); return -1; }
-                memset(nc + cnt_n, 0, (size_t)(ti->cap_slots - cnt_n) * sizeof(uint32_t));
-                cnt = nc;
-                cnt_n = ti->cap_slots;
+            if ((uint32_t)slot >= acc_n) {
+                uint32_t want = ti->cap_slots;
+                uint32_t *nz = realloc(sz, (size_t)want * sizeof(uint32_t));
+                if (!nz) goto fail;
+                memset(nz + acc_n, 0, (size_t)(want - acc_n) * sizeof(uint32_t));
+                sz = nz;
+                uint32_t *np = realloc(prev, (size_t)want * sizeof(uint32_t));
+                if (!np) goto fail;
+                memset(np + acc_n, 0, (size_t)(want - acc_n) * sizeof(uint32_t));
+                prev = np;
+                acc_n = want;
             }
-            cnt[slot]++;
+            /* `sz[slot] == 0` is the "no posting yet" test, and it is exact: a
+             * posting is never zero bytes wide. The first one is the id itself,
+             * which is what tri_post() writes for the first one too. */
+            sz[slot] += tri_vlen(sz[slot] ? i - prev[slot] : i);
+            prev[slot] = i;
         }
     }
 
-    if (cnt) {
+    uint64_t priced = 0;
+    if (sz) {
         for (uint32_t s = 0; s < ti->n_slots; s++) {
             tri_list_t *l = &ti->list[s];
-            uint32_t want = cnt[s] ? cnt[s] : 1;
-            l->ids = malloc((size_t)want * sizeof(eid_t));
-            if (!l->ids) { free(keys); free(cnt); tri_index_free(ti); return -1; }
+            uint32_t want = sz[s] ? sz[s] : 1;
+            l->buf = malloc(want);
+            if (!l->buf) goto fail;
             l->cap = want;
+            l->nb = 0;
             l->n = 0;
+            l->last = 0;
+            priced += sz[s];
         }
     }
-    free(cnt);
+    free(sz); sz = NULL;
+    free(prev); prev = NULL;
 
     for (uint32_t i = 0; i < n; i++) {
         if (db->et.flags[i] & EF_DEAD) continue;
@@ -300,25 +377,44 @@ int tri_index_build(tri_index_t *ti, const esidx_t *db)
         uint32_t nk = tri_keys_of(display_name_of(db, i), keys);
         for (uint32_t k = 0; k < nk; k++) {
             /* The slot is where pass one put it, and tri_post() does not have to
-             * grow anything: cap is already the exact count. */
+             * grow anything: cap is already the exact byte count. */
             int slot = tri_find(ti, keys[k]);
             if (slot < 0 || tri_post(ti, (uint32_t)slot, i) != 0) {
                 LOGE("cannot build the name trigram index at entry %u", i);
-                tri_index_free(ti);
-                return -1;
+                goto fail;
             }
         }
     }
-    LOGD("name trigrams: %u distinct over %u live names, %u postings",
-         ti->n_slots, n, ti->n_postings);
+    /* The two passes must agree on every byte, and the only way they can disagree
+     * is if the pricing and the append stop using the same width function -- which
+     * is a heap overflow, not a wrong answer, and so nothing would report it until
+     * something else happened to run under a sanitiser. Counted here, once, where
+     * the two numbers exist. */
+    uint64_t wrote = 0;
+    for (uint32_t s = 0; s < ti->n_slots; s++) wrote += ti->list[s].nb;
+    if (wrote != priced) {
+        LOGE("name trigram index: priced %llu posting bytes and wrote %llu",
+             (unsigned long long)priced, (unsigned long long)wrote);
+        goto fail;
+    }
+
+    LOGD("name trigrams: %u distinct over %u live names, %u postings in %llu bytes",
+         ti->n_slots, n, ti->n_postings, (unsigned long long)wrote);
     free(keys);
     return 0;
+
+fail:
+    free(keys);
+    free(sz);
+    free(prev);
+    tri_index_free(ti);
+    return -1;
 }
 
 void tri_index_free(tri_index_t *ti)
 {
     if (ti->list) {
-        for (uint32_t i = 0; i < ti->n_slots; i++) free(ti->list[i].ids);
+        for (uint32_t i = 0; i < ti->n_slots; i++) free(ti->list[i].buf);
         free(ti->list);
     }
     free(ti->key);
@@ -365,11 +461,29 @@ bool tri_index_filter(const tri_index_t *ti, const char *lit, bitset_t *out)
     if (!best) return false;
 
     /* Both sides are ascending, so this is a merge: walk the set, advance a
-     * cursor into the posting list, clear whatever the cursor passed. */
-    uint32_t k = 0;
+     * cursor into the posting list, clear whatever the cursor passed. The cursor
+     * only moves forward, which is what lets the list be a delta-varint stream --
+     * decoding is a byte-at-a-time walk and there is never a reason to go back to
+     * one already read.
+     *
+     * `k` is the index of the posting `v` holds, so `v` is ids[k] and reading the
+     * *next* one is a step that has to know there is one. The eid_t array this
+     * replaced got that for free -- it tested `ids[k] < i` before it incremented,
+     * so it never read ids[n] -- and a varint decode has to ask first. Skipping that
+     * ask reads one byte past every list whose last id is below the largest candidate,
+     * which -O2 does not notice: the byte past the end decodes to something, and every
+     * row it is compared against is one the list had already rejected, so the answers
+     * come out right. The sanitiser build is what found it. */
+    const uint8_t *p = best->buf;
+    uint32_t k = 0;                      /* the first posting is the id, read whole */
+    uint32_t v = tri_vget(&p);
     for (uint32_t i = bs_next(out, 0); i < out->nbits; i = bs_next(out, i + 1)) {
-        while (k < best->n && best->ids[k] < i) k++;
-        if (k >= best->n || best->ids[k] != i) bs_clear_bit(out, i);
+        while (v < i) {
+            if (k + 1u >= best->n) { k = best->n; break; }
+            v += tri_vget(&p);
+            k++;
+        }
+        if (k >= best->n || v != i) bs_clear_bit(out, i);
     }
     return true;
 }

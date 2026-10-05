@@ -2134,25 +2134,22 @@ static void mem_row(const char *phase, const char *what, uint64_t touched,
 
 /* ------------------------------------------------ the trigram lists' shape
  *
- * This is 318.6 MiB on /work -- a third of everything the index accounts for, and the
- * largest single structure in it -- and until now the ledger said one thing about it: a
- * mean of 15.2 postings per entry. A mean cannot decide anything. The two fixes anyone
- * would reach for are a *stop list* (do not index the trigrams whose lists are so long
- * that filtering on them costs more than scanning) and *delta-varint postings* (ids
- * inside a list ascend, so most gaps are small), and they want opposite numbers: the
- * first wants to know how much of the volume sits in the long lists, the second wants to
- * know how small the gaps are.
+ * This is 318.6 MiB on /work before the delta-varint encoding, a third of everything the
+ * index accounts for and the largest single structure in it -- and until now the ledger
+ * said one thing about it: a mean of 15.2 postings per entry. A mean cannot decide
+ * anything. The two fixes anyone would reach for are a *stop list* (do not index the
+ * trigrams whose lists are so long that filtering on them costs more than scanning) and
+ * *delta-varint postings* (ids inside a list ascend, so most gaps are small), and they
+ * want opposite numbers: the first wants to know how much of the volume sits in the long
+ * lists, the second wants to know how small the gaps are.
  *
- * Both come out of one pass, and both are printed as the question rather than as a
- * verdict -- the rule log_ext_lengths() and log_ext_cardinality() already follow. The
- * bands straddle the thresholds a stop list would plausibly use (1 % of the table, then
- * 10x that), because a distribution picks the threshold and a single point cannot.
- *
- * The gap figures are a *sample*: the first 64 gaps of each list, which on /work is 4 M
- * of the 83 M postings. That is stated because it is a sample, and the front of a list is not an ordinary place --
- * a list is built in id order, but its ids are packed more tightly at the start of
- * leading gap is an ordinary one. Walking all 318 MiB to avoid the word would cost more
- * than every build that prints it.
+ * Both came out of one pass. The varint half was measured here as a *sample* of gaps and
+ * an estimate of what the whole set would weigh, and it was what the encoding decision
+ * was made on -- and now that the encoding is what builds the index, that estimate is a
+ * measurement of the same bytes in the row above, printed exactly rather than sampled,
+ * so it is gone. What is left is the half that is still a question: the bands, which
+ * straddle the thresholds a stop list would plausibly use (1 % of the table, then 10x
+ * that), because a distribution picks the threshold and a single point cannot.
  */
 static void log_tri_shape(const esidx_t *db, const char *phase)
 {
@@ -2160,7 +2157,7 @@ static void log_tri_shape(const esidx_t *db, const char *phase)
     static const uint32_t lo[NB] = { 1, 2, 16, 256, 4096, 65536 };
     static const char   *hi[NB] = { "=1", "2-15", "16-255", "256-4k", "4k-65k", ">=65k" };
     uint64_t lists[NB] = {0}, posts[NB] = {0};
-    uint64_t nlists = 0, nposts = 0, gaps = 0, varint = 0, sampled = 0;
+    uint64_t nlists = 0, nposts = 0;
 
     for (uint32_t i = 0; i < db->tri.n_slots; i++) {
         const tri_list_t *l = &db->tri.list[i];
@@ -2172,40 +2169,6 @@ static void log_tri_shape(const esidx_t *db, const char *phase)
         posts[b] += n;
         nlists++;
         nposts += n;
-
-        /* What the same ids would weigh as varint deltas: gaps inside one list ascend
-         * by construction, so a gap is usually one byte.
-         *
-         * Two things about the sample, both of which were wrong in the first version and
-         * are visible in the numbers rather than in the code:
-         *
-         *   - a *fixed* count per list makes the sample list-uniform, and the
-         *     population is gap-uniform: 64 gaps out of a 100 000-entry list weigh the
-         *     same as 64 out of a 10-entry one, so the mean came out as the average
-         *     list's rather than the average gap's (2.2x sampled against 3.5x actual on
-         *     /etc). So the sample is a fixed *fraction* of each list, and every list
-         *     contributes in proportion to its length.
-         *   - the run has to start somewhere other than the front: the ids in one list
-         *     are packed more tightly at the start of the table than at the end. The
-         *     offset is the slot index hashed (Fibonacci), so it is spread, free and
-         *     deterministic -- and clamped so the run cannot read past the list, which
-         *     the first version did and the sanitiser build caught. */
-        if (n > 1) {
-            uint32_t span = n - 1;
-            uint32_t take = n / 64;
-            if (take < 1) take = 1;
-            if (take > span) take = span;
-            uint32_t room = span - take;                 /* off + take <= span = n-1 */
-            uint32_t off = room ? (uint32_t)(((uint64_t)i * 2654435761u) % (room + 1)) : 0;
-            uint32_t prev = l->ids[off];
-            for (uint32_t k = 1; k <= take; k++) {
-                uint32_t d = l->ids[off + k] - prev;
-                varint += d < (1u << 7) ? 1 : d < (1u << 14) ? 2 : d < (1u << 21) ? 3 : 4;
-                gaps++;
-                prev = l->ids[off + k];
-            }
-            sampled += take;
-        }
     }
 
     char band_line[512] = {0};
@@ -2217,8 +2180,8 @@ static void log_tri_shape(const esidx_t *db, const char *phase)
     LOGI("%s: mem trigram shape: %llu lists, %llu postings | by length (lists/postings): %s",
          phase, (unsigned long long)nlists, (unsigned long long)nposts, band_line);
 
-    /* The two questions, answered rather than left to be derived: how much a stop list
-     * at each threshold would remove, and what the postings weigh delta-encoded. */
+    /* The remaining question, answered rather than left to be derived: how much a stop
+     * list at each threshold would remove. */
     uint32_t cut1 = db->et.count / 100, cut2 = db->et.count / 10;
     uint64_t l1 = 0, p1 = 0, l2 = 0, p2 = 0;
     for (int i = 0; i < NB; i++) {
@@ -2231,30 +2194,6 @@ static void log_tri_shape(const esidx_t *db, const char *phase)
          nposts ? 100.0 * (double)p1 / (double)nposts : 0.0,
          (unsigned long long)l2, (unsigned long long)p2,
          nposts ? 100.0 * (double)p2 / (double)nposts : 0.0);
-
-    /* Two numbers, both stated as what they are. The first is the measurement: the mean
-     * encoded size of one gap, from the sample. The second is that mean applied to the
-     * whole set, and it carries the one term a gap cannot: the first id in a list has no
-     * predecessor to difference against, so it is stored whole.
-     *
-     * Both of these were wrong in the first version of this line, in ways only the
-     * numbers showed: it compared a *sample's* varint total against the *whole* table's
-     * 4-byte total and claimed 60x, which no encoding of a 4-byte id can reach; and it
-     * counted that first id as one byte. Checked exactly on /etc (every gap, no sample)
-     * the mean is 1.18 bytes against the sampled 1.32, so the sample is 12 % high on a
-     * 15 % sample -- close enough to decide with, and it says so.
-     */
-    uint64_t gaps_all = nposts - nlists;
-    double per_gap = gaps ? (double)varint / (double)gaps : 0.0;
-    uint64_t enc_all = (uint64_t)(per_gap * (double)gaps_all) + nlists * sizeof(eid_t);
-    LOGI("%s: mem trigram gaps: sampled %llu of %llu, %.2f bytes a gap against 4 for a "
-         "raw id (%.2fx) | the whole set would be ~%llu bytes against %llu (%.2fx), "
-         "including %llu first-of-list ids stored whole",
-         phase, (unsigned long long)sampled, (unsigned long long)gaps_all, per_gap,
-         per_gap ? 4.0 / per_gap : 0.0,
-         (unsigned long long)enc_all, (unsigned long long)(nposts * sizeof(eid_t)),
-         enc_all ? (double)(nposts * sizeof(eid_t)) / (double)enc_all : 0.0,
-         (unsigned long long)nlists);
 }
 
 void esidx_log_mem(const esidx_t *db, const char *phase)
@@ -2403,23 +2342,28 @@ void esidx_log_mem(const esidx_t *db, const char *phase)
     }
 
     if (db->tri.n_slots) {
-        uint64_t post_bytes = 0, post_used = 0;
+        uint64_t post_bytes = 0, post_used = 0, post_raw = 0;
         for (uint32_t i = 0; i < db->tri.n_slots; i++) {
-            post_bytes += (uint64_t)db->tri.list[i].cap * sizeof(eid_t);
-            post_used  += (uint64_t)db->tri.list[i].n * sizeof(eid_t);
+            post_bytes += (uint64_t)db->tri.list[i].cap;
+            post_used  += (uint64_t)db->tri.list[i].nb;
+            post_raw   += (uint64_t)db->tri.list[i].n * sizeof(eid_t);
         }
         uint64_t fixed = (uint64_t)db->tri.cap_slots *
                          (sizeof(tri_list_t) + sizeof(uint32_t));
         if (db->tri.tab) fixed += ((uint64_t)db->tri.tab_mask + 1) * sizeof(uint32_t);
-        /* Resident at the capacity, not at the length: tri_index_add() grows a
+        /* Resident at the capacity, not at the used length: tri_index_add() grows a
          * posting list by doubling, and realloc copies what was there, so the
-         * headroom between n and cap was written at some point and stays mapped.
-         * A counting pass before the fill is what would make these two columns
-         * agree -- the ext index above already does it, in the same function. */
+         * headroom between nb and cap was written at some point and stays mapped.
+         * A pricing pass before the fill is what makes these two columns agree --
+         * the ext index above already does it, in the same function. */
         mem_row(phase, "name trigram lists", post_bytes, post_bytes + fixed, &total);
-        LOGI("%s: mem trigram slots=%u of %u cap, %.1f postings/entry, %.0f%% of the "
-             "list capacity in use", phase, db->tri.n_slots, db->tri.cap_slots,
+        LOGI("%s: mem trigram slots=%u of %u cap, %.1f postings/entry, %.2f bytes a "
+             "posting against %u raw (%.2fx), %.0f%% of the list capacity in use",
+             phase, db->tri.n_slots, db->tri.cap_slots,
              et->count ? (double)db->tri.n_postings / (double)et->count : 0.0,
+             db->tri.n_postings ? (double)post_used / (double)db->tri.n_postings : 0.0,
+             (unsigned)sizeof(eid_t),
+             post_raw ? (double)post_raw / (double)post_used : 0.0,
              post_bytes ? 100.0 * (double)post_used / (double)post_bytes : 0.0);
         log_tri_shape(db, phase);
     }

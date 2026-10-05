@@ -841,6 +841,83 @@ else
     ok "the prefilter stays off for a path term"
 fi
 
+# ------------------------------------------------------- the posting encoding
+#
+# A posting list is delta-varint encoded (trigram.c), so the width of one posting is
+# 1, 2, 3 or 4 bytes and the filter decodes it as it walks. Every assertion above runs
+# on a fixture whose ids are single digits, which means every posting in them is *one*
+# byte -- so all of them pass against a decoder that reads one byte and stops, which is
+# the bug this fixture exists to exclude. Reaching the wider encodings needs ids above
+# 127 and above 16 384, and the id of a file is its position in the walk, which is
+# readdir order -- so naming a file does not decide its id and no fixture can place one.
+#
+# The reconcile path is what does decide it: `esidx update` appends ids and never reuses
+# one (design §11 D8), so an entry added to a 17 000-entry index is *necessarily* above
+# 16 384 however readdir ordered the directory. So the markers are added by an update:
+#
+#   wib        one file, so its list is a single posting -- and that posting is the
+#              first of its list, stored whole, so it is three bytes wide
+#   ark        two files 201 ids apart, so the gap between them is a two-byte posting
+#
+# Both are forced by arithmetic rather than by luck: the update adds 203 entries to an
+# index of 17 001, so every id it hands out is at least 17 002; and the two `mark` files
+# have 200 files between them, so their ids differ by 201 whichever order the pass
+# visited them in. The fourth width needs a value of 2^21, which no fixture on this
+# machine has an id space for, so no assertion here claims to reach it.
+TRI="$TMP/tri"
+mkdir -p "$TRI"
+awk 'BEGIN { for (i = 0; i < 17000; i++) printf "f%05d.dat\n", i }' \
+    | ( cd "$TRI" && xargs touch )
+TRI_DB="$TMP/tri.idx"
+build "$TRI" "$TRI_DB" >/dev/null
+expect "the encoding fixture has 17001 entries" "$BUILT" "17001"
+
+for i in $(seq 1 200); do : >"$TRI/g$i.dat"; done
+: >"$TRI/wibble.dat"; : >"$TRI/markaaa.dat"; : >"$TRI/markbbb.dat"
+if "$BIN" update "$TRI_DB" >/dev/null 2>"$TMP/err"; then
+    ok "203 entries added by a reconcile, so their ids are all above 16384"
+else
+    bad "203 entries added by a reconcile, so their ids are all above 16384" "see $TMP/err"
+fi
+
+# For a literal of exactly 3 bytes the prefilter's output *is* the matcher's: the one
+# trigram is the whole literal, so a name in that posting list contains the literal.
+# That makes `rows == candidates-after` an assertion about the decode and not about the
+# matcher -- a decoder that reads the wrong bytes keeps ids whose names do not hold the
+# literal, and the matcher drops them, so the two numbers come apart.
+DB="$TRI_DB"
+for shape in "wib 1" "ark 2"; do
+    set -- $shape
+    ESIDX_LOG=debug "$BIN" query "$TRI_DB" "$1" >/dev/null 2>"$TMP/err"
+    cat "$TMP/err" >>"$DIAG"
+    narrowed=$(sed -nE "s/.*trigram prefilter '$1': [0-9]+ -> ([0-9]+) candidates\$/\1/p" "$TMP/err" | head -1)
+    q "$1" "count:0"
+    rows=$(n "$LAST")
+    if [ "$rows" = "$2" ] && [ "${narrowed:-x}" = "$2" ]; then
+        ok "'$1' decodes to $2 rows and the prefilter kept exactly $2"
+    else
+        bad "'$1' decodes to $2 rows and the prefilter kept exactly $2" \
+            "got $rows rows, prefilter left ${narrowed:-nothing}"
+    fi
+done
+q "ark" "count:0"
+expect "...and the two of them are the two files, 201 ids apart" \
+       "$(paths "$LAST")" "$TRI/markaaa.dat $TRI/markbbb.dat "
+
+# ...and the encoding is actually engaged, which is the other half: a decoder can be
+# correct and still be handed a raw array, and nothing above would notice. The ledger
+# row is the measurement, and 1.00x is what it reads if the encoding is ever undone.
+"$BIN" -v 3 build "$TRI" -o "$TMP/triled.idx" >/dev/null 2>"$TMP/err"
+cat "$TMP/err" >>"$DIAG"
+TRI_RATIO=$(sed -n 's/.*mem trigram slots=.*against 4 raw (\([0-9.]*\)x).*/\1/p' "$TMP/err" | head -1)
+if [ -n "$TRI_RATIO" ] && awk -v r="$TRI_RATIO" 'BEGIN { exit !(r + 0 > 1.5) }'; then
+    ok "the posting lists are encoded (${TRI_RATIO}x against a raw id)"
+else
+    bad "the posting lists are encoded (>1.5x against a raw id)" \
+        "ledger says [${TRI_RATIO:-no trigram row}]"
+fi
+DB="$FLAT_DB"
+
 say "query language: macros and unsupported functions"
 
 q "type:document"   ; expect "type:document"              "$(n "$LAST")" "3"
