@@ -1275,6 +1275,95 @@ DB="$TREE_DB"
 q "ext:conf"
 expect "the original fixture is untouched by the incremental work" "$(n "$LAST")" "3"
 
+# ------------------------------------- a dirty set of directories, and what it must equal
+#
+# design §7's dirty set, which is what an event-driven refresh will feed. The oracle here
+# is the strongest one available and it is *not* a self-comparison: refreshing one
+# directory must leave the index in exactly the state a full pass leaves it in, and the
+# snapshot is the whole of that state -- the pools and the columns, no derived structure
+# (D4). So two snapshots copied from one starting point, taken to the same filesystem by
+# two different routes, are compared byte for byte. A partial refresh that misses anything,
+# or that writes a wrong depth or a wrong child count, differs.
+#
+# The changes are deliberately spread over four kinds, because each one takes a different
+# path through the reconcile: an add, a remove, a rename (which is both, in one listing),
+# and a *new subdirectory with a file in it* -- which the partial pass must find without
+# having been told about it, by descending into `a` and then into `a/deep` and then
+# noticing that `fresh` is new (ref B5).
+DL="$TMP/dirty"
+mkdir -p "$DL/a/deep" "$DL/b"
+printf 'x%.0s' $(seq 1 10) >"$DL/a/one.txt"
+printf 'x%.0s' $(seq 1 20) >"$DL/a/deep/two.txt"
+printf 'x%.0s' $(seq 1 30) >"$DL/b/three.txt"
+DL_DB="$TMP/dirty.idx"
+build "$DL" "$DL_DB" >/dev/null
+
+printf 'n%.0s' $(seq 1 5) >"$DL/a/new.txt"
+rm "$DL/a/one.txt"
+mv "$DL/a/deep/two.txt" "$DL/a/deep/renamed.txt"
+mkdir -p "$DL/a/deep/fresh"
+printf 'f%.0s' $(seq 1 7) >"$DL/a/deep/fresh/leaf.txt"
+
+cp "$DL_DB" "$TMP/dirty.full.idx"
+cp "$DL_DB" "$TMP/dirty.part.idx"
+"$BIN" update "$TMP/dirty.full.idx" >/dev/null 2>>"$DIAG"
+if "$BIN" update "$TMP/dirty.part.idx" --dir "$DL/a" >/dev/null 2>"$TMP/err"; then
+    ok "--dir refreshes one directory"
+    fd5=$(md5sum <"$TMP/dirty.full.idx"); pd5=$(md5sum <"$TMP/dirty.part.idx")
+    if [ "$fd5" = "$pd5" ]; then
+        ok "and the snapshot is identical to a full pass over the same tree"
+    else
+        bad "and the snapshot is identical to a full pass over the same tree" \
+            "full=$fd5 part=$pd5"
+    fi
+else
+    bad "--dir refreshes one directory" "see $TMP/err"
+fi
+
+# ...and what it actually found, so a pass that changed *nothing* cannot pass the
+# comparison above by matching a full pass that changed nothing either.
+DB="$TMP/dirty.part.idx"
+q "name:$DL/a/new.txt";   expect "the partial pass added A's new file" "$(n "$LAST")" "1"
+q "name:$DL/a/one.txt";   expect "and removed the one A lost" "$(n "$LAST")" "0"
+q "name:renamed";         expect "and followed the rename inside a subdirectory" "$(n "$LAST")" "1"
+q "name:leaf.txt";        expect "and found a file in a directory created inside A" "$(n "$LAST")" "1"
+q ""
+expect "its entry count is find(1)'s" "$(n "$LAST")" "$(find "$DL" | wc -l)"
+
+# The set is a *set*: a directory that changed but was not marked must not be looked at,
+# or "partial refresh" would be another name for the full one and the comparison above
+# would prove nothing. This is the assertion that can fail.
+printf 'z%.0s' $(seq 1 9) >"$DL/b/only-in-b.txt"
+cp "$DL_DB" "$TMP/dirty.part2.idx"
+"$BIN" update "$TMP/dirty.part2.idx" --dir "$DL/a" >/dev/null 2>>"$DIAG"
+DB="$TMP/dirty.part2.idx"
+q "name:only-in-b.txt"
+expect "a change in an unmarked directory is not seen" "$(n "$LAST")" "0"
+"$BIN" update "$TMP/dirty.part2.idx" >/dev/null 2>>"$DIAG"
+q "name:only-in-b.txt"
+expect "...and a full pass is what notices it" "$(n "$LAST")" "1"
+
+# A path that is not one of the index's directories is refused rather than reconciled:
+# a reconcile against the wrong directory would delete every row it did not find, which
+# is the same reason the root argument is checked rather than believed.
+if "$BIN" update "$DL_DB" --dir "$TMP/nonexistent" >/dev/null 2>"$TMP/err"; then
+    bad "--dir refuses a path that is not in the index" "exit status was 0"
+else
+    grep -q 'is not a directory in this index' "$TMP/err" \
+        && ok "--dir refuses a path that is not in the index by name" \
+        || bad "--dir refuses a path that is not in the index by name" "$(cat "$TMP/err")"
+fi
+if "$BIN" update "$DL_DB" --dir "$DL/a/one.txt" >/dev/null 2>"$TMP/err"; then
+    bad "--dir refuses a file" "exit status was 0"
+else
+    ok "--dir refuses a file"
+fi
+if "$BIN" update "$DL_DB" "$DL" --dir "$DL/a" >/dev/null 2>"$TMP/err"; then
+    bad "a root and --dir together are refused" "exit status was 0"
+else
+    ok "a root and --dir together are refused"
+fi
+
 # -------------------------------------------------------- extension interning
 #
 # `ext:` resolves an extension to an id, and the id is what the column stores, so the

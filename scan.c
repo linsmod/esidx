@@ -615,34 +615,47 @@ static void update_merge(esidx_t *db)
     }
 }
 
-int esidx_update(esidx_t *db, const char *root, unsigned flags, update_stats_t *st)
+int esidx_mark_dirty(esidx_t *db, eid_t dir)
+{
+    if (!db || dir >= db->et.count) return -1;
+    if (db->et.flags[dir] & EF_DEAD) return -1;
+    if (!(db->et.flags[dir] & EF_DIR)) return -1;
+    if (db->dirty_n == db->dirty_cap) {
+        uint32_t ncap = db->dirty_cap ? db->dirty_cap * 2 : 64;
+        eid_t *nd = realloc(db->dirty, (size_t)ncap * sizeof(eid_t));
+        if (!nd) return -1;
+        db->dirty = nd;
+        db->dirty_cap = ncap;
+    }
+    db->dirty[db->dirty_n++] = dir;
+    return 0;
+}
+
+static int cmp_eid(const void *a, const void *b)
+{
+    eid_t x = *(const eid_t *)a, y = *(const eid_t *)b;
+    return (x < y) ? -1 : (x > y) ? 1 : 0;
+}
+
+int esidx_refresh_dirs(esidx_t *db, unsigned flags, update_stats_t *st)
 {
     memset(st, 0, sizeof(*st));
     if (!db || !db->built) { LOGE("update: the index has not been finalized"); return -1; }
-    if (db->root_eid == EID_NONE) { LOGE("update: the index has no root"); return -1; }
+    if (!db->dirty_n) return 0;
 
-    /* The root argument is matched against the indexed root rather than trusted,
-     * because a reconcile against a different tree would delete every row it did
-     * not find -- a typo must not be able to empty the index. */
-    eid_t rid = db->root_eid;
-    if (root && *root) {
-        rid = di_lookup(db, root);
-        if (rid == EID_NONE) {
-            char have[4096];
-            path_of(db, db->root_eid, have, sizeof(have));
-            LOGE("update: %s is not this index (it was built from %s)", root, have);
-            return -1;
-        }
-    }
+    /* Sort and unique: a watcher may mark one directory once per event in it, and a
+     * directory listed twice would be reconciled twice -- correct, since the second pass
+     * claims everything the first one added, but the walk is the cost this exists to
+     * avoid. Not ancestor-collapsed; the reason is on the struct field. */
+    qsort(db->dirty, db->dirty_n, sizeof(eid_t), cmp_eid);
+    uint32_t w = 0;
+    for (uint32_t i = 0; i < db->dirty_n; i++)
+        if (i == 0 || db->dirty[i] != db->dirty[i - 1]) db->dirty[w++] = db->dirty[i];
+    uint32_t ndirty = w;
+    db->dirty_n = 0;          /* the set is consumed whether or not each entry was applied */
 
-    char rbuf[4096];
-    path_of(db, rid, rbuf, sizeof(rbuf));
-    int fd = open_dir(AT_FDCWD, rbuf);
-    if (fd < 0) {
-        LOGE("update: cannot open %s: %s", rbuf, strerror(errno));
-        return -1;
-    }
-
+    /* The walk's buffers and claim tables are per *depth*, so one upd_t serves every
+     * directory in the batch and grows to the deepest one reached. */
     upd_t u;
     memset(&u, 0, sizeof(u));
     u.db = db;
@@ -650,9 +663,41 @@ int esidx_update(esidx_t *db, const char *root, unsigned flags, update_stats_t *
     u.st = st;
 
     uint64_t t0 = ts_us();
-    LOGI("update: %s %s", u.deep ? "deep refresh of" : "name refresh of", rbuf);
-    reconcile_dir(&u, fd, rid, 1);
-    close(fd);
+    char rbuf[4096];
+    uint32_t applied = 0;
+    for (uint32_t i = 0; i < ndirty; i++) {
+        eid_t dir = db->dirty[i];
+        /* An earlier apply in this batch can have tombstoned this one -- a delete marks
+         * the parent, and the parent's reconcile removes the subtree. List its children
+         * and there is nothing to list them under (ref B4). */
+        if (dir >= db->et.count || (db->et.flags[dir] & EF_DEAD)) {
+            LOGD("update: skipping eid %u, gone since it was marked", dir);
+            continue;
+        }
+        uint16_t depth = (uint16_t)(db->et.depth[dir] + 1);
+        if (depth > SCAN_MAX_DEPTH) {
+            LOGW("update: eid %u is at depth %u, past the walk's cap; not refreshed",
+                 dir, db->et.depth[dir]);
+            continue;
+        }
+        path_of(db, dir, rbuf, sizeof(rbuf));
+        int fd = open_dir(AT_FDCWD, rbuf);
+        if (fd < 0) {
+            /* The directory is in the index and vanished before we could open it. Its
+             * removal belongs to the parent's pass, so this is not an error to fail
+             * on -- unless the parent was not marked, in which case the next full pass
+             * is what notices. Counted with the other entries that could not be read. */
+            LOGD("update: cannot open %s: %s", rbuf, strerror(errno));
+            st->stat_fail++;
+            continue;
+        }
+        if (!applied)
+            LOGI("update: %s %s%s", u.deep ? "deep refresh of" : "name refresh of", rbuf,
+                 ndirty > 1 ? " (and others marked)" : "");
+        reconcile_dir(&u, fd, dir, depth);
+        close(fd);
+        applied++;
+    }
     for (uint32_t d = 0; d <= SCAN_MAX_DEPTH; d++) free(u.pool[d]);
     ctab_free(&u);
     st->us = ts_us() - t0;
@@ -706,6 +751,33 @@ int esidx_update(esidx_t *db, const char *root, unsigned flags, update_stats_t *
          st->entries_seen, st->added, st->removed, st->refreshed,
          st->compacted ? ", compacted" : "", (double)st->us / 1000.0);
     return 0;
+}
+
+/* The whole-index pass: mark the root and apply. It is not a different reconcile from a
+ * partial one -- the root's reconcile descends into every subdirectory whose stamp moved,
+ * which is what "full" has always meant here, and whatever a watcher missed is exactly what
+ * the next one of these is for. */
+int esidx_update(esidx_t *db, const char *root, unsigned flags, update_stats_t *st)
+{
+    memset(st, 0, sizeof(*st));
+    if (!db || !db->built) { LOGE("update: the index has not been finalized"); return -1; }
+    if (db->root_eid == EID_NONE) { LOGE("update: the index has no root"); return -1; }
+
+    /* The root argument is matched against the indexed root rather than trusted,
+     * because a reconcile against a different tree would delete every row it did
+     * not find -- a typo must not be able to empty the index. */
+    eid_t rid = db->root_eid;
+    if (root && *root) {
+        rid = di_lookup(db, root);
+        if (rid == EID_NONE) {
+            char have[4096];
+            path_of(db, db->root_eid, have, sizeof(have));
+            LOGE("update: %s is not this index (it was built from %s)", root, have);
+            return -1;
+        }
+    }
+    if (esidx_mark_dirty(db, rid) != 0) return -1;
+    return esidx_refresh_dirs(db, flags, st);
 }
 
 int esidx_compact(esidx_t *db)

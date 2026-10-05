@@ -31,7 +31,8 @@ static void usage(void)
     fprintf(stderr,
         "usage:\n"
         "  esidx [-v N] build <root> -o <dbfile> [--no-index[=LIST]]\n"
-        "  esidx [-v N] update <dbfile> [root] [--deep] [--no-index[=LIST]]\n"
+        "  esidx [-v N] update <dbfile> [root] [--deep] [--dir PATH]...\n"
+        "                             [--no-index[=LIST]]\n"
         "  esidx [-v N] query <dbfile> [expr ...] [--no-index[=LIST]]\n"
         "  esidx [-v N] serve <dbfile> [-p port] [--bind addr]\n"
         "                             [-u user [-w pass]] [--no-download] [--once]\n"
@@ -42,7 +43,9 @@ static void usage(void)
         "update: bring an index back in line with the filesystem. Without --deep\n"
         "        it stats one directory per subtree and notices name changes;\n"
         "        with --deep it stats every entry and notices size/mtime changes.\n"
-        "        <root> defaults to the one the index was built from.\n"
+        "        <root> defaults to the one the index was built from, and --dir\n"
+        "        PATH refreshes only that directory (repeatable) -- the same\n"
+        "        reconcile with a smaller set of directories to list.\n"
         "\n"
         "serve --refresh=SECS runs that same names pass inside the server, every SECS\n"
         "        seconds and once at startup, so a long-running process keeps its own\n"
@@ -176,14 +179,28 @@ static int cmd_build(int argc, char **argv)
  * can drive a refresh between two queries without a socket in the way. The two differ
  * in exactly one respect, and deliberately: a pass here compacts (it is about to exit,
  * and a small snapshot is what it leaves behind) where the server refuses to
- * (EU_NOCOMPACT, etp.c) because it cannot stop answering clients for a rescan. */
+ * (EU_NOCOMPACT, etp.c) because it cannot stop answering clients for a rescan.
+ *
+ * `--dir PATH` refreshes only that directory (repeatable), which is the dirty set of
+ * design §7 spelled on a command line: the caller knows what changed, and the reconcile
+ * is the same one a full pass runs -- only the set of directories to list is smaller. */
 static int cmd_update(int argc, char **argv)
 {
     const char *dbfile = NULL, *root = NULL;
+    const char *dirs[128];
+    int ndirs = 0;
     unsigned flags = 0;
     for (int i = 0; i < argc; i++) {
         const char *a = argv[i];
         if (!strcmp(a, "--deep")) { flags |= EU_DEEP; continue; }
+        if (!strcmp(a, "--dir") && i + 1 < argc) {
+            if (ndirs == (int)(sizeof(dirs) / sizeof(dirs[0]))) {
+                fprintf(stderr, "update: too many --dir arguments (max %d)\n", ndirs);
+                return 1;
+            }
+            dirs[ndirs++] = argv[++i];
+            continue;
+        }
         if (a[0] == '-') { fprintf(stderr, "update: unknown option %s\n", a); return 1; }
         if (!dbfile) { dbfile = a; continue; }
         if (!root)   { root = a; continue; }
@@ -191,7 +208,13 @@ static int cmd_update(int argc, char **argv)
         return 1;
     }
     if (!dbfile) {
-        fprintf(stderr, "usage: esidx update <dbfile> [root] [--deep]\n");
+        fprintf(stderr, "usage: esidx update <dbfile> [root] [--deep] [--dir PATH]...\n");
+        return 1;
+    }
+    if (ndirs && root) {
+        /* Both name a set of directories and they mean different things; refusing is
+         * cheaper than deciding which one wins. */
+        fprintf(stderr, "update: give either a root or --dir, not both\n");
         return 1;
     }
 
@@ -208,8 +231,28 @@ static int cmd_update(int argc, char **argv)
     }
     uint32_t before = esidx_live_count(&db);
 
+    /* The dirty set, resolved against the index rather than trusted: a path that is not
+     * one of its directories is refused by name, because a reconcile against the wrong
+     * directory would delete every row it did not find -- the same reason the root
+     * argument is checked rather than believed. */
+    for (int i = 0; i < ndirs; i++) {
+        eid_t e = di_lookup(&db, dirs[i]);
+        if (e == EID_NONE) {
+            fprintf(stderr, "update: %s is not a directory in this index\n", dirs[i]);
+            esidx_free(&db);
+            return 1;
+        }
+        if (esidx_mark_dirty(&db, e) != 0) {
+            fprintf(stderr, "update: %s is not a directory\n", dirs[i]);
+            esidx_free(&db);
+            return 1;
+        }
+    }
+
     update_stats_t st;
-    if (esidx_update(&db, root, flags, &st) != 0) {
+    int rc = ndirs ? esidx_refresh_dirs(&db, flags, &st)
+                   : esidx_update(&db, root, flags, &st);
+    if (rc != 0) {
         esidx_free(&db);
         return 1;
     }

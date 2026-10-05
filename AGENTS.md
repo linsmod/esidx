@@ -511,6 +511,21 @@ Do not re-litigate these; they were measured and the conclusions are recorded:
 - **`path_of()` is O(depth) and does not allocate** (§12 risk 7, corrected). It was
   the *sort* that allocated per row; there is no path-sort cache left, because there
   was never a second call to cache.
+- **A dirty set is a shape change, not a constant-factor win, and the measurement says so.**
+  "Which directories need a full listing" now has one answer for a full pass and an
+  event-driven one: `esidx_mark_dirty()` appends to a transient set and
+  `esidx_refresh_dirs()` reconciles exactly it, with `esidx_update()` being the case where
+  the set holds the root — so a partial refresh cannot drift from a full one because they
+  are the same code. Measured on `r7000`, and the numbers refuse to oversell it: a full pass
+  is already **0.1 ms on `/usr` and 0.2 ms on `/work`** when idle, so refreshing one
+  directory can be *more* work than refreshing the whole tree (6.8 ms for `--dir
+  /usr/share/doc`, which owns 3 200 subdirectories). What the set buys is the case the
+  stamps cannot cover — a file edited in place moves nothing its parent's mtime can see
+  (§12 risk 8) — and there it is 3.1 ms to tombstone 2000 ids against a `/usr` worst case
+  of 110 ms over 7 776 directories. Two rules learned the hard way: the set is **not**
+  ancestor-collapsed (the parent's reconcile only descends on a moved stamp, which is
+  exactly the change that cannot be relied on), and a directory marked and then tombstoned
+  by an earlier apply in the same batch is skipped (ref B4).
 - **A periodic pass is affordable; a periodic pass that *adds* is not, and the difference
   is not proportional to the change.** `esidx serve --refresh=SECS` runs the names pass in
   the serving process (design §7 "In place"), so freshness is a knob rather than a restart.

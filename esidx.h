@@ -548,6 +548,21 @@ typedef struct {
                               * `esidx options`; a static string, never NULL after
                               * esidx_index_apply() */
     eid_t         root_eid; /* the scanned root; parent:"" and root: anchor here */
+    /* Directories marked for the next reconcile (design §7's dirty set), in the order they
+     * were marked. Transient state, like the overlays: never persisted, because it is a
+     * function of what happened to the *filesystem* and not of the columns (D4), and reset
+     * by a load or a compaction. Its whole point is that "which directories need a full
+     * listing" has one answer for a full pass and for an event-driven one --
+     * esidx_update() marks the root and a watcher will mark the directories its events
+     * named, and both go through the same apply.
+     *
+     * Deliberately *not* ancestor-collapsed. Marking a parent and a child looks redundant,
+     * since the parent's reconcile descends into a child whose stamp moved -- but it only
+     * descends when the *stamp* moved, and the whole reason a caller marks a directory by
+     * hand is a change the stamp cannot see (a file edited in place). Collapsing would
+     * drop exactly the marks that are doing the work. */
+    eid_t        *dirty;
+    uint32_t      dirty_n, dirty_cap;
     scan_stats_t  scan;
 } esidx_t;
 
@@ -600,6 +615,26 @@ int  esidx_scan(esidx_t *db, const char *root);
  * reclaimed on the next cron pass rather than never. */
 #define EU_NOCOMPACT 0x2u
 int  esidx_update(esidx_t *db, const char *root, unsigned flags, update_stats_t *st);
+/* Mark one indexed directory as needing a reconcile. Returns 0, or -1 if the id is not a
+ * live directory. Appends, and does not de-duplicate: a mark is cheap because a watcher may
+ * make thousands between two applies, and the apply sorts and uniques once.
+ *
+ * The type check is not reachable from today's callers -- `di_lookup()` resolves a path
+ * through the directory hash, which only holds directories, so `update --dir` refuses a
+ * file before it gets here -- and it is kept anyway because the next caller is a watcher
+ * that maps a kernel handle to an id, which is exactly the step that could hand over a
+ * file. No test covers it: there is nothing to test until that caller exists. */
+int  esidx_mark_dirty(esidx_t *db, eid_t dir);
+/* Reconcile exactly the marked directories and clear the set: for each, list it, claim its
+ * stored children by name, add/remove/touch what the listing disagrees with, and descend
+ * into any subdirectory whose stamp moved -- so a create inside a subdirectory is still
+ * found without having been marked itself. A directory whose row has been tombstoned by an
+ * earlier apply in the same batch is skipped (ref B4: events under a deleted directory).
+ *
+ * `esidx_update()` is the case where the set holds the root, and there is no second
+ * reconcile underneath this one: a partial refresh cannot drift from a full pass because
+ * they are the same code. */
+int  esidx_refresh_dirs(esidx_t *db, unsigned flags, update_stats_t *st);
 /* Rebuild from scratch to reclaim tombstoned ids. Automatic once they dominate,
  * because a reconcile that rewrites a hot directory costs one id per child. */
 int  esidx_compact(esidx_t *db);

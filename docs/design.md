@@ -692,6 +692,51 @@ separate knob from the refresh interval because a snapshot write is the whole fi
 and has nothing to do with how stale the index may be. §10 has the three costs
 separated, and they differ by three orders of magnitude.
 
+**The dirty set.** "Which directories need a full listing" is a question, and
+until now the only answer was "the root, and from there whatever a stamp says".
+`esidx_mark_dirty()` appends a directory to a transient set in the index;
+`esidx_refresh_dirs()` reconciles exactly that set and clears it; and
+`esidx_update()` is the case where the set holds the root. There is no second
+reconcile underneath, which is the property that matters: a partial refresh cannot
+drift from a full one because they are the same code, and the test that pins it is a
+byte comparison of the two snapshots (test.sh, "a dirty set of directories").
+
+What it is for is not milliseconds and the measurement says so plainly. On an idle
+tree the full pass is already the cheapest thing there is — 0.1 ms on `/usr`, 0.2 ms
+on `/work` — because 16 of `/usr`'s 17 directories are skipped on their stamp, so
+*refreshing one directory can be more work than refreshing the whole tree* (6.8 ms for
+`--dir /usr/share/doc`, which has 3 200 subdirectories of its own, against 0.1 ms for
+the full pass). The set earns its keep in the case the stamps cannot cover, which is
+design §12 risk 8: a file edited in place moves nothing its parent's mtime can see,
+so the only way to reach it is to have been told. Measured, `r7000`:
+
+| | full pass | `--dir` one directory |
+|---|---|---|
+| `/work`, idle (5.5 M entries, 630 k dirs) | 0.2 ms — 49 dirs | 0.9 ms — 4 dirs |
+| `/work`, add 2000 rows in one directory | 355 ms | 363 ms |
+| `/work`, remove them again | — | **3.1 ms** — 2000 ids tombstoned |
+| `/usr`, refresh one directory | 0.1 ms idle / **110 ms worst case** (§10) | 0.1-21 ms, by that directory's own size |
+
+The two rows worth reading twice are the third and the last: a removal is the case a
+full pass cannot do cheaply and a dirty set does (3.1 ms), and the `/usr` worst case
+is the number an interval has to stay under — every writable directory touched, 7 776
+directories, 110 ms — against a few ms for the one that changed. The add rows are
+equal on both routes because both pay the same one-time name-intern rebuild, which is
+§10's largest remaining item and not something the dirty set can help with.
+
+Two rules the set is built by, both learned the hard way and both about *not* being
+clever: it is **not** ancestor-collapsed, because the parent's reconcile only descends
+into a child whose *stamp* moved and the whole reason to mark a directory by hand is a
+change the stamp cannot see; and a directory marked and then tombstoned by an earlier
+apply in the same batch is skipped rather than listed (ref B4).
+
+`esidx update <db> --dir PATH` is the set on a command line, and the path is resolved
+against the index and refused by name otherwise — a reconcile against the wrong
+directory would delete every row it did not find, which is why the root argument has
+always been checked rather than believed. A directory created since the last pass has
+no row to mark, so a create names its *parent*, which is also what a watcher's create
+event gives you.
+
 Two things make a refresh visible to a client that asks the same question twice.
 The index epoch: a mutation bumps it, and `cache_matches()` compares it, so a
 cached result set cannot outlive the index it was computed from. And a new row
@@ -932,6 +977,12 @@ the whole argument for the two overlays, in one table:
 | | before the overlays | children overlay (P3a) | both overlays (P3b) |
 |---|---|---|---|
 | adding ~2000 rows, `/work` | **2.38 s** = 414 ms walk + 1469 ms name rank + 497 ms children array | **1.85 s** = 440 ms walk + 1413 ms name rank | **0.40 s** = 389 ms one-time name-intern rebuild + 12 ms of actual work |
+| removing 2000 rows again | 5-9 ms | 5-9 ms | 5-9 ms |
+
+The last row is in the table because it is the shape of the thing: **removal was never
+the expensive direction, and it stays that way through every one of these builds** — a
+removal needs neither rebuild, since no name changed and the CSR swap-removes in place.
+What the overlays bought is the other direction.
 
 - **Both O(n) rebuilds are now amortised rather than removed**, and the three builds say
   what each was worth: the children array 497 ms per pass, the name rank 1413 ms per pass.

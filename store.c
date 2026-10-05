@@ -2223,6 +2223,7 @@ void esidx_free(esidx_t *db)
     free(db->et.size); free(db->et.mtime); free(db->et.ctime); free(db->et.stamp);
     free(db->et.ext_id); free(db->et.name); free(db->et.nchild);
     free(db->di.citems); free(db->di.cstart); free(db->di.ccount);
+    free(db->dirty); db->dirty = NULL; db->dirty_n = db->dirty_cap = 0;
     ov_clear(&db->di);
     free(db->di.ord_slot);
     free(db->di.ord_eid);

@@ -142,6 +142,8 @@ inside a `mktemp` directory, leaving the source tree clean.
 #   updated /etc.idx: 1622 live entries (was 1622, +0), 91 dirs (90 skipped,
 #   1 descended), 0 added, 0 removed, 90 refreshed in 0.3 ms
 ./esidx update /etc.idx --deep     # also re-stat every entry (size, mtime, ctime)
+./esidx update /etc.idx --dir /etc/ssl # refresh only that directory, repeatable
+#   updated /etc.idx: ... --dir resolves against the index and refuses anything else
 
 # serve ETP -- what the ETP client speaks
 ./esidx serve /etc.idx -p 2121
@@ -170,6 +172,14 @@ new files; both are now drained on a threshold, and the same measurement is
 **0.40 s**, of which 389 ms is the name-intern table's one-time rebuild on the first
 add after a load. `--save=SECS` writes the snapshot on a timer and on a clean exit,
 and skips the write entirely when nothing changed.
+
+`update --dir PATH` refreshes only that directory (repeatable), which is the
+**dirty set** of [design §7](docs/design.md) spelled on a command line: the same
+reconcile, with a smaller set of directories to list. It is not a millisecond win on
+an idle tree — a full pass is already 0.1-0.2 ms because it skips unchanged
+subtrees, and naming one directory can cost *more* — it is the mechanism a
+filesystem watcher will feed instead of pulling from the root, and the case it
+actually serves is a change no stamp can see (§12 risk 8).
 
 ### Supported query language
 
