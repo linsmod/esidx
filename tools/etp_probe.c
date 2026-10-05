@@ -61,6 +61,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAX_LINE   65536
@@ -419,6 +420,19 @@ int main(int argc, char **argv)
             }
         } else if (!strcmp(line, "data")) {
             drain_data();
+        } else if (!strcmp(line, "sleep")) {
+            /* Wait, on one connection, between two commands. The only reason this
+             * exists: the result cache lives on the connection, so the only way to
+             * observe that a server which updates its own index does not serve a stale
+             * cached set is a session where the disk changes *between* two QUERYs. A
+             * real client would be doing something else while it waited, and waiting is
+             * part of what it does. Milliseconds, and clamped, because a suite that
+             * hangs here would rather fail than stop. */
+            long ms = strtol(arg, NULL, 10);
+            if (ms < 0) ms = 0;
+            if (ms > 60000) ms = 60000;
+            struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
+            nanosleep(&ts, NULL);
         } else if (!strcmp(line, "close")) {
             break;
         } else {

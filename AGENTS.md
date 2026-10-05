@@ -397,6 +397,7 @@ Record that in the commit message. Examples from this codebase:
 | `sort:attributes:` and `sort:inverse_size:` on the CLI silently sorted by **name** | `main.c` carried its own list of sort keys beside the 22-name table the ETP path uses, and the two drifted. The ETP wire was always right, so `test_etp.sh` could not see it; and a name sort and an attribute sort return the same *rows*, so a row count could not either. What found it was a measurement that made no sense — a numeric key 2.4x faster than the same key with an integer compare. The CLI now goes through `sort_from_etp_name()` and **refuses** an unknown key |
 | `sort -f` is not a case-insensitive byte order, and neither is `tr A-Z a-z \| sort` | GNU sort folds for *equality* but orders by the original bytes; under `LC_ALL=C` it compares bytes **signed** while `strcasecmp` compares unsigned, so any byte >= 0x80 lands in the other half of the order. Both agree with `strcasecmp` on a lower-case fixture, so an assertion written against them passes for the wrong reason — which is how a `sort -f` oracle survived a commit. The oracle is `tools/order_ref.c`, which *is* `strcasecmp` |
 | a name sort ordered two names that differ only in case by their raw bytes, not by id | the ranked path never copies the display name into the arena — that is what the rank is for — so `dn` stayed a pointer to the **unfolded** name and `cmp_folded` `memcmp`-ed the bytes as stored, which is not `strcasecmp`. Every order fixture had distinct names, so the tie-break was unreachable, and the no-rank fallback (which *does* fold `dn`) silently disagreed with the ordinary path about the same rows. A bug in one level of a multi-level sort is invisible until a fixture reaches that level — and `order-ref -c` cannot express it either, since it sorts the file it is given, so the case assertion compares against `find(1)`'s order (the id order) with `cmp` |
+| a new row was invisible to `size:`/`dm:`/`dc:`, the result cache never compared `db->epoch`, and a skipped sorted array could be merged into existence | all three are on the path `esidx update` takes and on no other: it exits, so the next process rebuilds the sorted arrays from the columns (`esidx_add` never pushed them), the epoch could not move under a live connection (serve never called `esidx_update`), and the delta it left behind died with it. 337 + 217 green assertions, and two of the three were *promised in a header* — `esidx.h:485` and design §6.4. The reachability test needs a process that appends and answers in the same breath, so it needed `serve --refresh` to exist first: one connection, two identical QUERYs, the disk changed in between, and no `cache hit` in the log |
 
 ### 3.5 A test that cannot fail is worse than no test
 
@@ -510,6 +511,40 @@ Do not re-litigate these; they were measured and the conclusions are recorded:
 - **`path_of()` is O(depth) and does not allocate** (§12 risk 7, corrected). It was
   the *sort* that allocated per row; there is no path-sort cache left, because there
   was never a second call to cache.
+- **A periodic pass is affordable; a periodic pass that *adds* is not, and the difference
+  is not proportional to the change.** `esidx serve --refresh=SECS` runs the names pass in
+  the serving process (design §7 "In place"), so freshness is a knob rather than a restart.
+  Measured with `./refresh.sh` on `r7000` (real ext4 NVMe, `hpet`, so these are syscall
+  times): an **idle** pass is **0.9 ms over 5 476 485 entries** — the walk stops at the
+  first unchanged directory stamp, so it is proportional to the *root's* fanout, not to the
+  tree — and a snapshot write is **538 ms** for a 313 MB file, which is why `--save` is a
+  separate coarse knob and is skipped entirely when the epoch has not moved. A pass that
+  adds 2000 rows costs **2.26 s**, of which **96 % is the two O(n) rebuilds** (1362 ms name
+  rank over 5.48 M rows, 487 ms children array over 630 473 ranges) and none of it scales
+  with the 2000. Removing is the cheap direction: 2001 tombstoned ids cost 1.0 ms, because
+  a removal needs neither structure. So an add-heavy tree needs an interval longer than
+  that pass until the overlay exists, and this measurement is the argument for it.
+- **A promise in a header is not an implementation, and the process that runs daily can be
+  why the gap stays invisible.** Three defects survived 337 index assertions and 217
+  protocol ones because the only caller of the mutation path was `esidx update`, which
+  exits: a new row never reached the numeric sorted arrays (`esidx_add` has nothing to link
+  *from*, and the next process rebuilt them from the columns), the result cache compared no
+  `db->epoch` although `esidx.h` and design §6.4 both said it did, and a `--no-index=size`
+  process could merge a two-row delta into a deliberately unbuilt array and then read it as
+  built. All three are reachable only from a process that appends and answers questions in
+  the same breath, which is what `serve --refresh` is. Two rules: a test that exercises a
+  layer through a caller that exits is testing the *caller*; and a documented invariant that
+  no line reads is a comment, not a check.
+- **A fixed threshold chosen for a batch tool can be wrong in a server, and the reason is
+  latency rather than memory.** `esidx_compact()` at 25 % tombstones is right for a process
+  about to exit and wrong for one that must answer: it is a full rescan plus a `finalize`
+  (97 s on `/work`), and it replaces the whole `esidx_t`, so every cached result set becomes
+  a set of unrelated ids. `EU_NOCOMPACT` is how a caller says "not now"; the offline
+  `update` still compacts, so the id space is reclaimed on the next cron pass, not never.
+- **`--refresh` does not fix attribute staleness and must not be documented as if it
+  does.** It runs the *names* pass, because a deep pass inside the serve loop would stat
+  every entry on the tree while clients wait. `size:`/`dm:` on a file edited in place are
+  still only as fresh as the last `esidx update --deep` (§12 risk 8, unchanged).
 - **A derived index that is not built must answer slower, never differently**, and the
   reason it is worth stating is that two halves disagreed: `est_leaf()` already refused
   to seed from an empty sorted array while `range_on()` went ahead and emptied the
@@ -670,6 +705,7 @@ here first.
 | protocol options | `etp.h` |
 | how to check the server against a real client | §1.4 |
 | where a number quoted against the reference comes from | `./cmp_ref.sh` — it re-measures all of them in one run |
+| what a refresh costs, and what it is allowed to cost | `./refresh.sh <root> [--add N]` — idle pass, adding pass, snapshot write |
 | what is left | `docs/design.md` §10 — it carries the current measurements |
 
 ## 8. Before committing

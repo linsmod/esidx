@@ -695,11 +695,21 @@ int esidx_update(esidx_t *db, const char *root, unsigned flags, update_stats_t *
     /* Tombstones are not reclaimed in place (design §11 D8), so a tree that is
      * rewritten often enough would otherwise grow the id space without bound. At
      * a quarter of the table the memory and the per-query bitmap walk have grown
-     * enough to matter, and a rebuild is the cheaper way back. */
+     * enough to matter, and a rebuild is the cheaper way back.
+     *
+     * A caller that passes EU_NOCOMPACT gets the threshold reported and nothing done
+     * about it -- the serve path, which cannot afford the stall (esidx.h). */
     uint32_t live = bs_count(&db->live);
     if (db->et.count >= 1024 && (uint64_t)(db->et.count - live) * 4 > db->et.count) {
-        LOGI("update: %u of %u ids are tombstones -- compacting", db->et.count - live, db->et.count);
-        if (esidx_compact(db) == 0) st->compacted = 1;
+        if (flags & EU_NOCOMPACT) {
+            LOGI("update: %u of %u ids are tombstones -- past the compaction threshold, "
+                 "left to the offline update (EU_NOCOMPACT)",
+                 db->et.count - live, db->et.count);
+        } else {
+            LOGI("update: %u of %u ids are tombstones -- compacting",
+                 db->et.count - live, db->et.count);
+            if (esidx_compact(db) == 0) st->compacted = 1;
+        }
     }
 
     LOGI("update: %u dirs (%u skipped, %u descended), %u entries seen, "

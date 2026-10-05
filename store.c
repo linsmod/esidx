@@ -533,6 +533,29 @@ static void bump_epoch(esidx_t *db)
     db->last_change_us = ts_us();
 }
 
+/* D3's delta for one of the three numeric arrays, and only for an array that exists.
+ *
+ * A skipped array has no main array to correct, so it must get no delta either --
+ * because `update_merge()` merges on `dn * 100 > n`, which is true the moment n is 0,
+ * and `sidx_merge()` would then build a main array out of the handful of rows a
+ * reconcile happened to touch. `range_on()` reads "built" as `s->n != 0`
+ * (query.c:1017), so the result would be a deliberately unbuilt index turned into a
+ * *partially* built one: `size:` would answer from those few rows and drop every other
+ * row in the tree. That is the failure design §4.3 records for a missing index --
+ * slower, never different -- arriving through the one path that was supposed to be
+ * harmless.
+ *
+ * One function, because there are five call sites (three in esidx_touch, one in
+ * esidx_add, one in kill_one) and a second opinion about whether an array exists is
+ * exactly how the two halves of a skip disagreed before (design §5.3.1). */
+static void num_delta(esidx_t *db, sidx_t *s, uint32_t skip_bit,
+                      int64_t v, eid_t id, bool del)
+{
+    if (db->skip & skip_bit) return;
+    if (del) sidx_erase(s, v, id);
+    else      sidx_update(s, v, id);
+}
+
 /* Make a freshly appended id visible to everything derived from the columns.
  * finalize builds these from scratch for a batch build; a reconcile appends into
  * an index that already has them, and this is the one place that knows the
@@ -601,6 +624,21 @@ eid_t esidx_add(esidx_t *db, eid_t parent, const entry_in_t *in)
 
     if (db->built) {
         if (link_new(db, id) != 0) { LOGE("cannot index new entry %s", in->name); return EID_NONE; }
+        /* The three numeric arrays too, which link_new does not do because there is
+         * nothing to link *from*: a brand-new id is past the end of the main array, and
+         * the delta is how it gets there -- sidx_merge() reads an id >= s->n as a new
+         * row (store.c:1276), and sidx_range_to_bitset() walks the delta in append
+         * order (store.c:1371), so the value is queryable the moment it is pushed, with
+         * no merge.
+         *
+         * Without this a *new* row was invisible to size:/dm:/dc: until the process
+         * exited and a load rebuilt the arrays from the columns -- which is exactly
+         * what `esidx update` does, every time, so all 337 index assertions passed
+         * while the path was broken. It takes a process that both appends and answers
+         * questions to see it, which is what `esidx serve --refresh` (design §7) is. */
+        num_delta(db, &db->by_size,  ESIDX_IX_SIZE,  et->size[id],  id, false);
+        num_delta(db, &db->by_mtime, ESIDX_IX_MTIME, et->mtime[id], id, false);
+        num_delta(db, &db->by_ctime, ESIDX_IX_CTIME, et->ctime[id], id, false);
         bump_epoch(db);
     }
     return id;
@@ -618,17 +656,17 @@ int esidx_touch(esidx_t *db, eid_t id, const entry_in_t *in)
     bool changed = false;
     if (et->size[id] != in->size) {
         et->size[id] = in->size;
-        sidx_update(&db->by_size, in->size, id);
+        num_delta(db, &db->by_size, ESIDX_IX_SIZE, in->size, id, false);
         changed = true;
     }
     if (et->mtime[id] != in->mtime) {
         et->mtime[id] = in->mtime;
-        sidx_update(&db->by_mtime, in->mtime, id);
+        num_delta(db, &db->by_mtime, ESIDX_IX_MTIME, in->mtime, id, false);
         changed = true;
     }
     if (et->ctime[id] != in->ctime) {
         et->ctime[id] = in->ctime;
-        sidx_update(&db->by_ctime, in->ctime, id);
+        num_delta(db, &db->by_ctime, ESIDX_IX_CTIME, in->ctime, id, false);
         changed = true;
     }
     /* The stamp is not a queried column -- it is what the *next* reconcile
@@ -647,9 +685,9 @@ static void kill_one(esidx_t *db, eid_t id)
 
     /* Retract the value each sorted array still holds for this id, then publish
      * the new one (EID_NONE) so a range query covering either value drops it. */
-    sidx_erase(&db->by_size, et->size[id], id);
-    sidx_erase(&db->by_mtime, et->mtime[id], id);
-    sidx_erase(&db->by_ctime, et->ctime[id], id);
+    num_delta(db, &db->by_size,  ESIDX_IX_SIZE,  et->size[id],  id, true);
+    num_delta(db, &db->by_mtime, ESIDX_IX_MTIME, et->mtime[id], id, true);
+    num_delta(db, &db->by_ctime, ESIDX_IX_CTIME, et->ctime[id], id, true);
 
     uint16_t e = et->ext_id[id];
     if (e) ext_index_del(&db->ext, e, id);

@@ -23,7 +23,8 @@ behaviour carry over.
 
 Under active development. The index engine, the query language and the ETP server
 are all built and tested; **a client can connect and search today.** An index can
-also be brought back in line with the filesystem without a rebuild, so it no longer
+also be brought back in line with the filesystem without a rebuild, and a server
+can do it to itself while it answers (`esidx serve --refresh=5`), so it no longer
 goes stale while a server runs. What is still missing is *immediacy*: freshness
 comes from a periodic pass rather than from filesystem events.
 
@@ -31,7 +32,7 @@ comes from a periodic pass rather than from filesystem events.
 |---|---|---|
 | P0 | columnar store, directory tree, L0/L1 capability, sort, paging | done |
 | P1 | FTP + `SITE EVERYTHING`, 32 subcommands, result cache | done |
-| P2 | incremental collection: directory-mtime skip, fanotify | reconcile + mutation core done (`esidx update`, 0.1 ms idle on `/usr`); fanotify not started |
+| P2 | incremental collection: directory-mtime skip, fanotify | reconcile + mutation core done (`esidx update`, 0.1 ms idle on `/usr`), and the serving process can now reconcile in place (`serve --refresh`); fanotify not started |
 | P3 | full query-language parser: 40+ functions, 12 comparisons, modifiers, constants, macros | done |
 | P4 | name/path trigram index, prefix/suffix search, CRoaring, query optimiser | name trigram index done (`trigram.c`, byte trigrams over the display name); driver selection done; path half, name-sorted/reversed arrays and CRoaring not started |
 | P5 | content inverted index, sparse media metadata, `dupe:` | not started |
@@ -67,7 +68,7 @@ Suites and harnesses, all runnable from a clean checkout:
 make check             # the gate: both suites x both builds, ~30 s
 
 ./test.sh              # index and query correctness   (337 assertions)
-./test_etp.sh          # protocol acceptance           (217 assertions)
+./test_etp.sh          # protocol acceptance           (229 assertions)
 make test-all          # both, in that order, optimised build only
 ESIDX_BUILD=dbg ./test.sh        # the sanitiser build
 
@@ -75,6 +76,8 @@ ESIDX_BUILD=dbg ./test.sh        # the sanitiser build
 ./round.sh /usr        # ...on a bigger one
 
 ./cmp_ref.sh           # re-measure every value quoted against the :21 server
+./refresh.sh /usr      # what a refresh costs: idle pass, adding pass, snapshot write
+./refresh.sh /work --add 2000
 ./ledger.sh /work      # the memory ledger + phase timings + the query shapes
 ./tri-skip.sh /usr     # what each derived index costs to skip, and what it buys
 ./sortcmp.sh -n 3 base=/path/to/old/esidx mine=./esidx -t /usr
@@ -143,6 +146,10 @@ inside a `mktemp` directory, leaving the source tree clean.
 # serve ETP -- what the ETP client speaks
 ./esidx serve /etc.idx -p 2121
 #   esidx serving 1622 entries from /etc.idx on 127.0.0.1:2121 (loaded in 0.3 ms)
+
+# ...and keep that index current while serving it
+./esidx serve /etc.idx -p 2121 --refresh=5 --save=300
+#   esidx: reconciling in place every 5 s, snapshot written every 300 s
 ```
 
 `update` is the same walk in two modes. Without `--deep` it stats one directory
@@ -151,6 +158,15 @@ per changed subtree and notices name changes; on an unchanged `/usr` that is
 file whose *content* changed — that moves the file's own mtime and nothing its
 parent can see — and costs 4.2 s on `/usr`. Both are safe to run repeatedly: a
 pass that finds nothing writes nothing to any index.
+
+`serve --refresh=SECS` is that same names pass, run by the serving process: once
+before the listener, then every SECS. The interval is a policy choice about
+staleness; what it costs is in [design §10](docs/design.md) and `./refresh.sh`
+measures it. An idle pass is 0.9 ms even over 5.5 M entries, because the walk
+stops at the first unchanged directory stamp — but a pass that *adds* rows pays
+two O(n) rebuilds (2.26 s on `/work`) because the name rank and the children array
+cannot be appended to in place. `--save=SECS` writes the snapshot on a timer and on
+a clean exit, and skips the write entirely when nothing changed.
 
 ### Supported query language
 
@@ -418,10 +434,20 @@ Staying current costs this, measured on the same tree:
 |---|---|---|---|
 | `update` | **0.1 ms** | 110 ms | one stat per directory whose parent changed |
 | `update --deep` | 4.23 s | 4.23 s | one stat per entry |
+| `serve --refresh=SECS`, idle | **0.2-0.9 ms** (`/work`: 5.5 M entries, 48 dirs skipped) | one getdents of the root's own listing | proportional to the root's fanout, not to the tree |
+| `serve --refresh=SECS`, adding 2000 rows | — | **2.26 s** on `/work` (408 ms walk + 1362 ms name rank + 487 ms children array) | two O(n) rebuilds, and neither is proportional to the 2000 |
+| `serve --save=SECS` | nothing written when nothing changed | 538 ms for a 313 MB snapshot | the whole file; no derived structure is persisted |
 
 A pass that finds nothing writes nothing to any index and does not move the index
 epoch, so it is invisible to a connected client — the query costs above are the
-query costs after a refresh.
+query costs after a refresh. A pass that *does* change something moves the epoch,
+and the result cache compares it, so a client that asks the same question twice
+across a change is re-answered rather than served the previous id set.
+
+`--refresh` runs the **names** pass, not the deep one: a deep pass inside the serve
+loop would stat every entry on the tree while clients wait. So attributes
+(`size:`, `dm:`, `dc:` on a file that was edited in place) are still only as fresh
+as the last `update --deep` — design §12 risk 8, unchanged.
 
 
 ## Documentation
@@ -473,6 +499,7 @@ test.sh        index and language suite
 test_etp.sh    protocol acceptance suite
 round.sh       one full round, with timings
 cmp_ref.sh     re-measures every number quoted against the reference server
+refresh.sh     what a refresh costs: idle pass, adding pass, snapshot write (design §10)
 ledger.sh      the memory ledger, the snapshot size and the query shapes
 tri-skip.sh    what each derived index costs to skip, and what it buys (design §5.3.1)
 sortcmp.sh     per-sort-key cost for several builds at once (design §10)

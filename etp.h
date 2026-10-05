@@ -31,6 +31,17 @@ typedef struct {
     const char *password;
     int         allow_download;  /* RETR / disk access */
     int         once;            /* serve one connection then exit (tests) */
+    /* >0: reconcile the index in place every N seconds, so the process is
+     * self-updating (design §7). One pass runs before the listener is up, because a
+     * client that connects first must not be answered from a stale index. 0 = the
+     * historical read-only server. */
+    int         refresh_secs;
+    /* >0: write the snapshot every N seconds, and once on a clean exit if anything
+     * changed since the last write. Separate from refresh_secs on purpose: a snapshot
+     * write is the whole file (design §4.1 -- D4 keeps no derived structure in it), so
+     * it blocks the serve loop for as long as it takes to write, and how often that is
+     * worth doing is a policy question about I/O, not about staleness. */
+    int         save_secs;
     /* Which derived indexes to leave unbuilt, already resolved by main.c: serve owns
      * its own esidx_t, so the flag cannot be re-read here without a second place that
      * decides. `no_index` is only read when `have_no_index` is set. */

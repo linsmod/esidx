@@ -67,9 +67,12 @@ esac
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/esidx-etp.XXXXXX")
 SRV_PID=""
 SRV_PID2=""
+SRV_PID3=""
+SRV_PID4=""
 cleanup() {
-    [ -n "$SRV_PID" ]  && kill "$SRV_PID"  2>/dev/null
-    [ -n "$SRV_PID2" ] && kill "$SRV_PID2" 2>/dev/null
+    for p in "$SRV_PID" "$SRV_PID2" "$SRV_PID3" "$SRV_PID4"; do
+        [ -n "$p" ] && kill "$p" 2>/dev/null
+    done
     rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -143,13 +146,18 @@ fi
 
 # ------------------------------------------------------------------ server
 
-# start_server <tag> [extra args...] -> sets SRV_PORT_<tag>, SRV_PID_<tag>
+# start_server <tag> [extra args...] -> sets SRV_PORT_<tag>, SRV_ERR_<tag>
+#
+# SRV_DB overrides the snapshot to serve, so a test can point a server at its own
+# fixture: the counts asserted above are literals a reader can check by hand, and a
+# test that invalidated them by mutating their tree would be worse than no test
+# (design §3.2 -- the deep fixture belongs to find(1) cross-checking, not here).
 start_server() {
     local tag="$1"; shift
     local out="$TMP/srv-$tag.out" err="$TMP/srv-$tag.err"
     # -v 3 so INFO lines (cache hits, query timings) are visible: the suite
     # asserts on some of them, and a silent log would make that vacuous
-    "$BIN" -v 3 serve "$DB" -p 0 --bind 127.0.0.1 "$@" >"$out" 2>"$err" &
+    "$BIN" -v 3 serve "${SRV_DB:-$DB}" -p 0 --bind 127.0.0.1 "$@" >"$out" 2>"$err" &
     local pid=$!
     local port=""
     for _ in $(seq 1 100); do
@@ -161,8 +169,10 @@ start_server() {
         echo "server '$tag' did not report a port"; sed 's/^/   /' "$err"; exit 1
     fi
     case "$tag" in
-        main) SRV_PID=$pid;  SRV_PORT=$port;  SRV_ERR=$err ;;
-        auth) SRV_PID2=$pid; SRV_PORT2=$port; SRV2_ERR=$err ;;
+        main)     SRV_PID=$pid;  SRV_PORT=$port;  SRV_ERR=$err ;;
+        auth)     SRV_PID2=$pid; SRV_PORT2=$port; SRV2_ERR=$err ;;
+        refresha) SRV_PID3=$pid; SRV_PORTA=$port; SRVA_ERR=$err ;;
+        refreshb) SRV_PID4=$pid; SRV_PORTB=$port; SRVB_ERR=$err ;;
         *) echo "unknown server tag '$tag'"; exit 1 ;;
     esac
     echo "   server '$tag': pid $pid on 127.0.0.1:$port"
@@ -205,16 +215,17 @@ OUT="$TMP/out"
 
 # Read values out of the probe output. When a script read more than one query
 # block, only the LAST one is considered -- that is what lets a single connection
-# run two QUERYs and have each be asserted on separately.
-lastblock() { awk '/^BLOCK-BEGIN/ { buf = "" } { buf = buf $0 "\n" } END { printf "%s", buf }' "$OUT"; }
-pcount()   { lastblock | sed -nE 's/^BLOCK-END [0-9]+ count=([0-9]+).*$/\1/p'; }
-prows()    { lastblock | sed -nE 's/^BLOCK-END [0-9]+ count=[0-9]+ rows=([0-9]+).*$/\1/p'; }
+# run two QUERYs and have each be asserted on separately. Each takes the file to
+# read, so two sessions driven at once (section 11b) do not overwrite each other.
+lastblock() { awk '/^BLOCK-BEGIN/ { buf = "" } { buf = buf $0 "\n" } END { printf "%s", buf }' "${1:-$OUT}"; }
+pcount()   { lastblock "${1:-$OUT}" | sed -nE 's/^BLOCK-END [0-9]+ count=([0-9]+).*$/\1/p'; }
+prows()    { lastblock "${1:-$OUT}" | sed -nE 's/^BLOCK-END [0-9]+ count=[0-9]+ rows=([0-9]+).*$/\1/p'; }
 # the nth row's field:  pfield <n> <key>
 pfield()   { lastblock | sed -nE "s/^ROW $1 [A-Z]+ [^ ]* .*$2=([^ ]*).*\$/\1/p" | head -1; }
 # every row's name, in order
-pnames()   { lastblock | sed -nE 's/^ROW [0-9]+ [A-Z]+ ([^ ]*).*$/\1/p' | tr '\n' ' '; }
+pnames()   { lastblock "${1:-$OUT}" | sed -nE 's/^ROW [0-9]+ [A-Z]+ ([^ ]*).*$/\1/p' | tr '\n' ' '; }
 # the wire lines, so a raw-format assertion can be made without the probe
-pwire(){ grep -E '^REPLY ' "$OUT" | sed 's/^REPLY //'; }
+pwire(){ grep -E '^REPLY ' "${1:-$OUT}" | sed 's/^REPLY //'; }
 
 # ------------------------------------------------------------------- 1: login
 
@@ -846,6 +857,158 @@ send USER anonymous
 send FROBNICATE
 EOF
 expect "  500 Unknown command." "$(pwire | tail -1)" "500 Unknown command."
+
+say "11b. a server that reconciles its own index while it is answering (design §7)"
+
+# Two servers, two index configurations, because one process has one configuration and
+# the two defects need opposite ones:
+#
+#   A, everything built. A newly indexed row has to reach the three numeric sorted
+#      arrays, or `size:` cannot see a file the server indexed a moment ago. esidx_add()
+#      did not push them: it has nothing to link *from*, and every test passed anyway
+#      because `esidx update` exits and the next process rebuilds the arrays from the
+#      columns. The path only exists in a process that appends and answers questions.
+#
+#   B, --no-index=size. The delta must NOT reach a skipped array. update_merge() merges
+#      on `dn * 100 > n`, true the moment n is 0, so a retraction would become a main
+#      array of one row -- and range_on() reads "built" as `s->n != 0`, turning a
+#      deliberately unbuilt index into a partially built one that answers `size:` from
+#      the rows it happens to hold. keep.txt is the tell: it is never touched, so a
+#      correct answer includes it and a merged delta cannot.
+#
+# The session is one connection with two identical QUERYs and the rename in between.
+# That is the only shape in which a stale cache is visible: the cache lives on the
+# connection (design §6.4), so the disk has to change under a session that already has
+# a result set, which no two-connection test can do. Before `serve --refresh` existed,
+# serve never called esidx_update(), so no answer could go stale -- and cache_matches()
+# compared no epoch at all, while esidx.h:485 and design §6.4 both said the cache was
+# invalidated by one. Both probes run at once: the refresh is on a wall clock, so run
+# sequentially the second server's first QUERY would land after its own first tick and
+# the "before" assertion would be measuring something else.
+
+REFRESH_SECS=2
+RT_A="$TMP/refa"
+RT_B="$TMP/refb"
+mkdir -p "$RT_A" "$RT_B"
+printf 'x%.0s' $(seq 1 100) >"$RT_A/before.txt"
+printf 'x%.0s' $(seq 1 100) >"$RT_B/keep.txt"
+printf 'x%.0s' $(seq 1 100) >"$RT_B/before.txt"
+RDB_A="$TMP/refa.idx"
+RDB_B="$TMP/refb.idx"
+"$BIN" build "$RT_A" -o "$RDB_A" 2>/dev/null || { echo "cannot build $RDB_A"; exit 1; }
+"$BIN" build "$RT_B" -o "$RDB_B" 2>/dev/null || { echo "cannot build $RDB_B"; exit 1; }
+
+# A flag that cannot mean anything is refused rather than ignored: --refresh=soon parsed
+# as 0 would be a server that silently never reconciles, which is indistinguishable from
+# a server with nothing to do.
+"$BIN" serve "$RDB_A" --refresh=soon >/dev/null 2>"$TMP/bad-refresh.err"
+if [ $? -ne 0 ] && grep -q 'needs a number of seconds' "$TMP/bad-refresh.err"; then
+    ok "  --refresh=soon is refused rather than read as 0"
+else
+    bad "  --refresh=soon is refused rather than read as 0" "$(cat "$TMP/bad-refresh.err")"
+fi
+"$BIN" serve "$RDB_A" --save=5 >/dev/null 2>"$TMP/bad-save.err"
+if [ $? -ne 0 ] && grep -q 'needs --refresh' "$TMP/bad-save.err"; then
+    ok "  --save without --refresh is refused"
+else
+    bad "  --save without --refresh is refused" "$(cat "$TMP/bad-save.err")"
+fi
+
+SRV_DB="$RDB_A" start_server refresha "--refresh=$REFRESH_SECS"
+SRV_DB="$RDB_B" start_server refreshb "--refresh=$REFRESH_SECS" --no-index=size
+SRV_DB=
+
+# Both startup repair passes have now run and found nothing -- the file is created after
+# them, so the first QUERY below is provably answered from an index that does not have
+# it. Asserting that is what keeps the second half of the test from passing vacuously
+# if a tick ever lands early.
+mv "$RT_A/before.txt" "$RT_A/after.txt"
+mv "$RT_B/before.txt" "$RT_B/after.txt"
+
+OUT_A="$TMP/out-a"
+OUT_B="$TMP/out-b"
+
+# etp_bg <name> <port> <outfile>: the same session as `etp`, in the background. Its own
+# script file, because two probes sharing one would interleave their directives.
+etp_bg() {
+    local name="$1" port="$2" out="$3"
+    local script="$TMP/script-$port"
+    cat >"$script"
+    timeout 30 "$PROBE" "$port" "$script" >"$out" 2>"$TMP/probe-$port.err"
+    echo $? >"$TMP/rc-$port"
+}
+
+etp_bg A "$SRV_PORTA" "$OUT_A" <<EOF &
+send USER anonymous
+send EVERYTHING SORT name_ascending
+send EVERYTHING COUNT 50
+send EVERYTHING SEARCH parent:"$RT_A" !folder: size:100
+sendraw EVERYTHING QUERY
+query
+sleep $((REFRESH_SECS * 1000 + 1000))
+sendraw EVERYTHING QUERY
+query
+EOF
+PIDA=$!
+
+etp_bg B "$SRV_PORTB" "$OUT_B" <<EOF &
+send USER anonymous
+send EVERYTHING SORT name_ascending
+send EVERYTHING COUNT 50
+send EVERYTHING SEARCH parent:"$RT_B" !folder: size:100
+sendraw EVERYTHING QUERY
+query
+sleep $((REFRESH_SECS * 1000 + 1000))
+sendraw EVERYTHING QUERY
+query
+EOF
+PIDB=$!
+
+wait "$PIDA" "$PIDB"
+
+for p in "$SRV_PORTA" "$SRV_PORTB"; do
+    if [ "$(cat "$TMP/rc-$p")" = "0" ]; then
+        ok "  a client spanning a refresh on :$p saw no unparseable reply"
+    else
+        bad "  a client spanning a refresh on :$p saw no unparseable reply" \
+            "$(grep -hm3 'PROTOCOL-ERROR' "$OUT_A" "$OUT_B" 2>/dev/null)$(cat "$TMP/probe-$p.err")"
+    fi
+done
+
+# brow <probe-output>: the row names of the FIRST query block; pnames/lastblock give the
+# last one. The "before" half of a session has to be read separately from the "after"
+# half, and a buffer that resets at every BLOCK-BEGIN keeps only the last block -- which is
+# what lastblock is for, and what made this an empty string the first time.
+brow()       { awk '/^BLOCK-BEGIN/ { n++ } n == 1 && /^ROW/ { print }' "$1" \
+                 | sed -nE 's/^ROW [0-9]+ [A-Z]+ ([^ ]*).*$/\1/p' | tr '\n' ' '; }
+
+# --- A: the new name, and the new row's size, are both visible on the same connection.
+# The first QUERY is asserted stale on purpose. If a tick ever beat it, the section would
+# be testing nothing -- so it fails loudly instead of passing vacuously.
+expect "  A, before the tick: only the old name" "$(brow "$OUT_A")" "before.txt "
+expect "  A, after the tick: the new name, found by its size" "$(pnames "$OUT_A")" "after.txt "
+expect "  A, after the tick: still exactly one row" "$(pcount "$OUT_A")" "1"
+
+# --- B: the skipped array stayed unbuilt, so the column fallback answered
+expect "  B, before the tick: both 100-byte files, the old name still indexed" \
+    "$(brow "$OUT_B")" "before.txt keep.txt "
+expect "  B, after the tick: both 100-byte files, the skipped index never became built" \
+    "$(pnames "$OUT_B")" "after.txt keep.txt "
+
+# --- the mechanism, not just the answer: the repeat must not have been a cache hit
+if grep -q 'cache hit' "$SRVA_ERR"; then
+    bad "  the index epoch invalidated the result cache" \
+        "$(grep -m2 'cache hit' "$SRVA_ERR")"
+else
+    ok "  the index epoch invalidated the result cache (design §6.4, esidx.h:485)"
+fi
+expect "  the startup repair pass ran once, before the listener" \
+    "$(grep -c 'startup repair pass' "$SRVA_ERR")" "1"
+if grep -q 'sorted index size SKIPPED' "$SRVB_ERR"; then
+    ok "  B really did run without the size index (so the guard was under test)"
+else
+    bad "  B really did run without the size index" "no SKIPPED line in the log"
+fi
 
 say "12. nothing in the exchange was unparseable"
 

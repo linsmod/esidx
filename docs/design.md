@@ -680,6 +680,27 @@ are skipped [B4], a directory create triggers a recursive scan [B5], and events 
 drained in batches [B7]. Not started: until it exists, the periodic pass is the
 mechanism, and it is measurable (§10).
 
+**In place.** `esidx serve --refresh=SECS` runs the names pass inside the serving
+process, once before the listener and then every SECS, so a long-running server
+keeps its own index current instead of serving the snapshot it loaded. The serve
+loop is single-threaded, which is what makes it safe rather than lucky — the pass
+runs between two `poll()` turns, so no client is half-way through a command while
+the index moves — and what bounds what a pass may cost: a pass that stalls the loop
+stalls every client. So the serving pass refuses compaction (`EU_NOCOMPACT`,
+`esidx_compact()` is a full rescan plus a `finalize`), and `--save=SECS` is a
+separate knob from the refresh interval because a snapshot write is the whole file
+and has nothing to do with how stale the index may be. §10 has the three costs
+separated, and they differ by three orders of magnitude.
+
+Two things make a refresh visible to a client that asks the same question twice.
+The index epoch: a mutation bumps it, and `cache_matches()` compares it, so a
+cached result set cannot outlive the index it was computed from. And a new row
+reaches the three numeric sorted arrays, which it did not while the only caller was
+`esidx update` — a process that exits, so the next one rebuilt the arrays from the
+columns and hid the gap. Both were promises in a header (`esidx.h`, §6.4) with no
+line of code behind them, reachable only once a process could append and answer
+questions in the same breath.
+
 **Mutation.** A removed entry keeps its row and its id and gains `EF_DEAD`; a
 `live` bitset is the single authority on what exists, and every query seeds its
 candidate set from it. Numeric changes go to the D3 delta with the old value
@@ -828,7 +849,7 @@ Each row: source → what was taken → how it lands here → why it changed.
 | 6.3 | execution: candidates → bitmaps → matchers → sort → slice | `query.c` | **done**, including the second-stage FILTER_* pass. The text matcher implements Everything's rule for *what a term reads* — the filename, or the path once the value carries a separator or says `path:` — verified shape by shape against voidtools' server; §12.10 has the table and the two shapes still open. An `ext:` term's id list is sized by the term, not by a fixed 256 (§6.3, and the reason is in the code): a longer list used to be cut with no complaint |
 | 6.4 | result cache | `etp.c` | **done** — the full sorted set is kept and re-sliced, and invalidated by the index epoch |
 | 7 | full scan | `scan.c` | done; concurrency (D6) not started |
-| 7 | incremental | `scan.c` | **done** for the two reconcile passes and the mutation core; `esidx update <db> [--deep]`. fanotify/inotify not started |
+| 7 | incremental | `scan.c` | **done** for the two reconcile passes and the mutation core; `esidx update <db> [--deep]`, and `esidx serve --refresh=SECS` runs the names pass in the serving process (one at startup, then on a timer; §7 "In place"). fanotify/inotify not started |
 | 1-3 | FTP + `SITE EVERYTHING` | `etp.c` | **done** — all 32 subcommands, 22 sort names, the data channel for other FTP clients |
 
 **Two things in §6.2 deliberately not built**, with the reasoning recorded
@@ -893,6 +914,46 @@ Four things these numbers settle:
   from the final delete: the row is matched by name and refreshed in place. Ids
   are only spent on names that genuinely appear or disappear, which is what makes
   the D8 compaction threshold a safety net rather than routine work.
+
+**The same passes, in the serving process** (`./refresh.sh <root> --add 2000`,
+`r7000` — real ext4 NVMe, `hpet` clocksource, so these are syscall times and not
+vDSO ones). A refresh interval has to be shorter than the pass it is waiting for, so
+these are the numbers that decide it, and they do not scale the way the table above
+suggests: the walk is pulled from the root and stops at the first unchanged stamp.
+
+| Tree | Entries | Startup repair | Idle pass | Pass that adds 2000 rows | Snapshot write |
+|---|---|---|---|---|---|
+| `/usr` | 372 084 | 0.2 ms | **0.2-0.5 ms** — 16 dirs, all skipped but the root | not run (no writable tree on this host) | *nothing written*: the epoch never moved |
+| `/work` | 5 476 485 | 0.6 ms | **0.4-0.9 ms** — 48 dirs skipped, the root's 74 entries listed | **2.26 s** = 408 ms walk + **1362 ms name rank** + **487 ms children array** | 538 ms for a 313 MB file |
+
+- **An idle refresh is free at any interval, on any tree here.** 0.9 ms over 5.5 M
+  entries, because 48 of the 49 directories were skipped on their stamp and the one
+  that was walked is the root's own listing. It is proportional to the *root's
+  fanout*, not to the tree — which is the cheapest possible answer and the reason the
+  repair pass can run unconditionally at startup.
+- **A refresh that *adds* rows is not, and that is the interval that matters.** 2000
+  new names cost 2.26 s, of which 96 % is the two O(n) rebuilds the §5.1 bargain
+  mandates — 1362 ms of name rank over 5.48 M rows, 487 ms of children array over
+  5.48 M ids in 630 473 ranges — and none of it is proportional to the 2000. On an
+  add-heavy tree a serving refresh therefore needs an interval longer than that, or
+  the process does nothing else but rebuild. This is the cost of the two structures
+  that cannot be appended to, measured rather than assumed, and it is the whole
+  argument for the overlay.
+- **Removing is cheap and adding is expensive**, which is the asymmetry to design
+  around: the pass that tombstoned 2001 ids cost 1.0 ms, because a removal needs
+  neither the rank nor the children array — both are maintained in place on the way
+  out (`di_remove_child` swaps the last child into the hole).
+- **The delta a new row now writes costs a range query nothing measurable at this
+  size.** `size:>1mb` over `/work` evaluated in 1.36 ms with an empty delta and
+  0.74 ms with 2000 added rows in each of the three arrays — and the difference is
+  noise, the sort on the same two runs being 13.5 ms and 5.4 ms.
+  `sidx_range_to_bitset()` walks the delta in append order, so the cost is linear in
+  it, and D3's 1 % rule bounds the delta at 54 762 rows per array on this tree. That
+  bound is *not* measured, and it is the number to watch if the interval gets short.
+- **A snapshot write is 538 ms here**, which is why `--save` is a separate knob from
+  the refresh interval and not "every refresh": on this tree that is half a second in
+  which the loop answers nobody. It is also skipped entirely when the epoch has not
+  moved, so an idle server writes nothing at all.
 
 `/usr` scan stats: 8 590 directories, 108 298 files, max depth 13, 567 distinct
 extensions. Finalize now also builds the ctime sorted array, the ext bitmaps and
@@ -1652,7 +1713,14 @@ answer anyway.
    deep one. That is the whole reason the deep pass exists and the reason its
    interval is a policy choice rather than a performance one. fanotify is the
    real answer; until it lands, the honest statement is that the index is at most
-   one deep-pass interval behind on attributes.
+   one deep-pass interval behind on attributes. This is unchanged by
+   `esidx serve --refresh=SECS` and worth being explicit about, because that flag
+   looks like it changes the answer: it does not. It runs the *names* pass, and
+   deliberately so — a deep pass stats every entry on the tree, which is 4.23 s on
+   `/usr` and a minute on `/work`, inside a loop that must keep answering clients.
+   So with `--refresh`, the index is at most `SECS` behind on *names* and still one
+   deep-pass interval behind on attributes, and a serving deployment needs
+   `esidx update --deep` on its own schedule for those.
 9. **Two text-matching bugs, both pre-existing and both found while writing the
    incremental tests** — both fixed now, and both pinned against the reference
    rather than against our reading of the code:

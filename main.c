@@ -35,6 +35,7 @@ static void usage(void)
         "  esidx [-v N] query <dbfile> [expr ...] [--no-index[=LIST]]\n"
         "  esidx [-v N] serve <dbfile> [-p port] [--bind addr]\n"
         "                             [-u user [-w pass]] [--no-download] [--once]\n"
+        "                             [--refresh=SECS] [--save=SECS]\n"
         "                             [--no-index[=LIST]]\n"
         "  esidx options <dbfile> [--no-index[=LIST]]\n"
         "\n"
@@ -42,6 +43,13 @@ static void usage(void)
         "        it stats one directory per subtree and notices name changes;\n"
         "        with --deep it stats every entry and notices size/mtime changes.\n"
         "        <root> defaults to the one the index was built from.\n"
+        "\n"
+        "serve --refresh=SECS runs that same names pass inside the server, every SECS\n"
+        "        seconds and once at startup, so a long-running process keeps its own\n"
+        "        index current instead of serving a snapshot until it is restarted.\n"
+        "        It answers at most one deep pass interval behind on attributes, which\n"
+        "        is design 12 risk 8 stated for this configuration. --save=SECS writes\n"
+        "        the snapshot on a timer and on a clean exit, and needs --refresh.\n"
         "\n"
         "derived indexes (design D4: none of them are in the snapshot, so this is a\n"
         "choice about this process and the same file serves both settings):\n"
@@ -162,10 +170,13 @@ static int cmd_build(int argc, char **argv)
 
 /* ------------------------------------------------------------------- update */
 
-/* The offline half of the incremental path (design §7). `esidx serve --refresh`
- * runs the same walk in-process; this exists so an index built by cron and served
- * read-only can still be brought forward, and so the suites can drive a refresh
- * between two queries without a socket in the way. */
+/* The offline half of the incremental path (design §7). `esidx serve --refresh=SECS`
+ * runs the same walk in-process, between two poll() turns; this exists so an index
+ * built by cron and served read-only can still be brought forward, and so the suites
+ * can drive a refresh between two queries without a socket in the way. The two differ
+ * in exactly one respect, and deliberately: a pass here compacts (it is about to exit,
+ * and a small snapshot is what it leaves behind) where the server refuses to
+ * (EU_NOCOMPACT, etp.c) because it cannot stop answering clients for a rescan. */
 static int cmd_update(int argc, char **argv)
 {
     const char *dbfile = NULL, *root = NULL;
@@ -377,6 +388,23 @@ static int cmd_query(int argc, char **argv)
 
 /* ------------------------------------------------------------------- serve */
 
+/* Parse a `--flag=N` interval. Zero is a real answer (off), and a value that is not a
+ * number at all is an error rather than 0: `--refresh=soon` would otherwise be a server
+ * that silently never reconciles, which is indistinguishable from a server with nothing
+ * to do. */
+static int secs_arg(const char *a, const char *what)
+{
+    const char *v = strchr(a, '=') + 1;
+    char *end = NULL;
+    long n = strtol(v, &end, 10);
+    if (end == v || *end || n < 0 || n > 86400) {
+        fprintf(stderr, "serve: %s needs a number of seconds (0..86400), not '%s'\n",
+                what, v);
+        return -1;
+    }
+    return (int)n;
+}
+
 /* ETP server (design §1). Loads a snapshot once and answers the client's
  * `EVERYTHING` sequence over a control connection; see etp.c for the protocol
  * notes and the decisions taken from the reference implementation. */
@@ -397,6 +425,18 @@ static int cmd_serve(int argc, char **argv)
         if (!strcmp(a, "-w") && i + 1 < argc) { o.password = argv[++i]; continue; }
         if (!strcmp(a, "--no-download")) { o.allow_download = 0; continue; }
         if (!strcmp(a, "--once")) { o.once = 1; continue; }
+        if (!strncmp(a, "--refresh=", 10)) {
+            int v = secs_arg(a, "--refresh");
+            if (v < 0) return 1;
+            o.refresh_secs = v;
+            continue;
+        }
+        if (!strncmp(a, "--save=", 7)) {
+            int v = secs_arg(a, "--save");
+            if (v < 0) return 1;
+            o.save_secs = v;
+            continue;
+        }
         if (a[0] == '-') {
             fprintf(stderr, "serve: unknown option %s\n", a);
             return 1;
@@ -408,7 +448,15 @@ static int cmd_serve(int argc, char **argv)
     if (!dbfile) {
         fprintf(stderr,
                 "usage: esidx serve <snapshot> [-p port] [--bind addr]\n"
-                "                    [-u user [-w pass]] [--no-download] [--once]\n");
+                "                    [-u user [-w pass]] [--no-download] [--once]\n"
+                "                    [--refresh=SECS] [--save=SECS]\n");
+        return 1;
+    }
+    if (o.save_secs > 0 && o.refresh_secs == 0) {
+        /* Refused rather than ignored: with nothing to reconcile, the epoch never moves
+         * and every tick would find the snapshot already current. */
+        fprintf(stderr, "serve: --save=%d needs --refresh; there is nothing to save\n",
+                o.save_secs);
         return 1;
     }
     o.dbfile = dbfile;

@@ -482,10 +482,14 @@ typedef struct {
      * removed entry out of every matcher without each matcher having to know
      * that removals exist. */
     bitset_t      live;
-    /* Bumped by every mutation. The protocol layer's result cache compares it
-     * (design §6.4), so a refresh between two identical QUERYs cannot serve the
-     * previous id set -- which after a compaction would be a set of unrelated
-     * rows rather than a stale subset. */
+    /* Bumped by every mutation, and read in exactly one place: the protocol layer's
+     * `cache_matches()` (design §6.4), so a refresh between two identical QUERYs
+     * cannot serve the previous id set -- which after a compaction would be a set of
+     * unrelated rows rather than a stale subset. That comparison did not exist until
+     * `esidx serve --refresh` made it reachable: before it, serve never called
+     * esidx_update(), so nothing could go stale and nothing read this field outside
+     * store.c. It also decides whether a snapshot needs writing at all, since a pass
+     * that changed nothing must not rewrite the file (etp.c, serve_save). */
     uint64_t      epoch;
     /* When the last mutation happened, for D3's "merge once the delta has been
      * idle" rule. Monotonic microseconds; 0 means the index has never been
@@ -548,6 +552,14 @@ uint32_t esidx_live_count(const esidx_t *db);
 int  esidx_scan(esidx_t *db, const char *root);
 /* Bring a built index back in line with the filesystem (design §7). */
 #define EU_DEEP 0x1u   /* stat every entry, not just directories whose stamp moved */
+/* Do not compact, even past the tombstone threshold below. A batch caller wants the
+ * compact -- it is about to exit and a small snapshot is what it leaves behind. A
+ * server does not: esidx_compact() is a full rescan plus a finalize, so inside a
+ * single-threaded serve loop it is a multi-second stall in which no client is answered
+ * at all, and it replaces the whole esidx_t, so every cached result set is a set of
+ * unrelated ids. The offline `esidx update` still compacts, so the id space is
+ * reclaimed on the next cron pass rather than never. */
+#define EU_NOCOMPACT 0x2u
 int  esidx_update(esidx_t *db, const char *root, unsigned flags, update_stats_t *st);
 /* Rebuild from scratch to reclaim tombstoned ids. Automatic once they dominate,
  * because a reconcile that rewrites a hot directory costs one id per child. */

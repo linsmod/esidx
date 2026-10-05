@@ -33,8 +33,12 @@
  *     on the Everything host process.
  *
  * Structure: one poll() loop over the listener plus every client, single-threaded.
- * The index is immutable while serving, so there is nothing to lock; design D6's
- * concurrency is about the *scan*, not the query path.
+ * Single-threaded is what makes the in-place refresh safe rather than lucky: the
+ * reconcile runs between two poll() turns, so no client is ever half-way through a
+ * command while the index moves under it, and nothing needs a lock. It is also what
+ * bounds what a refresh may cost -- a pass that stalls the loop stalls every client --
+ * which is why it is a names pass with compaction refused (see serve_refresh).
+ * design D6's concurrency is about the *scan*, not the query path.
  */
 
 #include "etp.h"
@@ -179,6 +183,7 @@ typedef struct {
     uint16_t cache_sort_key;
     int      cache_sort_asc;
     uint32_t cache_offset, cache_count;
+    uint64_t cache_epoch;     /* db->epoch when the set was produced */
 
     /* data connection state */
     int  pasv_listen;           /* listening socket awaiting a data connection */
@@ -325,16 +330,28 @@ static void send_query_results(const esidx_t *db, client_t *c, const qset_t *set
 
 /* ------------------------------------------------------------- the QUERY op */
 
-/* Is the current parameter set the one the cache holds?
+/* Is the current parameter set the one the cache holds, and does it still describe the
+ * index?
  *
  * etp_server.c:4250-4271 compares every match option, every column toggle, both
  * search strings and the filter flags -- and deliberately NOT offset/count, which
  * is what makes paging free. Everything re-sorts when only the sort changed
  * (:4273-4286); we already hold the sorted set, so a sort change is a cache miss
- * and a re-run, which is the same amount of work and one less code path. */
-static bool cache_matches(const client_t *c)
+ * and a re-run, which is the same amount of work and one less code path.
+ *
+ * The epoch is ours and not the reference's, because the reference cannot refresh:
+ * its result set is a snapshot of a database it re-reads on every search. esidx.h and
+ * design §6.4 both promised this comparison and no line of code made it -- which was
+ * unreachable, because serve never called esidx_update(). A server that updates its
+ * own index turns it into the ordinary case: one connection, the same search, the disk
+ * changed in between, and the answer must be the new one. `bump_epoch()` fires on an
+ * appended id, on a column that actually moved and on a tombstone, so this misses only
+ * when a reconcile found nothing -- which is the case where the cached set is still
+ * correct and re-running it would be waste. */
+static bool cache_matches(const esidx_t *db, const client_t *c)
 {
     if (!c->cache_valid) return false;
+    if (c->cache_epoch != db->epoch) return false;
     if (c->cache_sort_key != c->sort_key || c->cache_sort_asc != c->sort_asc) return false;
     if (strcmp(c->cache_search, c->search)) return false;
     if (strcmp(c->cache_filter, c->filter_search)) return false;
@@ -358,10 +375,11 @@ static bool cache_matches(const client_t *c)
     return true;
 }
 
-static void cache_store(client_t *c)
+static void cache_store(const esidx_t *db, client_t *c)
 {
     /* `c->cache` already holds the new set; this records the parameters that
-     * produced it, so the next QUERY can be answered without re-running. */
+     * produced it -- and the index epoch it was produced from -- so the next QUERY
+     * can be answered without re-running. */
     snprintf(c->cache_search, sizeof(c->cache_search), "%s", c->search);
     snprintf(c->cache_filter, sizeof(c->cache_filter), "%s", c->filter_search);
     c->cache_filter_flags = c->mo.filter_flags;
@@ -370,6 +388,7 @@ static void cache_store(client_t *c)
     c->cache_sort_asc = c->sort_asc;
     c->cache_offset = c->offset;
     c->cache_count = c->count;
+    c->cache_epoch = db->epoch;
     c->cache_valid = true;
 }
 
@@ -377,7 +396,7 @@ static void do_query(const esidx_t *db, client_t *c)
 {
     uint64_t t0 = ts_us();
 
-    if (cache_matches(c)) {
+    if (cache_matches(db, c)) {
         LOGI("query: cache hit, '%s' re-sliced at offset %u of %u",
              c->search, c->offset, c->cache.n);
         send_query_results(db, c, &c->cache);
@@ -396,7 +415,7 @@ static void do_query(const esidx_t *db, client_t *c)
         qset_free(&c->cache);
         memset(&c->cache, 0, sizeof(c->cache));
         c->cache.ids = malloc(1);
-        cache_store(c);
+        cache_store(db, c);
         send_query_results(db, c, &c->cache);
         return;
     }
@@ -422,7 +441,7 @@ static void do_query(const esidx_t *db, client_t *c)
 
     qset_free(&c->cache);
     c->cache = set;
-    cache_store(c);
+    cache_store(db, c);
 
     send_query_results(db, c, &c->cache);
 
@@ -1258,6 +1277,46 @@ static void client_free(client_t *c)
     c->fd = -1;
 }
 
+/* ------------------------------------------------------- in-process refresh
+ *
+ * The offline half of design §7's incremental path, run by the process that answers
+ * questions rather than by one that exits. No root argument: esidx_update() matches what
+ * it is given against the indexed root and refuses anything else, so there is nothing to
+ * check here and nothing worth reconstructing a path for.
+ *
+ * EU_NOCOMPACT because this loop is single-threaded. esidx_compact() is a full rescan
+ * plus a finalize -- on /work that is the tens of seconds a full build of the same tree
+ * takes (design §10) -- and during it no client is answered at all, which is the one
+ * thing a server must never stop doing. It also replaces the whole esidx_t, so every
+ * cached result set becomes a set of unrelated ids; the epoch would invalidate those
+ * caches correctly, but there is nothing to invalidate them *for* if nobody is waiting.
+ *
+ * The names pass is the only one that runs. A deep pass stats every entry on the tree,
+ * which is 4.23 s on /usr, and a server cannot do that on a timer; §12 risk 8 still
+ * stands for size and mtime, and it is now stated there in these terms. */
+static void serve_refresh(esidx_t *db)
+{
+    update_stats_t st;
+    if (esidx_update(db, NULL, EU_NOCOMPACT, &st) != 0)
+        LOGW("refresh: reconcile failed; still serving the index as it was");
+}
+
+/* Write the snapshot, but only if something has changed since the last write.
+ *
+ * `since` is the epoch the file on disk corresponds to, so "nothing changed" needs no
+ * dirty flag of its own -- and a pass that found nothing then writes nothing, which is
+ * the same bargain esidx_update() makes about the derived indexes. A save is the whole
+ * file (D4 keeps no derived structure in it), which is why it is a separate knob from
+ * the refresh interval and not simply "every refresh". */
+static void serve_save(const esidx_t *db, const char *dbfile, uint64_t *since, const char *why)
+{
+    if (db->epoch == *since) return;
+    uint64_t t0 = ts_us();
+    if (esidx_save(db, dbfile) != 0) { LOGE("refresh: cannot write %s", dbfile); return; }
+    *since = db->epoch;
+    LOGI("refresh: wrote %s (%s) in %.1f ms", dbfile, why, (double)(ts_us() - t0) / 1000.0);
+}
+
 int etp_serve(const etp_opts_t *opts)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -1283,6 +1342,21 @@ int etp_serve(const etp_opts_t *opts)
         return -1;
     }
     double lms = (double)(ts_us() - t0) / 1000.0;
+
+    /* The epoch the snapshot on disk corresponds to. Read before the repair pass, so a
+     * repair that changed something is a change this process is responsible for saving
+     * rather than one it inherited. */
+    uint64_t saved_epoch = db.epoch;
+
+    /* One pass before the listener exists, not on the first tick: a client that
+     * connects in the first interval must be answered from an index that has already
+     * looked, and the pass is the same one the offline update runs, so "the server just
+     * started" and "the server is up to date" cannot be different claims. */
+    if (opts->refresh_secs > 0) {
+        uint64_t r0 = ts_us();
+        serve_refresh(&db);
+        LOGI("serve: startup repair pass in %.1f ms", (double)(ts_us() - r0) / 1000.0);
+    }
 
     const char *bindaddr = (opts->bind_addr && *opts->bind_addr) ? opts->bind_addr
                                                                  : "127.0.0.1";
@@ -1332,14 +1406,47 @@ int etp_serve(const etp_opts_t *opts)
     fprintf(stderr, "%s auth, downloads %s\n",
             (opts->username && *opts->username) ? "password" : "anonymous",
             opts->allow_download ? "allowed" : "refused");
+    if (opts->refresh_secs > 0) {
+        if (opts->save_secs > 0)
+            fprintf(stderr, "esidx: reconciling in place every %d s, "
+                            "snapshot written every %d s\n",
+                    opts->refresh_secs, opts->save_secs);
+        else
+            fprintf(stderr, "esidx: reconciling in place every %d s, "
+                            "snapshot only on a clean exit\n",
+                    opts->refresh_secs);
+    }
     fflush(stderr);
 
     client_t clients[MAX_CLIENTS];
     memset(clients, 0, sizeof(clients));
     for (size_t i = 0; i < MAX_CLIENTS; i++) clients[i].fd = -1;
 
+    const uint64_t refresh_us = opts->refresh_secs > 0
+                              ? (uint64_t)opts->refresh_secs * 1000000ULL : 0;
+    const uint64_t save_us = opts->save_secs > 0
+                          ? (uint64_t)opts->save_secs * 1000000ULL : 0;
+    uint64_t next_refresh = ts_us() + refresh_us;
+    uint64_t next_save    = ts_us() + save_us;
+
     uint64_t served = 0;
     while (!g_stop) {
+        /* Deadlines are checked here, at the top, rather than after poll(): poll
+         * returning 0 is the *normal* outcome of this loop -- it is how the loop wakes
+         * up to do timed work at all -- and the old `if (r == 0) continue;` had no way
+         * to tell "nothing happened" from "the timer fired". Measured against the
+         * interval rather than counted, so a pass that overruns its own slot delays the
+         * next one instead of queueing a burst of them. */
+        uint64_t now = ts_us();
+        if (refresh_us && now >= next_refresh) {
+            serve_refresh(&db);
+            next_refresh = ts_us() + refresh_us;
+        }
+        if (save_us && ts_us() >= next_save) {
+            serve_save(&db, opts->dbfile, &saved_epoch, "timer");
+            next_save = ts_us() + save_us;
+        }
+
         struct pollfd pfd[MAX_CLIENTS + 1];
         int nfd = 0;
         pfd[nfd].fd = s;
@@ -1353,7 +1460,21 @@ int etp_serve(const etp_opts_t *opts)
             map[nfd - 1] = (int)i;
             nfd++;
         }
-        int r = poll(pfd, (nfds_t)nfd, 1000);
+        /* Wake for whichever comes first: a client, or the next deadline. Without the
+         * second term the timer resolution is the 1000 ms poll timeout, which happens to
+         * be finer than any interval worth configuring -- but it would be an accident,
+         * and an interval above 1000 ms would silently be quantised down to it. */
+        int tmo = 1000;
+        now = ts_us();
+        if (refresh_us && next_refresh > now) {
+            int64_t ms = (int64_t)((next_refresh - now) / 1000);
+            if (ms < tmo) tmo = (int)ms;
+        }
+        if (save_us && next_save > now) {
+            int64_t ms = (int64_t)((next_save - now) / 1000);
+            if (ms < tmo) tmo = (int)ms;
+        }
+        int r = poll(pfd, (nfds_t)nfd, tmo);
         if (r < 0) {
             if (errno == EINTR) continue;
             LOGE("poll: %s", strerror(errno));
@@ -1400,6 +1521,12 @@ done:
     for (size_t i = 0; i < MAX_CLIENTS; i++) client_free(&clients[i]);
     close(s);
     g_listen_fd = -1;
+    /* On a clean exit, write what this process changed -- a refresh that is only ever in
+     * memory is a day of work thrown away by a restart, and the next startup would pay
+     * for the repair pass this file would have made 0.1 ms. Not done when refresh is
+     * off: then the index is exactly what was loaded, and rewriting a 300 MB snapshot to
+     * say so is the wrong answer. */
+    if (refresh_us) serve_save(&db, opts->dbfile, &saved_epoch, "clean exit");
     esidx_free(&db);
     fprintf(stderr, "esidx: stopped after %llu client(s)\n",
             (unsigned long long)served);
