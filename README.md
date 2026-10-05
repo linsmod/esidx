@@ -66,7 +66,7 @@ Suites and harnesses, all runnable from a clean checkout:
 ```sh
 make check             # the gate: both suites x both builds, ~30 s
 
-./test.sh              # index and query correctness   (276 assertions)
+./test.sh              # index and query correctness   (301 assertions)
 ./test_etp.sh          # protocol acceptance           (217 assertions)
 make test-all          # both, in that order, optimised build only
 ESIDX_BUILD=dbg ./test.sh        # the sanitiser build
