@@ -720,6 +720,12 @@ int esidx_compact(esidx_t *db)
     LOGI("compact: rebuilding from %s", root);
     esidx_t fresh;
     esidx_init(&fresh);
+    /* The scratch index inherits the mask rather than re-resolving it: a compaction run
+     * by a process that was told not to build the trigram index must not quietly put
+     * 100 MiB of it back. The sidecar is beside the same dbfile and would resolve to the
+     * same answer, but inheriting cannot disagree with the process that is running. */
+    fresh.skip = db->skip;
+    fresh.skip_src = db->skip_src;
     if (esidx_scan(&fresh, root) != 0) { esidx_free(&fresh); return -1; }
     esidx_finalize(&fresh);
     /* Every id the caller may still be holding is now a different row, so the

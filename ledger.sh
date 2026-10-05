@@ -41,6 +41,11 @@ BUILD_LOG=$(mktemp "${TMPDIR:-/tmp}/esidx-ledger.XXXXXX")
 trap 'rm -f "$BUILD_LOG"' EXIT
 "$BIN" -v 3 build "$TREE" -o "$DB" >/dev/null 2>"$BUILD_LOG"
 
+# Which derived indexes were left out, and where that decision came from. It is printed
+# here rather than left in the log because every number below is only reproducible if the
+# configuration that produced it is in the same run (AGENTS.md 1.3) -- and the answer is
+# three sources deep, so "the obvious one" is a guess.
+grep -E 'indexes not built:' "$BUILD_LOG" | sed 's/^/  /' | head -1
 grep -E 'mem |peak rss|entries=|ext intern|indexed ' "$BUILD_LOG" | sed 's/^/  /'
 
 hr "2. snapshot"

@@ -31,6 +31,11 @@ typedef struct {
     const char *password;
     int         allow_download;  /* RETR / disk access */
     int         once;            /* serve one connection then exit (tests) */
+    /* Which derived indexes to leave unbuilt, already resolved by main.c: serve owns
+     * its own esidx_t, so the flag cannot be re-read here without a second place that
+     * decides. `no_index` is only read when `have_no_index` is set. */
+    int         have_no_index;
+    const char *no_index;        /* the list, possibly "" (= read the sidecar) */
 } etp_opts_t;
 
 /* Run until a signal or, with opts.once, until the first client disconnects.

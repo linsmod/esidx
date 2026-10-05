@@ -1550,48 +1550,74 @@ cat "$TMP/err" >>"$DIAG"
 # looks plausible" -- identical. A fixture where the two can differ is a fixture where
 # the check cannot fail.
 #
-# The env var goes on the *query*, not on the build, which is the property itself: the
-# snapshot was written by a process that built every index and knows nothing about which
-# ones this one wants.
+# Three ways to configure it, and all three have to reach the query: the environment (the
+# lowest, and what this section started as), the sidecar beside the snapshot, and the
+# flag. The flag is stripped from argv in main() rather than read by each subcommand,
+# because a flag the query loop can also see becomes part of the search string --
+# `--no-index=size size:>1k` answered zero rows with the index configured correctly and
+# the flag's own text ANDed in as a term matching no filename.
 say "a derived index that is not there"
 
 SKIP_DB="$TMP/skip.idx"
 build "$TREE" "$SKIP_DB" >/dev/null
 DB="$SKIP_DB"
 
-# qd <expr...> -- the same query with the arrays absent. Identical plumbing to q() on
-# purpose: an earlier version of this wrote to stdout and the results landed in the
-# suite's own output, which is a reminder that a helper which does not capture is a
-# helper whose comparison is against nothing.
-qd() { ESIDX_SKIP_INDEX="$DEGRADED" "$BIN" query "$SKIP_DB" "$@" >"$TMP/out" 2>>"$DIAG"
-       LAST=$(cat "$TMP/out"); }
-DEGRADED=size,mtime,ctime
+# The sidecar, written *before* the invariance loop below: a first version of this
+# section created it afterwards, so the three "sidecar" rows were a query with nothing
+# configured, comparing a result against itself and passing for the wrong reason -- which
+# is the whole failure mode of this section, committed inside it.
+cat >"$SKIP_DB.opts" <<'OPTS'
+# leave the numeric arrays out on this box: 12.8 MiB on /usr and a query shape nobody
+# here uses
+size
+mtime     # a trailing comment, and the space before it
+OPTS
+
+# qd <mode> <expr...> -- the same query under a different configuration. `$mode` is
+# empty (nothing skipped), "env:...", "--no-index=..." or "sidecar". Identical plumbing to
+# q() on purpose: an earlier version wrote to stdout and the results landed in the suite's
+# own output, which is a reminder that a helper which does not capture is a helper whose
+# comparison is against nothing.
+qd() {
+    local mode="$1"; shift
+    case "$mode" in
+        "")             "$BIN" query "$SKIP_DB" "$@" >"$TMP/out" 2>>"$DIAG" ;;
+        env:*)          env "ESIDX_SKIP_INDEX=${mode#env:}" \
+                        "$BIN" query "$SKIP_DB" "$@" >"$TMP/out" 2>>"$DIAG" ;;
+        sidecar)        "$BIN" query "$SKIP_DB" "$@" >"$TMP/out" 2>>"$DIAG" ;;
+        --no-index=*)   "$BIN" query "$SKIP_DB" "$mode" "$@" >"$TMP/out" 2>>"$DIAG" ;;
+    esac
+    LAST=$(cat "$TMP/out")
+}
 
 # The shapes are chosen so the missing array is the *only* thing that can decide them:
 # a bare range (so the driver would have been the array), a range ANDed with a column
 # leaf, and the two date forms. `dc:` is here because by_ctime is its only index and it
 # is the one Everything leaves off by default.
+DEGRADED=size,mtime,ctime
 for shape in "size:>1k" "size:1000..5000" "size:>1k ext:conf" "dm:today" "dm:>2000" "dc:>2000"; do
     # shellcheck disable=SC2086
     set -- $shape
     q "$@"
     full=$(n "$LAST"); full_paths=$(paths "$LAST")
-    qd "$@"
-    bare=$(n "$LAST"); bare_paths=$(paths "$LAST")
-    if [ "$full" = "$bare" ] && [ "$full_paths" = "$bare_paths" ]; then
-        ok "'$shape' answers the same $full row(s) with no sorted array"
-    else
-        bad "'$shape' answers the same with no sorted array" \
-            "with: $full rows [$full_paths]  without: $bare rows [$bare_paths]"
-    fi
+    for mode in "env:$DEGRADED" "--no-index=$DEGRADED" sidecar; do
+        qd "$mode" "$@"
+        bare=$(n "$LAST"); bare_paths=$(paths "$LAST")
+        if [ "$full" = "$bare" ] && [ "$full_paths" = "$bare_paths" ]; then
+            ok "'$shape' answers the same $full row(s) with no sorted array [$mode]"
+        else
+            bad "'$shape' answers the same with no sorted array [$mode]" \
+                "with: $full rows [$full_paths]  without: $bare rows [$bare_paths]"
+        fi
+    done
 done
 
 # ...and the degradation is *visible*. An answer that is right for the wrong reason is
 # the failure this whole section is about, so "it agreed" is not enough -- there has to
 # be a line saying the column was scanned instead, or a query that never reached
-# range_on() would pass the four above silently. DEBUG, not INFO: this is per query and
+# range_on() would pass the six above silently. DEBUG, not INFO: this is per query and
 # it says which leaf did it, which is the pair an INFO line cannot carry (AGENTS.md 2.3).
-ESIDX_SKIP_INDEX=size "$BIN" -v 4 query "$SKIP_DB" "size:>1k" >/dev/null 2>"$TMP/err"
+env ESIDX_SKIP_INDEX=size "$BIN" -v 4 query "$SKIP_DB" "size:>1k" >/dev/null 2>"$TMP/err"
 cat "$TMP/err" >>"$DIAG"
 if grep -q 'sorted index size SKIPPED' "$TMP/err"; then
     ok "the skipped index says so in the log rather than going missing"
@@ -1603,15 +1629,43 @@ if grep -q "text: size has no sorted array .*; scanning the column instead" "$TM
     ok "...and so does the leaf that had to scan instead"
 else
     bad "...and so does the leaf that had to scan instead" \
-        "$(grep -F 'no sorted array' "$TMP/err" || echo 'no degraded line: the range leaf never ran, so the four assertions above proved less than they look')"
+        "$(grep -F 'no sorted array' "$TMP/err" || echo 'no degraded line: the range leaf never ran, so the assertions above proved less than they look')"
 fi
 
-# The mask is a list of names. Two ways to get one you did not ask for, and both have to
-# be handled: a name that does not exist at all, and one that exists in a different
-# case. The first is reported, because a typo that silently built the index anyway is
-# how a memory option ends up believed to be off while it is on; the second is honoured,
-# because refusing it would be the same trap wearing the other hat -- the user asked for
-# less memory and got all of it, with a warning they could have read either way.
+# The sidecar reached the query, which is the only thing the three rows above do not
+# prove: with the comment lines and the blank line in it, a parser that treated them as
+# names would warn about "#" and leave.
+if env ESIDX_LOG=info "$BIN" -v 3 query "$SKIP_DB" "size:>1k" 2>&1 >/dev/null \
+        | grep -q "indexes not built: size,mtime (from $SKIP_DB.opts)"; then
+    ok "the log names the sidecar as the source, comments and all"
+else
+    bad "the log names the sidecar as the source" \
+        "$(env ESIDX_LOG=info "$BIN" -v 3 query "$SKIP_DB" "size:>1k" 2>&1 >/dev/null | grep -E 'not built|is not an index' || echo 'no line')"
+fi
+
+# Precedence, which is the argument rather than an accident: the flag is this
+# invocation's decision and the sidecar is the file's, so a stale sidecar must not
+# silently override a flag somebody typed -- and the environment is below both, so a
+# stale environment cannot either. `--no-index=` with nothing after it is how a caller
+# says "build everything, ignore the sidecar", which is only expressible if an empty
+# list is a setting rather than a missing argument.
+optsline() { env ${1:+ESIDX_SKIP_INDEX=$1} "$BIN" options "$SKIP_DB" ${2+"$2"} 2>/dev/null \
+                | sed -n 's/^skipped: //p'; }
+expect "the sidecar wins over the environment"  "$(optsline trigram)"              "size,mtime"
+expect "...the flag wins over the sidecar"      "$(optsline trigram --no-index=rank)" "rank"
+expect "...and --no-index= ignores both"        "$(optsline trigram --no-index=)"    "none"
+expect "the sidecar is reported as present" \
+       "$("$BIN" options "$SKIP_DB" 2>/dev/null | sed -n 's/^sidecar: .*(\(.*\))/\1/p')" "present"
+rm -f "$SKIP_DB.opts"
+expect "...and absent once removed" \
+       "$("$BIN" options "$SKIP_DB" 2>/dev/null | sed -n 's/^sidecar: .*(\(.*\))/\1/p')" "absent"
+expect "with no sidecar and no flag, everything is built" "$(optsline)" "none"
+expect "...and with only the environment, it wins"        "$(optsline rank)" "rank"
+
+# An unknown name is a typo, and a typo that silently built the index anyway is how a
+# memory option ends up believed to be off while it is on. Case does *not* warn: refusing
+# `siZE` would be the same trap wearing the other hat -- the user asked for less memory
+# and got all of it, with a warning they could have read either way.
 if ESIDX_SKIP_INDEX=siz ./esidx -v 3 build "$TREE" -o "$TMP/typo.idx" 2>&1 >/dev/null \
         | grep -q "is not an index"; then
     ok "a misspelled index name in the skip list is reported"
@@ -1626,19 +1680,47 @@ else
         "the mask came out empty, so the index was built"
 fi
 
+# A `--` argument on the query line is an option, not a search term, and an unrecognised
+# one is an error rather than something to AND into the query -- the failure above was
+# exactly that, and it looked like the flag not working.
+if "$BIN" query "$SKIP_DB" --nosuchflag >/dev/null 2>"$TMP/err"; then
+    bad "an unknown -- option on the query line is refused" "it was accepted"
+else
+    grep -q 'unknown option --nosuchflag' "$TMP/err" \
+        && ok "an unknown -- option on the query line is refused" \
+        || bad "an unknown -- option on the query line is refused" "$(head -1 "$TMP/err")"
+fi
+# ...and the flag works on either side of the subcommand, because an argument order
+# nobody has to remember is worth more than per-command parsing.
+a=$("$BIN" --no-index=size,mtime,ctime query "$SKIP_DB" "size:>1k" 2>/dev/null | grep -c .)
+b=$("$BIN" query "$SKIP_DB" --no-index=size,mtime,ctime "size:>1k" 2>/dev/null | grep -c .)
+c=$("$BIN" query "$SKIP_DB" "size:>1k" 2>/dev/null | grep -c .)
+expect "the flag works before or after the subcommand" "$a $b" "$c $c"
+
 # The trigram index and the name rank are the other two bits, and they already had
 # their fallbacks (tri_index_filter() refuses on an empty table; SORT_NAME reads
 # name_rank only if it is non-NULL). Pinned here so that "already worked" is a
 # measurement rather than a memory, and so a third derived index added later has
 # somewhere to be added.
 for bit in trigram rank; do
-    a=$(DB="$SKIP_DB"; "$BIN" query "$SKIP_DB" "conf" 2>/dev/null | paths)
-    b=$(ESIDX_SKIP_INDEX=$bit "$BIN" query "$SKIP_DB" "conf" 2>/dev/null | paths)
+    a=$("$BIN" query "$SKIP_DB" "conf" 2>/dev/null | paths)
+    b=$("$BIN" query "$SKIP_DB" --no-index=$bit "conf" 2>/dev/null | paths)
     expect "'conf' is unaffected by dropping the $bit index" "$b" "$a"
 done
 a=$("$BIN" query "$SKIP_DB" "ext:conf" "sort:name:asc" 2>/dev/null | paths)
-b=$(ESIDX_SKIP_INDEX=rank "$BIN" query "$SKIP_DB" "ext:conf" "sort:name:asc" 2>/dev/null | paths)
+b=$("$BIN" query "$SKIP_DB" --no-index=rank "ext:conf" "sort:name:asc" 2>/dev/null | paths)
 expect "a name sort still orders correctly without the rank" "$b" "$a"
+
+# `esidx options` must not load anything: a 300 MB snapshot must not have to be read to
+# be asked a question about configuration, or nobody runs it before changing a setting.
+# Structural rather than timed, because a timeout on this fixture's 40 KB snapshot would
+# pass whether or not the code opens the file -- what has to be checked is that it does
+# not, and the load path announces itself at INFO.
+if "$BIN" -v 3 options "$SKIP_DB" 2>&1 >/dev/null | grep -qE 'load:|read snapshot'; then
+    bad "esidx options does not load the snapshot" "it ran the load path"
+else
+    ok "esidx options does not load the snapshot"
+fi
 
 # --------------------------------------------------------------- logging
 

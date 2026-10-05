@@ -514,15 +514,29 @@ Do not re-litigate these; they were measured and the conclusions are recorded:
   reason it is worth stating is that two halves disagreed: `est_leaf()` already refused
   to seed from an empty sorted array while `range_on()` went ahead and emptied the
   answer, so `size:`/`dm:`/`dc:` returned **zero rows** for a valid query with no error
-  and exit status 0. Partial correctness reads as robustness. `ESIDX_SKIP_INDEX` and
-  `./tri-skip.sh` exist so this is checkable rather than asserted: the harness prints
-  the matched count from both configurations on every row, because a skip index is worth
-  nothing if the two sides may disagree. Three things fall out of the numbers (design
-  §5.3.1): a range index pays **only where the range is selective** (`size:>10mb` 10.5x
-  slower without it, `size:>1k` free without it — a 41 ms sort dwarfs the 1.2 ms it
-  saved); a missing index costs twice, since seeding is what keeps the *sort* small too;
-  and the **name rank is a sort cost, not an eval cost** (2.8x, all of it in sort), so a
-  harness that printed only plan/eval would have called it free.
+  and exit status 0. Partial correctness reads as robustness. It is configured three
+  ways deep — flag, `<dbfile>.opts` sidecar, `ESIDX_SKIP_INDEX` — and the **file is
+  byte-identical in all of them** (same md5 with every index on and all five off), which
+  is D4 saying out loud that the choice cannot reach the data. `./tri-skip.sh` exists so
+  the cost is checkable rather than asserted: it prints the matched count from both
+  configurations on every row, because a skip index is worth nothing if the two sides may
+  disagree. Three things fall out of the numbers (design §5.3.1): a range index pays
+  **only where the range is selective** (`size:>10mb` 10.5x slower without it, `size:>1k`
+  free without it — a 41 ms sort dwarfs the 1.2 ms it saved); a missing index costs twice,
+  since seeding is what keeps the *sort* small too; and the **name rank is a sort cost,
+  not an eval cost** (2.8x, all of it in sort), so a harness that printed only
+  plan/eval would have called it free.
+- **A flag that a loop can also see becomes a search term.** `--no-index=size size:>1k`
+  answered zero rows: the option worked, and its own text was ANDed into the query as a
+  term matching no filename — a symptom pointing at the option being ignored, which is
+  the opposite of what was wrong. `log_strip_flags()` already removed `-v` from `argv`
+  for the same reason; `idx_strip()` now does the same for `--no-index`. The general
+  rule: **a CLI flag is stripped once, centrally**, not read in place by each parser.
+- **A returned pointer into a dead frame is right until it is not.** `esidx_index_
+  resolve()` handed back `*source` pointing at a `char[4096]` local that the sidecar
+  reading loop then reused. `-O2` printed the right path (the old copy sat in a register)
+  and the sanitiser build's `-O0` printed an empty one. Found by `make check`, which is
+  the whole argument for it (§3.1).
 
 ### 4.4 Do not optimise on a guess
 

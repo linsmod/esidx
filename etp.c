@@ -1267,6 +1267,15 @@ int etp_serve(const etp_opts_t *opts)
 
     esidx_t db;
     esidx_init(&db);
+    /* The mask has to be settled before the load, because the load is where finalize
+     * runs -- and it is decided by main.c, which is the only place that reads the flag
+     * and the sidecar. Resolving it here a second time would be a second opinion. */
+    {
+        const char *src = "default";
+        uint32_t mask = esidx_index_resolve(opts->dbfile, opts->have_no_index,
+                                            opts->no_index, &src);
+        esidx_index_apply(&db, mask, src);
+    }
     uint64_t t0 = ts_us();
     if (esidx_load(&db, opts->dbfile) != 0) {
         fprintf(stderr, "cannot load %s\n", opts->dbfile);

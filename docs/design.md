@@ -394,7 +394,54 @@ the executor went ahead and emptied the answer. **Partial correctness reads as r
 `range_on()` now falls back to the column, which is the same shape `depth:`/`len:`/
 `child-count:` have always used — the value is in the column whatever the array did — and
 logs the degradation per query at DEBUG, because an answer that is right for the wrong
-reason is exactly what this section is about. §10 has the measurements.
+reason is exactly what this section is about.
+
+**How it is configured**, three sources deep, and the order is the argument rather than an
+accident — the flag is this invocation's decision and the sidecar is the file's, so a
+stale sidecar must not silently override a flag somebody typed:
+
+| source | spelling | note |
+|---|---|---|
+| flag | `--no-index[=LIST]`, on either side of the subcommand | stripped from `argv` in `main()`, the way `log_strip_flags()` removes `-v` |
+| sidecar | `<dbfile>.opts`, one name per line, `#` comments | beside the snapshot: options belong to a file, so two indexes of the same tree can differ |
+| environment | `ESIDX_SKIP_INDEX` | lowest; what the test suite drives |
+
+`--no-index` bare means "read the sidecar" and `--no-index=` means "ignore it", which is
+only expressible because an empty list is a setting rather than a missing argument.
+`esidx options <dbfile>` prints the resolved answer and its source **without opening the
+snapshot** — a 300 MB file must not have to be read to be asked a question about
+configuration, or nobody runs it before changing a setting.
+
+**The flag is stripped from `argv` rather than read in place**, and that detail is a bug
+this section had: the query loop treats every argument that is not `sort:`/`count:`/
+`offset:` as search text, so `--no-index=size size:>1k` answered **zero rows** — the flag
+worked perfectly and its own text was then ANDed into the query as a term matching no
+filename. The symptom pointed at the option being ignored, which is the opposite of what
+was wrong. One `idx_strip()` in `main()` now removes it before any subcommand sees it, and
+an unrecognised `--` argument on the query line is an error rather than a term.
+
+**What it saves, on `/work`** (5 476 485 entries, `./ledger.sh /work`, which now prints the
+configuration next to the numbers because a memory figure whose configuration is not in
+the same run is not reproducible):
+
+| `--no-index=` | accounted | peak rss | saved |
+|---|---|---|---|
+| *(nothing: all five)* | 789.2 MiB | 862.1 MiB | |
+| `size,mtime,ctime` | 601.2 | 669.4 | 188.0 MiB |
+| `trigram` | 687.4 | 761.2 | 101.8 |
+| `rank` | 725.4 | 749.2 | 63.8 |
+| `trigram,rank` | 623.6 | 664.5 | 165.6 |
+| all five | **435.6** | **455.2** | **353.6** |
+
+47 % of peak rss, **and the snapshot is byte-identical throughout** — 313 011 674 bytes
+and the same md5 with every index on and with all five off, which is D4 saying out loud
+that the configuration cannot reach the file. It is also why `esidx_compact()` copies the
+mask into its scratch index rather than re-resolving it: a compaction run by a process
+that was told not to build the trigram index must not quietly put 100 MiB of it back.
+
+**What it costs per query**, `./tri-skip.sh /usr 5`, one snapshot serving both
+configurations, the matched row count printed from both sides on every line so a "faster"
+row that answered something else could not pass for a trade:
 
 | skipped | query on /usr | rows | eval | sort | total |
 |---|---|---|---|---|---|
@@ -407,21 +454,17 @@ reason is exactly what this section is about. §10 has the measurements.
 | trigram | `path:/usr *.conf size:>1k` | 466 | 20.661 → 44.762 | — | 21.3 → 45.4 ms |
 | rank | `image: sort:name:asc` | 55 229 | 0.181 → 0.179 | 7.550 → **21.225** | 7.8 → 21.5 ms |
 
-(r7000, best of 5, `./tri-skip.sh /usr 5`, one snapshot serving both configurations. The
-harness prints the matched count from both sides on every row precisely so a "faster" row
-that answered something else could not pass for a trade.)
-
-Three things fall out of that table, and they are why the option is worth having rather
-than a fixed default:
+(r7000, best of 5, `-O2`.) Three things fall out of that table, and they are why the
+trade is worth exposing rather than settling in the code:
 
 - **A range index is worth its memory only where the range is selective.**
   `size:>10mb` is 10.5x without it; `size:>1k`, which matches 233 021 of 372 084 rows,
   is **free** without it — the 41 ms sort over the whole table dwarfs the 1.2 ms the
-  range saved, and the total actually came out 0.2 ms *faster*. So "12.8 MiB for
-  `by_size` on /usr" is not a cost that has to be justified in general; it buys the
+  range saved, and the total actually came out 0.2 ms *faster*. So "62.7 MiB for
+  `by_size` on /work" is not a cost that has to be justified in general; it buys the
   selective shapes and nothing else.
-- **A selective range pays twice.** The seeding is what keeps the *sort* small as well as
-  the eval, so removing the array costs twice over on `size:>10mb` — though on a 426-row
+- **A selective range pays twice.** Seeding is what keeps the *sort* small as well as the
+  eval, so removing the array costs twice over on `size:>10mb` — though on a 426-row
   result the second term is only 0.065 ms.
 - **The rank is a sort cost, not an eval cost**, so its 2.8x is invisible in eval
   (0.181 → 0.179) and all of it is in the sort (7.55 → 21.2 ms). A harness that printed

@@ -1883,6 +1883,70 @@ const char *esidx_index_names(uint32_t mask)
     return buf;
 }
 
+void esidx_index_sidecar_path(const char *dbfile, char *out, size_t n)
+{
+    /* Beside the snapshot rather than beside the binary or in a fixed place: options
+     * belong to a file, so `x.idx` and `y.idx` can be served differently from the same
+     * tree, and a config that follows the binary configures every index at once. */
+    snprintf(out, n, "%s.opts", dbfile ? dbfile : "");
+}
+
+uint32_t esidx_index_resolve(const char *dbfile, int have_flag, const char *flag_list,
+                             const char **source)
+{
+    if (have_flag) {
+        if (source) *source = "--no-index";
+        return esidx_index_skip(flag_list ? flag_list : "");
+    }
+
+    if (dbfile && *dbfile) {
+        /* The path is a *static* buffer and not a local: it is handed back as `*source`,
+         * and the loop below reuses this frame -- at -O2 the old copy survived in a
+         * register and the log printed the right path, and the sanitiser build's -O0
+         * frame reuse printed an empty one. A returned pointer into a dead frame is the
+         * kind of bug that is right until it is not, which is the definition of it. */
+        static char path[4096];
+        esidx_index_sidecar_path(dbfile, path, sizeof(path));
+        FILE *f = fopen(path, "r");
+        if (f) {
+            char line[256];
+            uint32_t mask = 0;
+            while (fgets(line, sizeof(line), f)) {
+                char *s = line;
+                /* '#' to end of line, and the trailing newline: a config file is
+                 * written by hand and the alternative is a list nobody can format. */
+                char *hash = strchr(s, '#');
+                if (hash) *hash = '\0';
+                s[strcspn(s, "\r\n")] = '\0';
+                while (*s == ' ' || *s == '\t') s++;
+                mask |= esidx_index_skip(s);
+            }
+            fclose(f);
+            if (source) *source = path;
+            return mask;
+        }
+    }
+
+    const char *env = getenv("ESIDX_SKIP_INDEX");
+    if (env && *env) {
+        if (source) *source = "ESIDX_SKIP_INDEX";
+        return esidx_index_skip(env);
+    }
+    if (source) *source = "default";
+    return 0;
+}
+
+void esidx_index_apply(esidx_t *db, uint32_t mask, const char *source)
+{
+    db->skip = mask;
+    db->skip_src = source ? source : "default";
+    /* Always printed, including at 0: "indexes not built: none" is the line that makes
+     * a memory number reproducible, and its absence is indistinguishable from a build
+     * that was never configured at all. */
+    LOGI("indexes not built: %s (from %s)", mask ? esidx_index_names(mask) : "none",
+         db->skip_src);
+}
+
 void esidx_init(esidx_t *db)
 {
     memset(db, 0, sizeof(*db));
@@ -1890,14 +1954,10 @@ void esidx_init(esidx_t *db)
     db->di.ht_val = calloc(1024, sizeof(eid_t));
     db->di.ht_mask = 1023;
     db->root_eid = EID_NONE;
-    /* A test and a diagnostic hook, not the user-facing option: the option is a flag
-     * and a config file over this same mask, and it is deliberately not built yet,
-     * because building it on top of a mask whose readers do not yet degrade correctly
-     * would be shipping a switch that turns a fast answer into a wrong one. Read here,
-     * once, so every caller of esidx_finalize() obeys it without a signature change. */
-    db->skip = esidx_index_skip(getenv("ESIDX_SKIP_INDEX"));
-    if (db->skip)
-        LOGI("indexes not built: %s", esidx_index_names(db->skip));
+    /* No decision here about which indexes exist. esidx_init() is called by paths that
+     * have no dbfile (a compact's scratch index) and by paths that have already
+     * resolved one, so a default set here would be a second place to be right about.
+     * esidx_index_apply() is the one place, and esidx_index_resolve() the one answer. */
 }
 
 void esidx_free(esidx_t *db)

@@ -24,23 +24,81 @@
 #include <strings.h>
 #include <time.h>
 #include <ctype.h>
+#include <unistd.h>
 
 static void usage(void)
 {
     fprintf(stderr,
         "usage:\n"
-        "  esidx [-v N] build <root> -o <dbfile>\n"
-        "  esidx [-v N] update <dbfile> [root] [--deep]\n"
-        "  esidx [-v N] query <dbfile> [expr ...]\n"
+        "  esidx [-v N] build <root> -o <dbfile> [--no-index[=LIST]]\n"
+        "  esidx [-v N] update <dbfile> [root] [--deep] [--no-index[=LIST]]\n"
+        "  esidx [-v N] query <dbfile> [expr ...] [--no-index[=LIST]]\n"
         "  esidx [-v N] serve <dbfile> [-p port] [--bind addr]\n"
         "                             [-u user [-w pass]] [--no-download] [--once]\n"
+        "                             [--no-index[=LIST]]\n"
+        "  esidx options <dbfile> [--no-index[=LIST]]\n"
         "\n"
         "update: bring an index back in line with the filesystem. Without --deep\n"
         "        it stats one directory per subtree and notices name changes;\n"
         "        with --deep it stats every entry and notices size/mtime changes.\n"
         "        <root> defaults to the one the index was built from.\n"
         "\n"
+        "derived indexes (design D4: none of them are in the snapshot, so this is a\n"
+        "choice about this process and the same file serves both settings):\n"
+        "  --no-index=size,mtime,ctime,trigram,rank   leave those unbuilt\n"
+        "  --no-index                                 the same, from <dbfile>.opts\n"
+        "  --no-index=                                build everything, ignore .opts\n"
+        "  <dbfile>.opts  one name per line, '#' comments; --no-index wins over it,\n"
+        "                 and ESIDX_SKIP_INDEX is the last resort (tests use it)\n"
+        "  esidx options <dbfile>     print what would be left out, and why\n"
+        "\n"
         "logging: ESIDX_LOG=error|warn|info|debug  or  -v / -v N / --verbose=N\n");
+}
+
+/* ------------------------------------------------------ the --no-index flag
+ *
+ * Removed from argv rather than read in place, for the reason log_strip_flags() removes
+ * `-v`: a flag that the query loop can also see becomes part of the search string, and
+ * `--no-index=size size:>1k` then answers zero rows -- the flag worked perfectly and its
+ * own text was ANDed in as a term matching no filename, which is a much worse thing to
+ * debug than "unknown option". Stripping it here means no other parser has to know the
+ * name, and an argument the query loop does not recognise still becomes search text
+ * exactly as before.
+ *
+ * `--no-index` with no value means "read the sidecar" and `--no-index=` means "ignore the
+ * sidecar", which is why `have` is separate from the list: an empty list is a real
+ * setting, not an absent argument.
+ *
+ * One flag for the whole command line, not one per subcommand: `esidx -v 3 --no-index=x
+ * serve ...` and `esidx serve ... --no-index=x` have to mean the same thing, and an
+ * argument order nobody has to remember is worth more than per-command parsing. */
+typedef struct { int have; const char *list; } idx_flag_t;
+static idx_flag_t g_flag;   /* stripped from argv in main(), before any subcommand */
+
+static idx_flag_t idx_strip(int *argc, char **argv)
+{
+    idx_flag_t f = { 0, NULL };
+    int w = 0;
+    for (int i = 0; i < *argc; i++) {
+        if (!strncmp(argv[i], "--no-index=", 11)) {
+            f.have = 1; f.list = argv[i] + 11; continue;
+        }
+        if (!strcmp(argv[i], "--no-index")) {
+            f.have = 1; f.list = ""; continue;
+        }
+        argv[w++] = argv[i];
+    }
+    for (int i = w; i < *argc; i++) argv[i] = NULL;
+    *argc = w;
+    return f;
+}
+
+/* Resolve and record, for a command that has just initialised `db` and knows its file. */
+static void idx_configure(esidx_t *db, const char *dbfile, idx_flag_t f)
+{
+    const char *src = "default";
+    uint32_t mask = esidx_index_resolve(dbfile, f.have, f.list, &src);
+    esidx_index_apply(db, mask, src);
 }
 
 /* ------------------------------------------------------------- arg parsing */
@@ -63,6 +121,11 @@ static int cmd_build(int argc, char **argv)
 
     esidx_t db;
     esidx_init(&db);
+    /* The options belong to the file being written, so the sidecar that can turn an
+     * index off is the one sitting next to it -- and `build` is the one command that
+     * has to honour it, or the snapshot would be written by a process configured
+     * differently from every other process that reads it. */
+    idx_configure(&db, out, g_flag);
 
     uint64_t t0 = ts_us();
     if (esidx_scan(&db, root) != 0) {
@@ -123,6 +186,9 @@ static int cmd_update(int argc, char **argv)
 
     esidx_t db;
     esidx_init(&db);
+    /* Before the load, because the load is where finalize runs and therefore where the
+     * decision has to have been made. */
+    idx_configure(&db, dbfile, g_flag);
     uint64_t t0 = ts_us();
     if (esidx_load(&db, dbfile) != 0) {
         fprintf(stderr, "load failed: %s\n", dbfile);
@@ -175,6 +241,7 @@ static int cmd_query(int argc, char **argv)
 
     esidx_t db;
     esidx_init(&db);
+    idx_configure(&db, dbfile, g_flag);
 
     uint64_t t0 = ts_us();
     if (esidx_load(&db, dbfile) != 0) {
@@ -230,6 +297,20 @@ static int cmd_query(int argc, char **argv)
         }
         if (!strncasecmp(a, "count:", 6))  { count  = (uint32_t)strtoul(a + 6, NULL, 10); continue; }
         if (!strncasecmp(a, "offset:", 7)) { offset = (uint32_t)strtoul(a + 7, NULL, 10); continue; }
+        /* A `--` argument is this CLI's option syntax, never search text. Everything
+         * else on this loop is a term, including something that merely looks like a
+         * flag: the query language has no use for one, and swallowing a misspelled
+         * option into the search string is how `--no-index=size size:>1k` came to
+         * answer zero rows while the index really was configured correctly -- the
+         * flag worked, and its own text was then ANDed into the query as a term that
+         * matches no filename. Only `--` is claimed, not `-`, so a term may still
+         * begin with a single dash. */
+        if (a[0] == '-' && a[1] == '-') {
+            fprintf(stderr, "query: unknown option %s\n", a);
+            free(expr);
+            esidx_free(&db);
+            return 1;
+        }
         if (elen) expr[elen++] = ' ';
         size_t al = strlen(a);
         memcpy(expr + elen, a, al + 1);
@@ -331,13 +412,59 @@ static int cmd_serve(int argc, char **argv)
         return 1;
     }
     o.dbfile = dbfile;
+    /* serve keeps its own esidx_t inside etp_serve(), so the flag travels as two plain
+     * fields rather than being re-read from the environment over there: one place
+     * decides what this process does not build. */
+    o.have_no_index = g_flag.have;
+    o.no_index = g_flag.list;
     return etp_serve(&o) == 0 ? 0 : 1;
+}
+
+/* ----------------------------------------------------------------- options */
+
+/* Print what this invocation would leave unbuilt, without loading anything. The point is
+ * that the answer is cheap: a 300 MB snapshot must not have to be read to be asked a
+ * question about configuration, and a command that did would be one nobody runs before
+ * changing a setting. */
+static int cmd_options(int argc, char **argv)
+{
+    const char *dbfile = NULL;
+    for (int i = 0; i < argc; i++) {
+        if (argv[i][0] == '-') continue;
+        if (!dbfile) { dbfile = argv[i]; continue; }
+        fprintf(stderr, "options: unexpected argument %s\n", argv[i]);
+        return 1;
+    }
+    if (!dbfile) {
+        fprintf(stderr, "usage: esidx options <dbfile> [--no-index[=LIST]]\n");
+        return 1;
+    }
+
+    static const char *all[] = { "size", "mtime", "ctime", "trigram", "rank" };
+    static const uint32_t bits[] = { ESIDX_IX_SIZE, ESIDX_IX_MTIME, ESIDX_IX_CTIME,
+                                     ESIDX_IX_TRIGRAM, ESIDX_IX_RANK };
+
+    const char *src = "default";
+    uint32_t mask = esidx_index_resolve(dbfile, g_flag.have, g_flag.list, &src);
+
+    char side[4096];
+    esidx_index_sidecar_path(dbfile, side, sizeof(side));
+    printf("dbfile:  %s\n", dbfile);
+    printf("sidecar: %s (%s)\n", side, access(side, R_OK) == 0 ? "present" : "absent");
+    printf("source:  %s\n", src);
+    printf("skipped: %s\n", mask ? esidx_index_names(mask) : "none");
+    printf("built:  ");
+    for (size_t i = 0; i < sizeof(bits) / sizeof(bits[0]); i++)
+        if (!(mask & bits[i])) printf(" %s", all[i]);
+    printf("\n");
+    return 0;
 }
 
 int main(int argc, char **argv)
 {
     log_init(argc, argv);
     argc = log_strip_flags(argc, argv);   /* so argv[1] is always the subcommand */
+    g_flag = idx_strip(&argc, argv);      /* and the flag is out of every subcommand's way */
     LOGD("log level: %s", log_level_name(log_level()));
 
     if (argc < 2) { usage(); return 1; }
@@ -345,6 +472,7 @@ int main(int argc, char **argv)
     if (!strcmp(argv[1], "update")) return cmd_update(argc - 2, argv + 2);
     if (!strcmp(argv[1], "query"))  return cmd_query(argc - 2, argv + 2);
     if (!strcmp(argv[1], "serve"))  return cmd_serve(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "options")) return cmd_options(argc - 2, argv + 2);
     usage();
     return 1;
 }

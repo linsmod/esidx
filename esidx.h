@@ -221,12 +221,26 @@ enum {
     ESIDX_IX_RANK    = 1u << 4    /* name rank  -- SORT_NAME as an int compare */
 };
 
-/* Parse a skip list like "size,mtime" or "all". Returns 0 for nothing skipped. Read
- * once per process from ESIDX_SKIP_INDEX (see store.c) -- a test and a diagnostic hook,
- * not the user-facing option, which is a flag and a config file over this same mask. */
+/* Parse a skip list like "size,mtime" or "all". Returns 0 for nothing skipped. The same
+ * parser serves the flag, the sidecar and the environment, so a name that works in one
+ * works in all three. */
 uint32_t esidx_index_skip(const char *list);
 /* The bits in `mask` as the comma-separated names, for a log line or an error. */
 const char *esidx_index_names(uint32_t mask);
+
+/* Resolve which derived indexes this process will not build, and say where the answer
+ * came from in `*source` (a static string; never NULL).
+ *
+ * Precedence is **flag > sidecar > environment > everything on**, and the order is the
+ * argument rather than an accident: the flag is this invocation's decision and the
+ * sidecar is the file's, so a stale sidecar must not silently override a flag someone
+ * typed. `have_flag` with an empty list is therefore meaningful -- it is how a caller
+ * says "ignore the sidecar and build everything" -- which is why it is a separate flag
+ * rather than a NULL pointer. */
+uint32_t esidx_index_resolve(const char *dbfile, int have_flag, const char *flag_list,
+                             const char **source);
+/* The path a sidecar for `dbfile` would have. */
+void esidx_index_sidecar_path(const char *dbfile, char *out, size_t n);
 
 void sidx_build(sidx_t *s, const int64_t *vals, uint32_t n);
 void sidx_free(sidx_t *s);
@@ -481,18 +495,26 @@ typedef struct {
      * them in step. A full scan appends with no derived indexes present and lets
      * finalize build them; a reconcile appends into a live index. */
     bool          built;
-    /* Which derived indexes esidx_finalize() must NOT build: the ESIDX_IX_* mask, read
-     * once by esidx_init(). Every *reader* of a skipped structure has to fall back to
+    /* Which derived indexes esidx_finalize() must NOT build: the ESIDX_IX_* mask, from
+     * esidx_index_resolve(). Every *reader* of a skipped structure has to fall back to
      * something slower and correct -- that is the whole contract, and `built` being
      * true says nothing about it, which is why the mask is checked where it is used
      * rather than being folded into it. */
     uint32_t      skip;
+    const char   *skip_src;  /* which flag/sidecar/env decided it, for the log and for
+                              * `esidx options`; a static string, never NULL after
+                              * esidx_index_apply() */
     eid_t         root_eid; /* the scanned root; parent:"" and root: anchor here */
     scan_stats_t  scan;
 } esidx_t;
 
 void esidx_init(esidx_t *db);
 void esidx_free(esidx_t *db);
+
+/* Record the resolved mask on an open index, and print it at INFO. One line, at startup,
+ * naming the source: a configuration that is believed to be off while it is on is the
+ * whole failure this exists to prevent. */
+void esidx_index_apply(esidx_t *db, uint32_t mask, const char *source);
 
 /* One entry as the collector hands it over. A struct rather than nine positional
  * arguments because three of them are adjacent int64_t seconds/nanoseconds: a
