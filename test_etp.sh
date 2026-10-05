@@ -60,8 +60,8 @@ cd "$(dirname "$0")"
 # apart, so neither can be stale relative to the other; that is why the selection is a
 # name here and not a `make DEBUG=1` that rewrites the same object files.
 case "${ESIDX_BUILD:-opt}" in
-    dbg) BIN=${ESIDX_BIN:-./esidx-dbg}; PROBE=./etp-probe-dbg ;;
-    opt) BIN=${ESIDX_BIN:-./esidx};    PROBE=./etp-probe ;;
+    dbg) BIN=${ESIDX_BIN:-./esidx-dbg}; PROBE=./etp-probe-dbg; ORDER_REF=./order-ref-dbg ;;
+    opt) BIN=${ESIDX_BIN:-./esidx};    PROBE=./etp-probe;    ORDER_REF=./order-ref ;;
     *)   printf 'ESIDX_BUILD must be opt or dbg, not "%s"\n' "${ESIDX_BUILD}" >&2; exit 2 ;;
 esac
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/esidx-etp.XXXXXX")
@@ -1089,6 +1089,62 @@ else
     ok "  the removals were answered from the overlay, so di_remove_child read it too"
 fi
 
+# --- and the name rank, which is the same bargain for the same reason. A rank is a sorted
+# position, so a name the index has never seen has nowhere to go: recomputing the order
+# costs O(n log n) -- measured 1413 ms over 5.48 M rows -- which is why a pass that added
+# one file used to cost more than the whole walk. Those rows instead get a key computed on
+# the fly: one binary search over the rank table per *distinct* new name, and nothing at
+# all per comparison (query.c, rank_pending).
+#
+# The three names interleave with the existing ones instead of landing at one end, because
+# "sorts before everything" and "sorts in the right place" are different requirements and
+# only the second is the contract (design §1.2: a client pages by OFFSET, so the order *is*
+# the answer). Two of them land in the same gap, which is the case that needs the count of
+# new names sharing a gap rather than a single "before the next rank" slot.
+: >"$OTREE/o0a.dat"; : >"$OTREE/o0b.dat"; : >"$OTREE/o1a.dat"
+sleep $((REFRESH_SECS * 2 + 1))
+
+# The order, against the oracle that *is* strcasecmp. order-ref is the comparison because
+# neither `sort -f` nor `tr A-Z a-z | sort` is (design §10: GNU sort folds for equality
+# but orders by the original bytes, and compares signed under LC_ALL=C).
+names_sorted() {
+    cat >"$TMP/script-o" <<EOF
+send USER anonymous
+send EVERYTHING SORT name_ascending
+send EVERYTHING COUNT 300
+send EVERYTHING SEARCH parent:"$OTREE" !folder:
+sendraw EVERYTHING QUERY
+query
+EOF
+    timeout 30 "$PROBE" "$SRV_PORTO" "$TMP/script-o" >"$OUT_O" 2>&1 || {
+        echo "probe failed" >&2; return 1; }
+    pnames "$OUT_O" | tr ' ' '\n' | sed '/^$/d' >"$TMP/os.got"
+}
+expect_name_order() {   # expect_name_order <label>
+    names_sorted
+    find "$OTREE" -maxdepth 1 -type f | awk -F/ '{print $NF}' >"$TMP/os.want"
+    "$ORDER_REF" "$TMP/os.want" >"$TMP/os.want.sorted"
+    if cmp -s "$TMP/os.got" "$TMP/os.want.sorted"; then
+        ok "  $1"
+    else
+        bad "  $1" "$(diff "$TMP/os.want.sorted" "$TMP/os.got" | head -6 | tr '\n' ' ')"
+    fi
+}
+if [ -x "$ORDER_REF" ]; then
+    expect_name_order "a name sort with three unranked names interleaved matches strcasecmp order"
+else
+    bad "  a name sort with three unranked names interleaved matches strcasecmp order" \
+        "$ORDER_REF not built"
+fi
+if grep -q 'drain: name rank rebuilt' "$SRVO_ERR"; then
+    bad "  those three names were ordered without a rank rebuild" \
+        "$(grep -m1 'drain: name rank rebuilt' "$SRVO_ERR")"
+else
+    ok "  those three names were ordered without a rank rebuild (computed on the fly)"
+fi
+expect "  and the count is still the filesystem's" \
+    "$(kids "parent:\"$OTREE\" !folder:")" "$(ofiles)"
+
 # --- now far past any threshold: the drain folds the overlay into the array, and the
 # answers must not move. The count is compared against find(1), not against what the
 # server said a moment ago, so a wrong answer cannot agree with itself.
@@ -1099,9 +1155,16 @@ sleep $((REFRESH_SECS * 3))
 expect "  after a bulk create the count is the filesystem's" \
     "$(kids "parent:\"$OTREE\" !folder:")" "$(ofiles)"
 if grep -q 'drain: children array rebuilt' "$SRVO_ERR"; then
-    ok "  the drain ran once the overlay passed its threshold ($(grep -c 'drain: children array rebuilt' "$SRVO_ERR") times)"
+    ok "  the drain ran once the overlay passed its threshold ($(grep -c 'drain: children array rebuilt' "$SRVO_ERR") children, $(grep -c 'drain: name rank rebuilt' "$SRVO_ERR") rank)"
 else
     bad "  the drain ran once the overlay passed its threshold" "no drain line in the log"
+fi
+# The same comparison again, now that the ranks have been recomputed instead of computed
+# per row. Same tree, same oracle, so a self-consistent-but-wrong key cannot pass this one:
+# the on-the-fly keys and the rebuilt ranks have to agree with strcasecmp about the same
+# 243 names.
+if [ -x "$ORDER_REF" ]; then
+    expect_name_order "and the order still matches strcasecmp after the drain recomputed the ranks"
 fi
 expect "  child-count: still agrees after the drain" \
     "$(kids "child-count:$(ofiles)")" "1"

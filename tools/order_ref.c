@@ -107,5 +107,10 @@ int main(int argc, char **argv)
     if (!v) return 2;
     qsort(v, n, sizeof(char *), cmp_ci);
     for (size_t i = 0; i < n; i++) printf("%s\n", v[i]);
+    /* Freed here because the print mode is not a one-shot debugging aid any more:
+     * test_etp.sh 11c uses it to produce the expectation a name sort is compared
+     * against, and `make check` runs that suite under AddressSanitizer with
+     * detect_leaks=1 -- so a tool that leaks here fails the gate, and did. */
+    free_lines(v, n);
     return 0;
 }

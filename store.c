@@ -273,11 +273,24 @@ int esidx_build_name_rank(esidx_t *db)
     }
     uint32_t *noff = malloc((size_t)n * sizeof(uint32_t));
     if (!noff) { free(order); free(newr); esidx_free_name_rank(db); return -1; }
-    for (uint32_t i = 0; i < n; i++) noff[newr[i]] = db->rk_off[order[i]];
+    /* `noff` is indexed by *sorted position*, so the old rank has to come through
+     * `order`. It used to read noff[newr[i]] -- and newr is indexed by old rank, so that
+     * stored each offset at the sorted position of the name whose old rank was `i`, which
+     * is a different name entirely: rk_off came out a permutation and name_rank came out
+     * right, because it is filled from newr separately. Nothing noticed for as long as the
+     * only readers were rk_intern()'s probe and the intern rebuild, neither of which
+     * requires the table to be *sorted*; esidx_name_rank_gap() below is the first reader
+     * that does, and it is a binary search. */
+    for (uint32_t i = 0; i < n; i++) noff[i] = db->rk_off[order[i]];
     memcpy(db->rk_off, noff, (size_t)n * sizeof(uint32_t));
     for (uint32_t i = 0; i < et->count; i++)
         if (!(et->flags[i] & EF_DEAD)) db->name_rank[i] = newr[db->name_rank[i]];
     db->n_ranks = m + 1;
+    /* The entry count this covers. Anything at or past it has no rank, and that is the
+     * state every pass that added a name leaves behind until the drain -- which is why
+     * esidx_name_rank() bounds-checks against this and not against et->count. */
+    db->rk_n = et->count;
+    db->rk_pending = 0;
     free(order); free(newr); free(noff);
 
     /* the intern table indexes the *new* numbering */
@@ -301,13 +314,33 @@ void esidx_free_name_rank(esidx_t *db)
     db->folded.buf = NULL;
     db->folded.len = db->folded.cap = 0;
     db->rk_tab = NULL; db->rk_off = NULL; db->name_rank = NULL;
-    db->rk_mask = 0; db->n_ranks = 0;
+    db->rk_mask = 0; db->n_ranks = 0; db->rk_n = 0;
 }
 
 uint32_t esidx_name_rank(const esidx_t *db, eid_t id)
 {
-    if (!db->name_rank || id >= db->et.count) return 0;
+    if (!db->name_rank || id >= db->rk_n) return RANK_NONE;
     return db->name_rank[id];
+}
+
+/* The insertion point of `folded` in the rank table, and whether it is already there.
+ * `rk_off` is in sorted-name order by construction (esidx_build_name_rank renumbers it),
+ * so this is a plain lower_bound. `found` distinguishes "sorts before every rank" (gap 0)
+ * from "is rank 0", which the count alone cannot. */
+uint32_t esidx_name_rank_gap(const esidx_t *db, const char *folded, bool *found)
+{
+    if (found) *found = false;
+    uint32_t lo = 0, hi = db->n_ranks;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        int r = strcmp(sp_get(&db->folded, db->rk_off[mid]), folded);
+        if (r < 0) lo = mid + 1;
+        else       hi = mid;
+    }
+    if (found && lo < db->n_ranks &&
+        strcmp(sp_get(&db->folded, db->rk_off[lo]), folded) == 0)
+        *found = true;
+    return lo;
 }
 
 /* ------------------------------------------------------------ entry table */
@@ -639,6 +672,10 @@ eid_t esidx_add(esidx_t *db, eid_t parent, const entry_in_t *in)
         num_delta(db, &db->by_size,  ESIDX_IX_SIZE,  et->size[id],  id, false);
         num_delta(db, &db->by_mtime, ESIDX_IX_MTIME, et->mtime[id], id, false);
         num_delta(db, &db->by_ctime, ESIDX_IX_CTIME, et->ctime[id], id, false);
+        /* One more name the rank has not seen. Counted here rather than derived from the
+         * entry count, because a reconcile spends ids on files that are already gone and
+         * an id spent on a tombstone would count as pending for ever. */
+        if (db->name_rank) db->rk_pending++;
         bump_epoch(db);
     }
     return id;
@@ -702,6 +739,9 @@ static void kill_one(esidx_t *db, eid_t id)
     if (p != EID_NONE) di_remove_child(db, p, id);
 
     et->flags[id] |= EF_DEAD;
+    /* If the rank never covered this id, it was one of the names it had not seen, and
+     * the drain's threshold must not keep counting it. */
+    if (db->name_rank && id >= db->rk_n && db->rk_pending) db->rk_pending--;
     bump_epoch(db);
 }
 
@@ -1015,30 +1055,46 @@ int esidx_build_children(esidx_t *db)
 }
 
 /* Drain whichever overlays are over their threshold. Returns 0 whether or not anything
- * was rebuilt, so a caller does not have to care. The rank half is the same bargain and
- * lands here too when it exists; for now this is the children one, and the reason the
- * decision lives in one function rather than at the two call sites is that "when do the
- * O(n) rebuilds happen" is a question with one answer.
+ * was rebuilt, so a caller does not have to care.
+ *
+ * One function because "when do the O(n) rebuilds happen" is a question with one answer,
+ * and because the two overlays want the same answer: both exist because their structure
+ * cannot be appended to in the middle, both cost O(n) to rebuild, and both are cheaper to
+ * leave alone than to catch up while the threshold is not reached.
  *
  * INFO, not DEBUG, because the line is also how a reader tells *which* of the two
- * mechanisms answered `parent:` -- the overlay or the rebuilt array -- and that
- * distinction is the whole content of the test that covers this (test_etp.sh 11c). It is
- * rare by construction: once per threshold's worth of additions, so 487 ms per 456 000
- * additions on /work, and never at all on an index that is not changing. */
+ * mechanisms answered -- the overlay or the rebuilt structure -- and that distinction is
+ * the whole content of the test that covers this (test_etp.sh 11c, 11d). It is rare by
+ * construction: once per threshold's worth of additions. */
 int esidx_drain(esidx_t *db)
 {
-    if (!db->di.c_dirty) return 0;
-    uint32_t limit = db->et.count / ESIDX_CHILD_OVERLAY_DIV;
-    if (db->di.ov_ids <= limit) return 0;
+    uint32_t limit = db->et.count / ESIDX_OVERLAY_DIV;
 
-    uint64_t t0 = ts_us();
-    uint32_t pending = db->di.ov_ids;
-    if (esidx_build_children(db) == 0)
-        LOGI("drain: children array rebuilt over %u entries from %u pending ids in %.1f ms",
-             db->et.count, pending, (double)(ts_us() - t0) / 1000.0);
-    else
-        LOGW("drain: children array rebuild failed; the overlay answers `parent:` until "
-             "the next one");
+    if (db->di.c_dirty && db->di.ov_ids > limit) {
+        uint64_t t0 = ts_us();
+        uint32_t pending = db->di.ov_ids;
+        if (esidx_build_children(db) == 0)
+            LOGI("drain: children array rebuilt over %u entries from %u pending ids in %.1f ms",
+                 db->et.count, pending, (double)(ts_us() - t0) / 1000.0);
+        else
+            LOGW("drain: children array rebuild failed; the overlay answers `parent:` "
+                 "until the next one");
+    }
+
+    /* The rank's pending set is counted, not derived (esidx.h): every live entry past the
+     * rank's extent is a name it has not seen, and the counter's two writers are the two
+     * functions that already maintain the epoch. Same fraction of the same count as the
+     * children overlay, for the same reason. */
+    if (db->name_rank && db->rk_pending > limit) {
+        uint64_t t0 = ts_us();
+        uint32_t pending = db->rk_pending;
+        if (esidx_build_name_rank(db) == 0)
+            LOGI("drain: name rank rebuilt over %u entries from %u pending names in %.1f ms",
+                 db->et.count, pending, (double)(ts_us() - t0) / 1000.0);
+        else
+            LOGW("drain: name rank rebuild failed; a name sort falls back to comparing "
+                 "folded names");
+    }
     return 0;
 }
 
@@ -2624,7 +2680,7 @@ void esidx_log_mem(const esidx_t *db, const char *phase)
              "drain at %u (entries/%u) -- 0 on a fresh build, and the window between a "
              "reconcile and its drain is where `parent:` reads two runs",
              phase, db->di.ov_ids, db->di.ov_count, (unsigned long long)ovb,
-             et->count / ESIDX_CHILD_OVERLAY_DIV, ESIDX_CHILD_OVERLAY_DIV);
+             et->count / ESIDX_OVERLAY_DIV, ESIDX_OVERLAY_DIV);
     }
     if (db->di.ht_off) {
         uint64_t slots = (uint64_t)db->di.ht_mask + 1;

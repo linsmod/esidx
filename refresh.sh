@@ -104,12 +104,20 @@ EOF
     grep -F "query: '$1'" "$TMP/srv.err" | tail -1 | sed 's/^/  /'
 }
 
-passes() { grep -E 'update: [0-9]+ dirs' "$TMP/srv.err" | tail -"$1" | sed 's/^/  /'; }
+# Every pass and every drain since the last mark(). `tail -2` was what this used to print,
+# and it hid the one that matters: the first pass to add a row after a load pays the name
+# intern table's lazy rebuild, so the phase's cost is in the pass you did not print.
+mark() { MARK=$(wc -l <"$TMP/srv.err"); }
+since() {
+    tail -n +$((MARK + 1)) "$TMP/srv.err" |
+        grep -E 'update: [0-9]+ dirs|drain:' | sed 's/^/  /'
+}
 
 hr "startup repair pass, then idle passes"
+mark
 sleep $((SECS * 3))
 grep 'startup repair pass' "$TMP/srv.err" | sed 's/^/  /'
-passes 3
+since
 
 # One range query, before anything is added. esidx_add pushes each new row into the three
 # numeric deltas (D3), so this line and the one after the churn are the measurement of
@@ -123,6 +131,10 @@ query 'size:>1mb'
 if [ "$ADD" -gt 0 ]; then
     hr "add $ADD files, and the pass that finds them"
     CHURN=1
+    # Marked *before* the files exist, not after: the ticks that fire while this loop is
+    # running are the ones that pick the files up, and the first of them is the pass that
+    # pays the name intern table's lazy rebuild after a load.
+    mark
     mkdir -p "$ROOT/.esidx-refresh-churn"
     # One file per iteration, and *not* a stride: a loop that steps i by more than 1
     # creates fewer files than it says, which is how a first version of this script
@@ -135,9 +147,8 @@ if [ "$ADD" -gt 0 ]; then
         i=$((i + 1))
     done
     ls "$ROOT/.esidx-refresh-churn" | wc -l | sed 's/^/  files created: /'
-    sleep $((SECS * 2))
-    passes 2
-    grep -E 'name rank rebuilt|children array rebuilt' "$TMP/srv.err" | tail -2 | sed 's/^/  /'
+    sleep $((SECS * 3))
+    since
 
     hr "the same range query, with those rows in the delta"
     query 'size:>1mb'
@@ -145,8 +156,9 @@ if [ "$ADD" -gt 0 ]; then
     hr "remove them again"
     rm -rf "$ROOT/.esidx-refresh-churn"
     CHURN=0
+    mark
     sleep $((SECS * 2))
-    passes 2
+    since
 fi
 
 hr "snapshot write: the clean-exit save"

@@ -163,11 +163,13 @@ pass that finds nothing writes nothing to any index.
 before the listener, then every SECS. The interval is a policy choice about
 staleness; what it costs is in [design §10](docs/design.md) and `./refresh.sh`
 measures it. An idle pass is 0.9 ms even over 5.5 M entries, because the walk
-stops at the first unchanged directory stamp — but a pass that *adds* rows pays an
-O(n log n) name-rank rebuild (1.41 s on `/work`), because a rank is a sorted
-position and a new name has nowhere to go until the order is recomputed.
-`--save=SECS` writes the snapshot on a timer and on a clean exit, and skips the
-write entirely when nothing changed.
+stops at the first unchanged directory stamp. A pass that *adds* rows used to pay
+two O(n) rebuilds — a name rank and a children array, neither of which can be
+appended to in the middle — which cost 2.38 s per pass on `/work` for any number of
+new files; both are now drained on a threshold, and the same measurement is
+**0.40 s**, of which 389 ms is the name-intern table's one-time rebuild on the first
+add after a load. `--save=SECS` writes the snapshot on a timer and on a clean exit,
+and skips the write entirely when nothing changed.
 
 ### Supported query language
 
@@ -436,7 +438,7 @@ Staying current costs this, measured on the same tree:
 | `update` | **0.1 ms** | 110 ms | one stat per directory whose parent changed |
 | `update --deep` | 4.23 s | 4.23 s | one stat per entry |
 | `serve --refresh=SECS`, idle | **0.2-0.9 ms** (`/work`: 5.5 M entries, 48 dirs skipped) | one getdents of the root's own listing | proportional to the root's fanout, not to the tree |
-| `serve --refresh=SECS`, adding ~2000 rows | — | **1.85 s** on `/work` (440 ms walk + 1413 ms name rank); 2.38 s before the children overlay | the name rank is 76 % of it, and neither is proportional to the 2000 |
+| `serve --refresh=SECS`, adding ~2000 rows | — | **0.40 s** on `/work` (389 ms one-time name-intern rebuild + 12 ms of work); 2.38 s before the two overlays | the O(n) rebuilds are drained on a threshold, not skipped |
 | `serve --save=SECS` | nothing written when nothing changed | 538-563 ms for a 313 MB snapshot | the whole file; no derived structure is persisted |
 
 A pass that finds nothing writes nothing to any index and does not move the index

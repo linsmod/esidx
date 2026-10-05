@@ -1668,13 +1668,21 @@ static void apply_filter(qctx_t *c, bitset_t *set)
  * `dn` is not a second copy where it can be a pointer into the first: for a name sort
  * it is `s`, and for a path sort it is the tail of `s` after the last separator. Only
  * the extension and numeric keys need a copy of their own -- and only when the rank is
- * missing, which is the fallback path rather than the ordinary one. */
+ * missing, which is the fallback path rather than the ordinary one.
+ *
+ * `nrank` is 64-bit because for a name the rank has not seen it holds a *composite* key
+ * (see name_key_placeholder), which is what keeps the comparator a pure integer compare
+ * while the drain is pending. A name sort sets `num` to the same value, so the primary
+ * compare and the tie-break agree by construction rather than by two rules agreeing. */
 typedef struct {
     eid_t       id;
-    uint32_t    nrank;
+    int64_t     nrank;
     int64_t     num;
     const char *s;
     const char *dn;
+    /* The rank has never seen this name: an entry added since the last drain. `s` holds
+     * its folded name until rank_pending() gives it a key. */
+    int         unranked;
 } srec_t;
 
 typedef struct {
@@ -1880,6 +1888,118 @@ static int cmp_folded(const char *a, const char *b)
 static bool sort_key_is_path(sort_key_t k)
 {
     return k == SORT_PATH || k == SORT_FILE_LIST_FILENAME;
+}
+
+/* ---------------------------------------------------------- ranks that are pending
+ *
+ * A rank is a sorted position, so a name the index has never seen has nowhere to go:
+ * esidx_build_name_rank() would renumber the whole table, and that is the O(n log n) the
+ * drain exists to defer. The alternative is to let those rows sort by a key computed on
+ * the fly, and the shape of that key is the whole design.
+ *
+ * **The comparator must not learn a second rule.** An earlier version of this idea had
+ * cmp_rec() fall back to a string compare when one side had no rank, which makes the
+ * comparator's answer depend on which of two rows happens to carry a rank -- and a
+ * comparator whose answer depends on the argument order is not a valid ordering, which
+ * qsort is entitled to answer with anything at all. (design §10 records the same class
+ * of bug in the tie-break.) So every row keeps an *integer* key and the fallback is
+ * arithmetic instead:
+ *
+ *   a ranked name r        (r << 32)
+ *   a new name, gap g      (g << 32) - t + i, for i in [0, t)
+ *
+ * where `g` is the number of distinct ranked names that sort before it (a binary search
+ * over the rank table, esidx_name_rank_gap) and `i` is its position in name order among
+ * the t new names sharing that gap. The gap's keys therefore land strictly between
+ * (g-1) << 32 and g << 32, which is exactly the interval between the two ranks the name
+ * belongs between, and i ascending in name order makes them ascend too. A new name that
+ * folds *equal* to a ranked one is a special case: the search finds that rank, and the
+ * key becomes (r << 32) exactly, so the two tie and fall through to the id -- the
+ * behaviour equal names have always had.
+ *
+ * The cost is one fold per pending row, one sort among the pending rows of this result
+ * set, and one binary search per *distinct* pending name: never anything per comparison.
+ * Rows whose name is ranked pay a shift.
+ */
+#define RANK_SHIFT 32
+
+static int cmp_pending(const void *pa, const void *pb, void *arg)
+{
+    (void)arg;
+    const srec_t *a = *(srec_t *const *)pa, *b = *(srec_t *const *)pb;
+    return cmp_folded(a->s, b->s);
+}
+
+/* Fill in `num` and `nrank` for the `n` rows marked unranked. `rows` is the whole result
+ * set, because a name sort's primary key lives in the same field. */
+static void rank_pending(const esidx_t *db, srec_t *rows, uint32_t total, uint32_t n)
+{
+    srec_t **pend = malloc((size_t)n * sizeof(*pend));
+    if (!pend) {
+        /* No keys means no order, and no order means the id tie-break alone: every row
+         * compares equal, which is still a valid (if arbitrary) order and, unlike a
+         * partial key, cannot make qsort misbehave. */
+        LOGW("sort: cannot allocate %u pending-rank slots; names added since the last "
+             "drain will order by id", n);
+        for (uint32_t i = 0; i < total; i++)
+            if (rows[i].unranked) { rows[i].num = 0; rows[i].nrank = 0; }
+        return;
+    }
+    uint32_t np = 0;
+    for (uint32_t i = 0; i < total; i++)
+        if (rows[i].unranked) pend[np++] = &rows[i];
+    if (np > 1) qsort_r(pend, np, sizeof(*pend), cmp_pending, NULL);
+
+    /* Walk the pending names in name order, grouping the ones that fold equal. `gap` is
+     * monotone in name order too, so the groups arrive already in gap order, and a group's
+     * index within its gap is the number of groups of that gap already placed -- which is
+     * what makes the keys ascend. */
+    uint32_t i = 0;
+    while (i < np) {
+        uint32_t j = i;
+        while (j + 1 < np && cmp_folded(pend[j]->s, pend[j + 1]->s) == 0) j++;
+
+        bool found = false;
+        uint32_t gap = esidx_name_rank_gap(db, pend[i]->s, &found);
+
+        /* How many groups of *this* gap come before this one and how many after; with this
+         * one they are the width the keys have to fit into. Both halves are needed, and a
+         * first version that counted only the ones after made the last group in a gap
+         * compute width == before, so its key landed exactly on the next rank and tied
+         * with it -- which the test caught as one file out of place among fifty. */
+        uint32_t before = 0, after = 0;
+        if (!found) {
+            for (uint32_t k = i; k > 0; k--) {
+                if (k - 1 != i && cmp_folded(pend[k - 1]->s, pend[k]->s) == 0) continue;
+                bool f2 = false;
+                if (esidx_name_rank_gap(db, pend[k - 1]->s, &f2) != gap) break;
+                before++;
+            }
+            for (uint32_t k = j + 1; k < np; k++) {
+                if (cmp_folded(pend[k - 1]->s, pend[k]->s) == 0) continue;
+                bool f2 = false;
+                if (esidx_name_rank_gap(db, pend[k]->s, &f2) != gap) break;
+                after++;
+            }
+        }
+
+        /* A name the rank already has takes no slot at all: it lands exactly on its rank,
+         * so a new entry whose name folds equal to an existing one ties with it and falls
+         * through to the id, which is what equal names have always done. */
+        int64_t key;
+        if (found) {
+            key = (int64_t)gap << RANK_SHIFT;
+        } else {
+            uint32_t width = before + 1 + after;
+            key = ((int64_t)gap << RANK_SHIFT) - (int64_t)(width - before);
+        }
+        for (uint32_t k = i; k <= j; k++) {
+            pend[k]->num = key;
+            pend[k]->nrank = key;
+        }
+        i = j + 1;
+    }
+    free(pend);
 }
 
 /* Multi-level chain: primary key, then name, then id. The id tiebreak is what
@@ -2103,13 +2223,25 @@ int qexec(const esidx_t *db, const ast_t *ast_in, const match_opts_t *mo,
     sc.tie_rank = (db->name_rank != NULL);
     uint64_t t_key0 = ts_us();
     uint32_t ri = 0;
+    uint32_t unranked = 0;
     for (uint32_t i = bs_next(&set, 0); i < c.n; i = bs_next(&set, i + 1)) {
         const char *name = display_name_of(db, i);
         rows[ri].id = i;
         rows[ri].s  = "";
         rows[ri].dn = "";
         rows[ri].nrank = sc.tie_rank ? esidx_name_rank(db, i) : 0;
-        rows[ri].num = sc.ranked ? (int64_t)rows[ri].nrank : sort_number(&sc, i);
+        if (sc.tie_rank && rows[ri].nrank == RANK_NONE) {
+            /* A name the rank has not seen: an entry added since the last drain. Its
+             * folded name goes in `s`, which is otherwise unused for a name sort, and
+             * the key is filled in below -- once per query, not once per comparison. */
+            rows[ri].s = fa_put_x(&fa, name, true);
+            rows[ri].unranked = 1;
+            unranked++;
+        } else {
+            rows[ri].unranked = 0;
+            rows[ri].nrank = sc.tie_rank ? ((int64_t)rows[ri].nrank << RANK_SHIFT) : 0;
+        }
+        rows[ri].num = sc.ranked ? rows[ri].nrank : sort_number(&sc, i);
         if (!sc.ranked) {
             if (key_is_path) {
                 /* A path gets its own exact-sized copy and nothing else: no arena, no
@@ -2135,6 +2267,7 @@ int qexec(const esidx_t *db, const ast_t *ast_in, const match_opts_t *mo,
         }
         ri++;
     }
+    if (unranked) rank_pending(db, rows, total, unranked);
     out->t_key_us = ts_us() - t_key0;
 
     if (total > 1) qsort_r(rows, total, sizeof(srec_t), cmp_plain, &sc);

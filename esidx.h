@@ -141,7 +141,7 @@ typedef struct {
      * The cost of the shape is that a directory's children cannot be appended to: a
      * shared array does not have room in the middle. So additions go to an *overlay* --
      * an append-only per-directory block, drained into this array by
-     * esidx_build_children() when it grows past ESIDX_CHILD_OVERLAY_DIV -- and
+     * esidx_build_children() when it grows past ESIDX_OVERLAY_DIV -- and
      * di_children() hands back both runs so no reader can see one without the other.
      * The same bargain esidx_build_name_rank() makes, and the threshold is a fraction of
      * the entry count for the same reason: both rebuilds are O(n), so the question is
@@ -504,6 +504,14 @@ typedef struct {
      * finalize: a name sort is an integer compare rather than a string one. */
     strpool_t     folded;
     uint32_t     *name_rank;  /* eid -> rank of its display name */
+    uint32_t      rk_n;       /* the entry count `name_rank` covers */
+    /* Live entries at or past rk_n: the names the rank has not seen. Counted rather than
+     * derived from et->count - rk_n, because that difference also counts the ids a
+     * reconcile spent on files that are already gone -- and on a directory that is created
+     * and emptied repeatedly, every one of those ids would push the count up until the
+     * rebuild ran on every pass, which is the cost the drain exists to remove. Two writers
+     * (esidx_add, kill_one), both already the two that maintain the epoch. */
+    uint32_t      rk_pending;
     uint32_t      n_ranks;    /* distinct folded names */
     uint32_t     *rk_off;     /* rank -> offset into `folded` */
     uint32_t     *rk_tab;     /* open addressing, value = rank + 1, 0 = empty */
@@ -623,14 +631,15 @@ static inline eid_t     di_child_at(children_t c, uint32_t i)
  * dropped. Called from esidx_finalize() (which covers a fresh build and a snapshot load)
  * and from esidx_drain() when the overlay has grown past its threshold. */
 int  esidx_build_children(esidx_t *db);
-/* How many additions may accumulate before that rebuild, as a fraction of the entry
- * count: a twelfth. The rebuild is O(n) and measured at 487 ms over 5.5 M entries, and
- * the overlay costs 4 bytes an id, so letting a twelfth of the index accumulate turns
- * 487 ms per pass into 487 ms per 456 000 additions -- while bounding the overlay at
- * 2.7 MiB there and at 1/12 of the CSR's own size everywhere. On a small index the
- * threshold is small too, which is why a 1 622-entry fixture still exercises both the
- * overlay path and the drain in one pass. */
-#define ESIDX_CHILD_OVERLAY_DIV 12u
+/* How many additions may accumulate before the O(n) rebuild that folds an overlay in, as
+ * a fraction of the entry count: a twelfth. Both rebuilds are O(n) -- measured at 497 ms
+ * and 1413 ms over 5.5 M entries -- and the overlay costs 4 bytes an id (children) or one
+ * fold plus one binary search per row in a result set (name ranks), so letting a twelfth
+ * of the index accumulate turns "once per pass" into "once per 456 000 additions" while
+ * bounding the children overlay at 2.7 MiB there and at 1/12 of the CSR's own size
+ * everywhere. On a small index the threshold is small too, which is why a 1 622-entry
+ * fixture still exercises both mechanisms in one pass. */
+#define ESIDX_OVERLAY_DIV 12u
 /* Drain whichever overlays are over their threshold. Called at the end of a reconcile
  * (scan.c), and the one place a future event-driven path will call after applying a
  * batch -- so "when do the O(n) rebuilds happen" has one answer. */
@@ -659,14 +668,28 @@ int      ext_index_del(ext_index_t *xi, uint16_t ext_id, eid_t id);
 
 /* Fold every live display name and rank it by sorted position. Called from
  * esidx_finalize(), so a snapshot load and a compaction both get it -- and from
- * esidx_update(), once per pass that actually added a name, because a rank is a
- * sorted position and a name the index has never seen has nowhere to go until the
- * order is recomputed. A pass that added nothing does not rebuild, so the idle cost
- * design §7 reports is unchanged. */
+ * esidx_drain(), when the ranks of names added since the last build have piled up past
+ * their threshold. A pass that added nothing does not rebuild, so the idle cost design §7
+ * reports is unchanged. */
 int      esidx_build_name_rank(esidx_t *db);
 void     esidx_free_name_rank(esidx_t *db);
-/* rank of an entry's display name; 0 when the column has not been built */
+/* Rank of an entry's folded display name, or RANK_NONE for an entry added since the last
+ * build -- the array is sized for the entry count that build saw, so this is also the
+ * bounds check: reading it against et->count instead is an out-of-bounds read, which is
+ * why `rk_n` exists rather than a comparison with the entry count. */
+#define RANK_NONE 0xFFFFFFFFu
 uint32_t esidx_name_rank(const esidx_t *db, eid_t id);
+/* Where a folded name belongs among the ranks the index already has: the number of
+ * distinct names that sort before it, which is the insertion point in the sorted
+ * `rk_off` table. `*found` comes back set when the name is *already* ranked, in which
+ * case the count is that name's rank -- a new entry whose name folds equal to an existing
+ * one has to tie with it, or the id tie-break stops being the thing that orders them.
+ *
+ * This is the whole of the answer to a name the rank has not seen: it is one binary
+ * search over a table that is already sorted, and the caller turns it into a sort key
+ * that needs no renumbering (query.c). O(log n_ranks) string compares, once per *distinct*
+ * new name in a result set, never once per comparison. */
+uint32_t esidx_name_rank_gap(const esidx_t *db, const char *folded, bool *found);
 
 /* -------------------------------------------------------- name trigram index */
 

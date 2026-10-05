@@ -519,16 +519,29 @@ Do not re-litigate these; they were measured and the conclusions are recorded:
   first unchanged directory stamp, so it is proportional to the *root's* fanout, not to the
   tree — and a snapshot write is **538-563 ms** for a 313 MB file, which is why `--save` is
   a separate coarse knob and is skipped entirely when the epoch has not moved. A pass that
-  adds rows costs **1.85 s**, of which **76 % is the name-rank rebuild** (1413 ms over
-  5.48 M rows) and none of it scales with the change: two runs of the same command added
-  1220 and 2001 rows and cost 2.38 s and 1.85 s. Removing stays cheap — 2001 tombstoned
-  ids cost 5-6 ms, because no name changed and the CSR swap-removes in place.
+  adds rows cost **2.38 s** and now costs **0.40 s**, the difference being two O(n)
+  rebuilds turned into thresholded drains; neither was proportional to the change (two
+  runs of the same command added 1220 and 2001 rows and cost 2.38 s both times). What is
+  left of it is 389 ms of name-intern table rebuild on the *first* add after a load — a
+  once-per-process cost, and now the largest single item on the path. Removing stays cheap:
+  2001 tombstoned ids cost 5-9 ms, because no name changed and the CSR swap-removes in
+  place.
 - **A structure that cannot be appended to in the middle costs O(n) per pass, and the fix
   is a threshold on a second structure rather than a cheaper rebuild.** The children array
   is a compressed sparse row, so an addition cannot go into it; it goes to an append-only
   overlay that `esidx_drain()` folds in once it passes **a twelfth of the entry count**
-  (497 ms per 456 000 additions on `/work`, instead of per pass). Three things about that
-  number, all of them measured or refuted rather than argued:
+  (497 ms per 456 000 additions on `/work`, instead of per pass). The name rank is the same
+  bargain for the same reason — a rank is a sorted position — and the fix has to be
+  different, because a new name cannot be ranked into the middle of the table either: it is
+  given `gap << 32` minus the width of the pending names sharing that gap, where `gap` is
+  one binary search over the sorted rank table (query.c, `rank_pending`). Four things about
+  that, all of them measured or refuted rather than argued:
+  - **A comparator that falls back to a string for the rows it has no rank for is not a
+    valid ordering.** Its answer would depend on which of two rows carries a rank, and
+    qsort is entitled to answer anything at all to that. So the fallback is *arithmetic*
+    and the comparator stays a pure integer compare — which is also why `srec_t.nrank`
+    widened to 64 bits, rather than the primary key and the tie-break growing two rules
+    that have to agree.
   - **A per-directory slack does not work, and the reason is the case that matters.** Slack
     at the end of each range keeps `di_children()` a single view and needs no overlay at
     all — but a directory created by a bulk copy is *empty*, so its slack is empty too, and
@@ -542,6 +555,18 @@ Do not re-litigate these; they were measured and the conclusions are recorded:
     `parent:` reads the two runs, the two are maintained by the same two functions, and
     test_etp.sh 11c asserts they agree at every step — which is the only assertion that
     notices a caller reading one run and missing the other.
+- **A derived structure can hold a wrong value that every current reader is indifferent
+  to, and that is not the same as being correct.** `rk_off` (rank → offset of its folded
+  name) was filled with `noff[newr[i]]` where `newr` is indexed by *old rank*, so the table
+  came out a permutation of the offsets — while `name_rank`, filled from `newr` separately,
+  came out **right**. Every name sort was correct, because the only two readers were
+  `rk_intern`'s probe and the intern rebuild, and neither requires the table to be
+  *sorted*. `esidx_name_rank_gap()` is a binary search and the first reader that does, so
+  the bug became reachable the moment the on-the-fly keys needed an insertion point, and
+  test_etp.sh 11c's order assertion found it in one run. Two rules: a new reader of a
+  derived structure is a new *test* of the invariant that structure documents; and when
+  adding one, check what the old readers actually required rather than what the comment
+  claims.
 - **A promise in a header is not an implementation, and the process that runs daily can be
   why the gap stays invisible.** Three defects survived 337 index assertions and 217
   protocol ones because the only caller of the mutation path was `esidx update`, which

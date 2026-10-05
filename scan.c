@@ -659,32 +659,24 @@ int esidx_update(esidx_t *db, const char *root, unsigned flags, update_stats_t *
 
     update_merge(db);
 
-    /* The name rank is sorted position, so a name the index has never seen has
-     * nowhere to go until the order is recomputed (design §10). Doing that per added
-     * name would be O(n) renumbering each time; doing it once per pass that actually
-     * added something is one O(n log n) against a walk that already stat-ed every
-     * directory it descended. A pass that added nothing -- the idle case, 0.1 ms on
-     * an unchanged /usr -- does not pay it at all, which is the number design §7
-     * reports, so the rebuild is gated on `added` rather than run unconditionally. */
-    if (st->added && db->name_rank) {
-        uint64_t r0 = ts_us();
-        if (esidx_build_name_rank(db) == 0)
-            LOGD("update: name rank rebuilt over %u entries in %.3f ms",
-                 db->et.count, ts_ms_since(r0));
-        else
-            LOGW("update: name rank rebuild failed; a name sort will fall back to "
-                 "comparing folded names");
-    }
-
-    /* The children, for the same reason and behind the same gate. An addition cannot go
-     * into the flat array in the middle, so di_add_child() put it in the overlay, and
-     * without either of the two halves of this the in-memory index would answer
-     * `parent:` without the rows this pass just added. Every assertion in the suite would
-     * still pass, because each one reads the snapshot this pass writes and the load
-     * rebuilds the array: the same blindness design §3.4 records for the aggregate
-     * column. What is *not* done per pass any more is the O(n) rebuild -- esidx_drain()
-     * does it only once the overlay has grown past its threshold, which is the whole
-     * point of the overlay (design §7 "In place", §10). */
+    /* Both O(n) rebuilds -- the name rank and the children array -- are the drain's, and
+     * neither runs per pass any more.
+     *
+     * The rank is sorted position, so a name the index has never seen has nowhere to go
+     * until the order is recomputed, and recomputing costs O(n log n): measured at 1413 ms
+     * over 5.48 M rows on /work, against 1-3 us of one binary search for the name that a
+     * query would otherwise do. Doing that per pass made every pass that added a single
+     * file cost more than the whole walk. Instead the entries past the rank's extent keep
+     * a key computed on the fly (query.c, rank_pending) and esidx_drain() recomputes the
+     * order once a twelfth of the index has accumulated -- 1413 ms per 456 000 names
+     * instead of per pass.
+     *
+     * The children are the same bargain for the same reason: an addition cannot go into
+     * the flat array in the middle, so di_add_child() put it in the overlay, and without
+     * either half of that the in-memory index would answer `parent:` without the rows this
+     * pass just added. Every assertion in the index suite would still pass, because each
+     * one reads the snapshot this pass writes and the load rebuilds the array: the same
+     * blindness design §3.4 records for the aggregate column. */
     esidx_drain(db);
 
     /* Tombstones are not reclaimed in place (design §11 D8), so a tree that is

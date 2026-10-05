@@ -921,50 +921,60 @@ vDSO ones). A refresh interval has to be shorter than the pass it is waiting for
 these are the numbers that decide it, and they do not scale the way the table above
 suggests: the walk is pulled from the root and stops at the first unchanged stamp.
 
-| Tree | Entries | Startup repair | Idle pass | Pass that adds ~2000 rows | Snapshot write |
+| Tree | Entries | Startup repair | Idle pass | Passes that add ~2000 rows | Snapshot write |
 |---|---|---|---|---|---|
 | `/usr` | 372 084 | 0.2 ms | **0.2-0.5 ms** — 16 dirs, all skipped but the root | not run (no writable tree on this host) | *nothing written*: the epoch never moved |
-| `/work` | 5 476 485 | 0.5 ms | **0.4-0.9 ms** — 48 dirs skipped, the root's 74 entries listed | **1.85 s** = 440 ms walk + **1413 ms name rank** | 538-541 ms for a 313 MB file |
+| `/work` | 5 476 485 | 0.5 ms | **0.4-1.1 ms** — 48 dirs skipped, the root's 74 entries listed | **0.40 s** in three passes (see below) | 538-549 ms for a 313 MB file |
 
-Before the children overlay (§7 "In place") the same command on the same tree cost
-**2.38 s** = 414 ms walk + **1469 ms name rank** + **497 ms children array** — the
-drain is what the overlay removed, and the walk and the rank are untouched by it.
+What the adding passes cost, same tree, same command, three builds of this tree — which is
+the whole argument for the two overlays, in one table:
 
+| | before the overlays | children overlay (P3a) | both overlays (P3b) |
+|---|---|---|---|
+| adding ~2000 rows, `/work` | **2.38 s** = 414 ms walk + 1469 ms name rank + 497 ms children array | **1.85 s** = 440 ms walk + 1413 ms name rank | **0.40 s** = 389 ms one-time name-intern rebuild + 12 ms of actual work |
+
+- **Both O(n) rebuilds are now amortised rather than removed**, and the three builds say
+  what each was worth: the children array 497 ms per pass, the name rank 1413 ms per pass.
+  Neither is proportional to the change — two runs of the same command added 1220 and 2001
+  rows and cost 2.38 s and 1.85 s — which is the flatness stated as a measurement rather
+  than as an argument. After them, the 2001 rows cost **12 ms** and the pass that first
+  adds a row after a load costs 389 ms for a reason that has nothing to do with either
+  rebuild: the name intern table is rebuilt lazily on the first add, over 1 499 995 distinct
+  names, so a serve-only process never pays for it and a refreshing one pays it once per
+  process. **That is now the largest single item on the refresh path**, and the next thing
+  worth measuring rather than the next thing worth building.
 - **An idle refresh is free at any interval, on any tree measured.** 0.9 ms over 5.5 M
   entries, because 48 of the 49 directories were skipped on their stamp and the one
   that was walked is the root's own listing. It is proportional to the *root's
   fanout*, not to the tree — which is the cheapest possible answer and the reason the
   repair pass can run unconditionally at startup.
-- **A refresh that *adds* rows is not, and that is the interval that matters.** Of the
-  1.85 s that remains, **76 % is the name-rank rebuild** — 1413 ms over 5.48 M rows, and
-  none of it proportional to the 2000. (Two runs of the same command added 1220 and
-  2001 rows and cost 2.38 s and 1.85 s respectively, which is the flatness stated as a
-  measurement rather than as an argument.) So on an add-heavy tree a serving refresh
-  needs an interval longer than that pass, or the process does nothing else but
-  rebuild. That is the cost of a rank being a sorted position, and it is the whole
-  argument for making it drainable too.
-- **The children half of that is now amortised rather than removed**, and the shape of
-  the argument is worth keeping: an addition cannot be appended to a shared array in
-  the middle, so it goes to an append-only overlay and `esidx_drain()` folds the
-  overlay in once it passes a *twelfth of the entry count*. That is 497 ms per 456 000
-  additions instead of 497 ms per pass, and it bounds the overlay at 2.7 MiB here.
-  A fixed per-directory slack would have been simpler and does not work: a directory
-  created by a bulk copy is empty, so its slack is empty too, and the measured case
-  (2000 files into one new directory) blew through any slack and paid the rebuild
-  anyway.
+- **A name the rank has not seen is placed between its two neighbours by arithmetic, not
+  by renumbering.** One binary search over the sorted rank table says how many distinct
+  names sort before it; the key is then `gap << 32` minus the width of the pending names
+  sharing that gap, so a name sort stays a pure integer comparison (query.c, `rank_pending`).
+  The alternative — have the comparator fall back to a string when one side has no rank —
+  was not written, because a comparator whose answer depends on which row carries a rank
+  is not a valid ordering and `qsort` is entitled to answer anything to one (design §10
+  records the same class of bug in the tie-break).
+- **The children half is an append-only overlay** that `esidx_drain()` folds into the
+  array once it passes a *twelfth of the entry count*: 497 ms per 456 000 additions
+  instead of per pass, bounding the overlay at 2.7 MiB here. A fixed per-directory slack
+  would have been simpler and does not work — a directory created by a bulk copy is
+  empty, so its slack is empty too, and the measured case (2000 files into one new
+  directory) blew through any slack and paid the rebuild anyway.
 - **Removing is cheap and adding is expensive**, which is the asymmetry to design
-  around: the pass that tombstoned 2001 ids cost 5-6 ms, because a removal needs
+  around: the pass that tombstoned 2001 ids cost 5-9 ms, because a removal needs
   neither the rank nor the children array — the rank does not change when no name
   changes, and the CSR swap-removes in place.
 - **The delta a new row now writes costs a range query nothing measurable at this
-  size.** `size:>1mb` over `/work` evaluated in 1.77 ms with an empty delta and
-  0.89 ms with 2000 added rows in each of the three arrays — and the second number
-  being *lower* is the point: the difference is noise (the sort on those two runs was
-  13.7 ms and 7.2 ms). `sidx_range_to_bitset()` walks the delta in append order, so
-  the cost is linear in it, and D3's 1 % rule bounds the delta at 54 762 rows per
-  array on this tree. That bound is *not* measured, and it is the number to watch if
-  the interval gets short.
-- **A snapshot write is 538-563 ms here**, which is why `--save` is a separate knob
+  size.** `size:>1mb` over `/work` evaluated in 1.72 ms with an empty delta and
+  1.25-1.78 ms with 2000 added rows in each of the three arrays — the same spread as the
+  two runs with an empty delta, which is the point: it is noise (the sort on those runs
+  was 12.7-14.5 ms). `sidx_range_to_bitset()` walks the delta in append order, so the
+  cost is linear in it, and D3's 1 % rule bounds the delta at 54 762 rows per array on
+  this tree. That bound is *not* measured, and it is the number to watch if the interval
+  gets short.
+- **A snapshot write is 538-549 ms here**, which is why `--save` is a separate knob
   from the refresh interval and not "every refresh": on this tree that is half a
   second in which the loop answers nobody. It is also skipped entirely when the epoch
   has not moved, so an idle server writes nothing at all.
