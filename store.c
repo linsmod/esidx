@@ -2019,9 +2019,23 @@ static void mem_row(const char *phase, const char *what, uint64_t touched,
                     uint64_t address, uint64_t *total)
 {
     if (total) *total += touched;
-    LOGI("%s: mem %-22s %8.1f MiB touched %8.1f MiB addr  (%3.0f%%)",
-         phase, what, (double)touched / 1048576.0, (double)address / 1048576.0,
-         address ? 100.0 * (double)touched / (double)address : 0.0);
+    /* The bytes are here as well as the MiB because the MiB is rounded to a tenth and
+     * the total has to be checkable: "the accounted total is the sum of the rows" is an
+     * assertion test.sh makes, and at one decimal it is only true on a tree big enough
+     * for the rounding to cancel. One decimal is for reading; twelve digits are for
+     * adding.
+     *
+     * A row whose `total` is NULL is *not* part of the accounted figure, and says so in
+     * the percentage column rather than being indistinguishable from a counted row --
+     * which is how 56.6 MiB of directory paths came to be printed on a line that claimed
+     * they were counted elsewhere. `(--)` also gives the test something to select on. */
+    char pct[8];
+    if (total) snprintf(pct, sizeof(pct), "%3.0f%%",
+                        address ? 100.0 * (double)touched / (double)address : 0.0);
+    else        snprintf(pct, sizeof(pct), "%3s", "--");
+    LOGI("%s: mem %-22s %8.1f MiB touched %8.1f MiB addr  (%s)  %llu/%llu B",
+         phase, what, (double)touched / 1048576.0, (double)address / 1048576.0, pct,
+         (unsigned long long)touched, (unsigned long long)address);
 }
 
 /* ------------------------------------------------ the trigram lists' shape
@@ -2217,31 +2231,28 @@ void esidx_log_mem(const esidx_t *db, const char *phase)
     }
     if (db->di.ht_off) {
         uint64_t slots = (uint64_t)db->di.ht_mask + 1;
-        /* Every occupied slot holds an offset into the name pool and the string
-         * there is the directory's whole path -- a second copy of something the
-         * parent chain already rebuilds. Counted exactly, by walking the strings
-         * the table points at, because "how much does the dir tree cost twice" is
-         * not a number worth estimating. It is part of the names pool above, so it
-         * does not go in the total.
-         *
-         * HT_TOMB is a *slot* marker, not an offset: a reconcile's removal leaves it
-         * behind (di_hash_erase, and why it does), and reading the pool at
-         * 0xFFFFFFFF is what the first version of this row did. The sanitiser
-         * build caught it and the incremental suite is what surfaced it -- the
-         * update that hit a tombstone died, the snapshot was never rewritten, and
-         * every assertion after it was a stale index. */
-        uint64_t stored = 0;
-        for (uint64_t s = 0; s < slots; s++)
-            if (db->di.ht_off[s] && db->di.ht_off[s] != HT_TOMB)
-                stored += strlen(sp_get(&db->dpaths, db->di.ht_off[s] - 1)) + 1;
-        /* calloc: only the occupied slots are ever written, so the rest is address
-         * space and not memory -- until something runs under a ulimit -v. */
         mem_row(phase, "dir path hash table", (uint64_t)db->di.ht_count * 8,
                 slots * 8, &total);
-        mem_row(phase, "dir paths copied to pool", stored, stored, NULL);
-        LOGI("%s: mem dir hash load %.2f of %.0f slots for %u dirs",
-             phase, (double)db->di.ht_count / (double)slots, (double)slots,
-             db->di.ht_count);
+        /* The hash's keys: one full path per directory, in `dpaths`. This row used to
+         * carry the reason "it is part of the names pool above", which stopped being
+         * true the moment the dir hash was given a pool of its own -- and so 56.6 MiB of
+         * resident memory on /work quietly stopped being counted anywhere, while still
+         * being printed on a line that said it was counted. The figure is the pool's own
+         * length rather than the sum of the strings the slots point at, because that is
+         * what the process holds: a removed directory's string stays in the pool and only
+         * the slot is marked HT_TOMB (di_hash_erase, and why the marker exists), so the
+         * two differ on any index that has seen a removal and the larger one is the
+         * honest number.
+         *
+         * calloc: only the occupied slots are ever written, so the tail of the address
+         * column is address space and not memory -- until something runs under a
+         * ulimit -v. */
+        mem_row(phase, "dir paths pool", db->dpaths.len, db->dpaths.cap, &total);
+        LOGI("%s: mem dir hash load %.2f of %.0f slots for %u dirs, %llu bytes of paths "
+             "in the pool (%.0f a directory)", phase,
+             (double)db->di.ht_count / (double)slots, (double)slots,
+             db->di.ht_count, (unsigned long long)db->dpaths.len,
+             db->di.ht_count ? (double)db->dpaths.len / (double)db->di.ht_count : 0.0);
     }
 
     /* Two arrays of {int64} and {eid_t}: 12 bytes a row with no padding, and the array
@@ -2327,8 +2338,8 @@ void esidx_log_mem(const esidx_t *db, const char *phase)
         mem_row(phase, "type bitmaps", b, b, &total);
     }
 
-    LOGI("%s: mem %-22s %8.1f MiB accounted", phase, "TOTAL",
-         (double)total / 1048576.0);
+    LOGI("%s: mem %-22s %8.1f MiB accounted  (%llu B)", phase, "TOTAL",
+         (double)total / 1048576.0, (unsigned long long)total);
     uint64_t hwm = vm_hwm_kb() * 1024u;
     if (hwm)
         LOGI("%s: mem peak rss %.1f MiB -- the difference is the allocator's own "

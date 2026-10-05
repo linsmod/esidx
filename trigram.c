@@ -336,7 +336,18 @@ bool tri_index_filter(const tri_index_t *ti, const char *lit, bitset_t *out)
 
     /* Any one trigram of the literal is a necessary condition, so the shortest
      * posting list is both the smallest answer and the cheapest to walk -- which
-     * is why this picks one rather than intersecting them all. */
+     * is why this picks one rather than intersecting them all.
+     *
+     * The `n == 0` branch below is a narrowing all the way to zero, and it is only
+     * sound because *every* trigram a name can produce is indexed here. That is why a
+     * "stop list" -- do not index the trigrams whose lists are so long that filtering on
+     * them is nearly useless, 20 % of the volume on /work in 142 keys -- is not a
+     * threshold away: it would make this branch answer zero rows for every pattern
+     * containing a stopped trigram, which is the one failure this codebase keeps calling
+     * the worst. Doing it needs the index to distinguish "no name has this trigram" from
+     * "this trigram was stopped" -- a small key set beside the table -- and the filter to
+     * skip the stopped ones instead of narrowing on them. Recorded here because the
+     * reasoning is invisible from the threshold and load-bearing from the code. */
     const tri_list_t *best = NULL;
     for (size_t i = 0; i + 3 <= len; i++) {
         int slot = tri_find(ti, tri_key(lit, i));

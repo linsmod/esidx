@@ -1414,6 +1414,19 @@ TRI_SHAPE=$(sed -n 's/.*mem trigram shape: \([0-9]*\) lists, \([0-9]*\) postings
 expect "the ledger recounts the trigram lists the build filled" \
     "$TRI_SHAPE" "$TRI_BUILT"
 
+# The ledger's own total has to be the sum of the rows above it, or "the index accounts
+# for N MiB" means nothing. This is not a formality: the dir paths pool (56.6 MiB on /work)
+# sat on a row that said "part of the names pool, so not in the total", which stopped being
+# true when the pool was split out of `names` -- and 56.6 MiB of resident memory stopped
+# being counted while still being printed.
+"$BIN" -v 3 build "$TREE" -o "$TMP/ledger.idx" >/dev/null 2>"$TMP/err"
+cat "$TMP/err" >>"$DIAG"
+LEDGER_TOTAL=$(sed -n 's/.*mem TOTAL *[0-9.]* MiB accounted  (\([0-9]*\) B).*/\1/p' "$TMP/err" | head -1)
+LEDGER_ROWS=$(sed -n 's/.*: mem [a-z0-9 >-]* *[0-9.]* MiB touched *[0-9.]* MiB addr *(\([ 0-9]*%\)) *\([0-9]*\)\/[0-9]* B$/\2/p' "$TMP/err" \
+              | awk '{t += $1} END {printf "%d", t}')
+expect "the accounted total is the sum of the rows that feed it" \
+    "${LEDGER_TOTAL:-0}" "${LEDGER_ROWS:-x}"
+
 # --------------------------------------------------------------- logging
 
 say "instrumentation"

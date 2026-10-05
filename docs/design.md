@@ -1218,6 +1218,17 @@ Six things it says that no document recorded, and what has been done about each:
   whole set — 318.6 MiB would become ~102 MiB**, at the cost of decoding every posting
   the prefilter reads. That is the larger prize and it is on the query path, so it is not
   a decision this paragraph makes; it is the decision the next one has to measure.
+
+  **And the stop list is not a threshold away, which reading the code settles.**
+  `tri_index_filter()` treats "this literal's trigram has no posting list" as a narrowing
+  all the way to zero (`trigram.c:331`), and that is sound only because *every* trigram a
+  name can produce is indexed. Stopping one would make the branch answer **zero rows** for
+  every pattern containing it — the failure this codebase keeps calling the worst — so
+  §5.2's "a filter may be dropped, never required" does not hold here as written. It needs
+  the index to tell "no name has this trigram" from "this trigram was stopped" (a small
+  key set beside the table) and the filter to skip the stopped ones rather than narrow on
+  them. The measurement says the prize is 63.7 MiB; the code says the price is a semantic
+  change to the one place where a wrong answer is invisible.
 - **`di.child` was indexed by entry id.** 651 897 of 8 388 608 slots were a directory's, and the
   growth path memsets every new range, so all 128 MiB was resident. It is indexed by a dense
   **directory ordinal** now, with an open-addressed eid → ordinal map (6.4 MiB) beside it:
@@ -1276,7 +1287,19 @@ Where the ledger stands after the commits that acted on it, `/work` again:
 | dir children vectors | 39.4 | 39.4 | 5 476 484 ids in 10 324 800 slots |
 | eid → dir ordinal map | 6.4 | 6.4 | 2 097 152 slots for 630 472 directories |
 | dir path hash | 5.0 | 16.0 | load factor 0.31 |
-| **total** | **975.9** | 1 515 | **peak rss 1 114.1**, was 1 418.4 at the first ledger |
+| dir paths pool | 56.6 | 64.0 | 651 897 whole paths, 91 bytes a directory |
+| **total** | **1 032.5** | 1 579 | **peak rss 1 114.1**, was 1 418.4 at the first ledger |
+
+The `dir paths pool` row is new and the total moved with it, which is the point: the row was
+already being printed, carrying the reason "it is part of the names pool above, so it does
+not go in the total" — a reason that stopped being true when the dir hash was given a pool
+of its own. **56.6 MiB of resident memory was being displayed on a line that said it was
+counted somewhere else, and was counted nowhere.** Every "the index accounts for N MiB"
+figure before this one is therefore 56.6 MiB short of the truth; peak rss was always right,
+because peak rss is measured rather than summed. `test.sh` now asserts that the total is
+the sum of the rows that feed it, in exact bytes, which is checkable because the rows print
+bytes as well as MiB — and a row that is *not* in the total says `(--)` in its percentage
+column instead of being indistinguishable from one that is.
 
 ---
 

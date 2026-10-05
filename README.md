@@ -300,7 +300,8 @@ building); the only lever left on that walk is D6's concurrency.
 each — and it is the only way to tell a structure that is too big from one that is merely
 sized by the wrong number. `./ledger.sh <tree>` prints it together with the snapshot size
 and the query shapes, so a figure quoted from it can be re-measured with one command. On
-`/work` (1 114 MiB peak, 976 MiB accounted):
+`/work` (1 114 MiB peak, **1 033 MiB accounted** — the total includes the 56.6 MiB of
+directory paths the ledger spent two commits displaying without counting):
 
 | | touched | address | |
 |---|---|---|---|
@@ -315,6 +316,7 @@ and the query shapes, so a figure quoted from it can be re-measured with one com
 | dir children vectors | 39.4 | 39.4 | 5 476 484 ids in 10 324 800 slots |
 | ext index | 15.1 | 11.5 | 16 384 slots for 6 765 extensions |
 | dir path hash | 5.0 | 16.0 | load factor 0.31 |
+| dir paths pool | 56.6 | 64.0 | 651 897 whole paths, 91 bytes a directory |
 
 What is left, largest first: the children vectors are at 53 % occupancy, 56.6 MiB of
 directory paths sit in a pool at all when the parent chain already rebuilds them, and the
