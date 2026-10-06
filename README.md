@@ -69,6 +69,42 @@ event source (`--watch`), its pointer is committed in the tree, and the build st
 line if `sfa/sfa.h` is missing rather than handing back a server that has no watcher and
 does not say so. `make clean` still works without it — nothing that compiles needs it.
 
+### Deploying somewhere else
+
+```sh
+make dist            # dist/esidx-<version>.tar.gz + .sha256
+make dist-verify     # unpack it elsewhere, check it against both commits, build, run the suite
+```
+
+`make dist` is the whole deployment in one file: esidx's sources, the **sfa submodule's
+sources** (which a gitlink cannot carry — that is the reason the target exists), and
+`install.sh`. Two properties it holds that a hand-rolled package does not:
+
+- **The file list and the modes come from the two commits**, not from the build tree. This
+  project is developed on a 9p/v9fs mount where `chmod` is a no-op and every file looks like
+  `0777`, so a `cp`-based package would ship executable documentation and a non-executable
+  `install.sh`. Both happened here before the modes were taken from git.
+- **`make dist-verify` proves the package rather than trusting it**: it unpacks somewhere
+  else, diffs the contents and every mode against `git ls-files -s`, builds it, and runs the
+  watcher suite from the unpacked tree. It checks the suite's exit status instead of
+  tailing its output, which is not a detail — the first version of it printed "passes" over a
+  suite that had died with `Permission denied`.
+
+On the target:
+
+```sh
+tar xzf esidx-<version>.tar.gz && cd esidx-<version>
+./install.sh --start --root /work              # build, install, and run both halves
+./install.sh --start --root /work --prefix ~/.local    # same, no root for the install
+./install.sh --stop
+```
+
+`install.sh` handles the three things that made doing it by hand annoying: the submodule is
+already inside the package, the proxy's socket is chgrp'ed to a group you name (`--group`,
+default: your own) so the *unprivileged* index server can connect to the *privileged* proxy,
+and it refuses to continue rather than half-installing. Without `--start` it installs and
+prints the three commands. Logs land in `--logdir` (default `/tmp/esidx-logs`).
+
 One `make` leaves the tree ready for everything, and it always builds both
 flavours: the gate needs both, and a selector that could point it at one of them
 is how it used to go wrong — the two shared object names, so switching meant

@@ -121,6 +121,13 @@ sfa/libsfa.o: $(SFA_LIB) $(SFA_H)
 sfa/libsfa.dbg.o: $(SFA_LIB) $(SFA_H)
 	$(CC) $(DBG_CFLAGS) -Wno-builtin-macro-redefined -U_GNU_SOURCE -c $< -o $@
 
+# The Makefile is a prerequisite of every object, because a change to it is a change to how
+# the code is compiled -- a new flag, a different -D, a source added to $(OBJS). Without
+# this, `make` leaves a binary that was built by rules that no longer exist, and the only
+# symptom is the suites' mtime guard refusing to measure it ("build did not run or did not
+# finish"), which is true and much less obvious than a rebuild.
+$(OBJS) $(DBG_OBJS) sfa/libsfa.o sfa/libsfa.dbg.o: Makefile
+
 # The gate, in the order AGENTS.md 3.1 asks for: the index suite before the protocol one,
 # so a parse regression is not read as a protocol fault, and both builds of each.
 check: all
@@ -167,10 +174,124 @@ install: esidx
 uninstall:
 	rm -f "$(DESTDIR)$(BINDIR)/esidx"
 
+# ---------------------------------------------------------------- deployment package
+#
+# One tarball that is the whole deployment: esidx's sources, the sfa submodule's sources,
+# and install.sh. The submodule is the reason this target exists rather than a `tar czf` --
+# a gitlink is not a directory as far as tar is concerned, and `tar czf x.tar.gz sfa/`
+# either follows into .git or fails, which is what a hand-rolled deployment package does.
+# It is also the only way to ship the *suites* with the thing: a binary-only tarball cannot
+# be re-verified on the machine it lands on, and "it builds on its own" is the only
+# practical test that a package is self-contained (README, Independence).
+#
+# The file list comes from `git ls-files` on both repositories rather than from a wildcard,
+# for two reasons that are one reason: a wildcard would pick up build artefacts and the
+# untracked, and a package's contents must be exactly what the commit says. An empty
+# sfa/ is a hard error above, so the list cannot come out half-empty here.
+GIT       ?= git
+REVISION  := $(shell $(GIT) rev-parse --short=12 HEAD 2>/dev/null)
+DESCRIBE  := $(shell $(GIT) describe --tags --always 2>/dev/null)
+# `git status --porcelain` rather than `describe --dirty`: the latter compares tracked
+# files only, so untracked ones (install.sh before it is committed, docs/todo.md always)
+# would change the package without changing the version string.
+DIRTY     := $(shell test -z "$$($(GIT) status --porcelain 2>/dev/null)" || echo -dirty)
+VERSION   := $(if $(DESCRIBE),$(DESCRIBE),$(REVISION))$(DIRTY)
+MTIME     := $(shell $(GIT) show -s --format=%ct HEAD 2>/dev/null || echo 0)
+
+DISTDIR   := dist
+PKGNAME   := esidx-$(VERSION)
+# Staged outside the build tree on purpose: the build tree may be on a 9p/v9fs mount,
+# where chmod is a no-op, and then every file in the package lands as 0777 -- sources and
+# documentation included. The mode a file gets in the package has to come from git, and the
+# only way to apply it is on a filesystem that lets us.
+STAGE     := /tmp/.esidx-stage-$(PKGNAME)
+PKG       := $(DISTDIR)/$(PKGNAME).tar.gz
+
+dist: require-sfa
+	@mkdir -p "$(DISTDIR)"
+	@$(GIT) ls-files -s | grep -v '	sfa$$' > "$(DISTDIR)/.esidx-files"
+	@$(GIT) -C sfa ls-files -s > "$(DISTDIR)/.sfa-files"
+	@rm -rf "$(STAGE)"
+	@mkdir -p "$(STAGE)/$(PKGNAME)"
+	@# mode, hash, stage, path -> the mode is git's, not the staging filesystem's. Copying
+	@# with cp would carry whatever the build tree happens to say, and on a 9p/v9fs mount
+	@# (this project is developed on one) that is 0777 for every file in the package,
+	@# sources and documentation included. A package's contents are what the commit says.
+	@while read -r mode _ _ f; do \
+	    mkdir -p "$(STAGE)/$(PKGNAME)/$$(dirname "$$f")"; \
+	    cp "$$f" "$(STAGE)/$(PKGNAME)/$$f"; \
+	    chmod 0755 "$(STAGE)/$(PKGNAME)/$$f" 2>/dev/null || true; \
+	    [ "$$mode" = 100644 ] && chmod 0644 "$(STAGE)/$(PKGNAME)/$$f"; \
+	done < "$(DISTDIR)/.esidx-files"
+	@while read -r mode _ _ f; do \
+	    mkdir -p "$(STAGE)/$(PKGNAME)/sfa/$$(dirname "$$f")"; \
+	    cp "sfa/$$f" "$(STAGE)/$(PKGNAME)/sfa/$$f"; \
+	    chmod 0755 "$(STAGE)/$(PKGNAME)/sfa/$$f" 2>/dev/null || true; \
+	    [ "$$mode" = 100644 ] && chmod 0644 "$(STAGE)/$(PKGNAME)/sfa/$$f"; \
+	done < "$(DISTDIR)/.sfa-files"
+	@printf '%s\n' '$(VERSION)' > "$(STAGE)/$(PKGNAME)/VERSION"
+	@printf '%s\n' 'esidx $(REVISION) + sfa $$($(GIT) -C sfa rev-parse --short=12 HEAD 2>/dev/null)' \
+	    > "$(STAGE)/$(PKGNAME)/VERSION-SOURCES"
+	@chmod 0644 "$(STAGE)/$(PKGNAME)/VERSION" "$(STAGE)/$(PKGNAME)/VERSION-SOURCES"
+	@tar --sort=name --owner=0 --group=0 --numeric-owner --mtime='@$(MTIME)' \
+	     -C "$(STAGE)" -czf "$(PKG)" "$(PKGNAME)"
+	@rm -rf "$(STAGE)" "$(DISTDIR)/.esidx-files" "$(DISTDIR)/.sfa-files"
+	@echo "package : $(PKG)"
+	@echo "version : $(VERSION)"
+	@echo "files   : $$(tar -tzf "$(PKG)" | grep -vc '/$$')"
+	@cd "$(DISTDIR)" && sha256sum "$(PKGNAME).tar.gz" > "$(PKGNAME).tar.gz.sha256" && \
+	    cat "$(PKGNAME).tar.gz.sha256"
+
+# Prove the package is self-contained by unpacking it somewhere else and building it there,
+# and that it is *faithful*: the file list and the modes have to be what the two commits say,
+# because the two ways this can go wrong are both invisible in a tarball that merely opens.
+# A file missing from the package fails when somebody unpacks it on another machine; a file
+# with the wrong mode fails more quietly, as an executable documentation file or a
+# non-executable install.sh.
+dist-verify: dist
+	@rm -rf "$(STAGE)" && mkdir -p "$(STAGE)"
+	@tar -xzf "$(PKG)" -C "$(STAGE)"
+	@echo "== contents: the package against the two commits"
+	@cd "$(STAGE)/$(PKGNAME)" && { \
+	    { $(GIT) -C "$(CURDIR)" ls-files | grep -v '^sfa$$'; \
+	      $(GIT) -C "$(CURDIR)/sfa" ls-files | sed 's|^|sfa/|'; \
+	      printf 'VERSION\nVERSION-SOURCES\n'; } | LC_ALL=C sort > /tmp/.dv-want; \
+	    find . -type f | sed 's|^\./||' | LC_ALL=C sort > /tmp/.dv-have; \
+	    if diff -u /tmp/.dv-want /tmp/.dv-have; then \
+	        echo "   file list matches ($$(wc -l < /tmp/.dv-have) files)"; \
+	    else echo "   FILE LIST DIFFERS"; exit 1; fi; }
+	@echo "== modes: nothing executable that git says is not, nothing missing that it says is"
+	@cd "$(STAGE)/$(PKGNAME)" && $(GIT) -C "$(CURDIR)" ls-files -s \
+	    | grep -v '	sfa$$' > /tmp/.dv-modes && \
+	    $(GIT) -C "$(CURDIR)/sfa" ls-files -s | sed 's|^|sfa/|' >> /tmp/.dv-modes && \
+	    bad=0; \
+	    while read -r mode _ _ f; do \
+	        case "$$mode" in 100644) want=644 ;; 100755) want=755 ;; *) want="" ;; esac; \
+	        [ -n "$$want" ] || continue; \
+	        have=$$(stat -c %a "$$f" 2>/dev/null || echo missing); \
+	        if [ "$$have" != "$$want" ]; then \
+	            echo "   mode $$f: want $$want have $$have"; bad=1; \
+	        fi; \
+	    done < /tmp/.dv-modes; \
+	    [ "$$bad" = 0 ] && echo "   every mode matches" || { echo "   MODES DIFFER"; exit 1; }
+	@echo "== building the unpacked package"
+	@$(MAKE) -C "$(STAGE)/$(PKGNAME)" -j4 >/dev/null && \
+	    echo "   build ok" || { echo "   BUILD FAILED"; exit 1; }
+	@echo "== the watcher suite, run from the unpacked package"
+	@cd "$(STAGE)/$(PKGNAME)" && (./test_watch.sh > /tmp/.dv-watch.log 2>&1; \
+	    echo $$? > /tmp/.dv-watch.rc) || true
+	@tail -3 /tmp/.dv-watch.log | sed 's/^/   /'
+	@test "$$(cat /tmp/.dv-watch.rc)" = 0 || { echo "   THE SUITE FAILED -- see /tmp/.dv-watch.log"; exit 1; }
+	@rm -rf "$(STAGE)" /tmp/.dv-want /tmp/.dv-have /tmp/.dv-modes /tmp/.dv-watch.log /tmp/.dv-watch.rc
+	@echo "dist-verify: faithful to both commits, builds on its own, watcher suite passes"
+
+distclean: clean
+	rm -rf $(DISTDIR) /tmp/.esidx-stage-esidx-* /tmp/.dv-*
+
 # `make DEBUG=1` means nothing here and is gone on purpose; `make opt`, `make dbg` and
 # `make check` are the spellings.
 
 clean:
 	rm -f $(OBJS) $(DBG_OBJS) esidx esidx-dbg etp-probe etp-probe-dbg order-ref order-ref-dbg
 
-.PHONY: require-sfa all opt dbg sfa-proxy check test test-etp test-all install uninstall clean
+.PHONY: require-sfa all opt dbg sfa-proxy check test test-etp test-all install uninstall clean dist dist-verify distclean

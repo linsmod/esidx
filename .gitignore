@@ -7,6 +7,7 @@
 /order-ref
 /order-ref-dbg
 
-# snapshots and scratch output
+# deployment packages (make dist)
+/dist/
 *.idx
 *.db

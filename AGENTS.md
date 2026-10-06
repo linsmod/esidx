@@ -57,6 +57,7 @@ Each layer has its own suite, and they are separate files on purpose:
 | `test_watch.sh` | the **watcher**: kernel events → dirty directories → visible rows | an event is mapped to the wrong directory, or the index is not current within one batch. Needs root and skips without it — see below |
 | `round.sh` | nothing — it is the end-to-end demonstration and the source of the numbers in the docs | (prints timings; asserts nothing) |
 | `cmp_ref.sh` | nothing — it re-measures every expected value quoted against the reference server (§1.4) | (prints a table; when the two indexes differ by more than 0 it prints the entries that make up the difference and stats each one, so a delta is classified rather than assumed; `--strict` exits 1 on a row the delta does not explain) |
+| `make dist` / `dist-verify` | nothing — they package the tree and then check the package | (dist builds a tarball of both repositories; dist-verify unpacks it elsewhere, diffs contents **and modes** against `git ls-files -s`, builds it, and runs the watcher suite from the unpacked tree) |
 
 Run the index suite before the protocol suite. A parse regression shows up as a
 protocol failure otherwise, and you will spend an hour in the wrong file.
@@ -350,6 +351,15 @@ One `make` also builds the two test peers (`all: opt dbg` covers `etp-probe` and
 `make && make etp-probe`, and forgetting it cost an hour's confusion:
 `test_etp.sh` stops with `./etp-probe not built`, which reads like a broken checkout
 rather than a missing prerequisite.
+
+**A bare `make` must build something, and saying so is a rule.** `.DEFAULT_GOAL` is
+named explicitly rather than left to be the first target in the file, because that is a
+silent trap: one commit added a `require-sfa` rule above `all`, and from then on a bare
+`make` checked one file and exited 0 on every machine. The check that missed it was
+`make 2>&1 | grep -Ei 'error|warning'` — it printed nothing because nothing happened. A
+deployment caught it (`make -j16` returned in 12 ms with no artefacts). **Ask whether the
+artefact appeared, not whether make complained** — the same question as the mtime guard
+above, one level up.
 
 The ASan build is not optional. It is the only thing that catches:
 
