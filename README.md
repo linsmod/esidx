@@ -30,7 +30,7 @@ goes stale while a server runs. Freshness can also be *immediate*:
 holds the fanotify group and rebroadcasts events as absolute paths, so a name
 change is visible within one event batch instead of one `--refresh` interval — and
 esidx itself needs no privilege, because the proxy is where that lives. The same
-watcher can run *inside* this server instead (`--watch-embed=ROOT --drop-to=USER`),
+watcher can run *inside* this server instead (`--watch-embed`),
 which opens the group itself and gives the privilege back before it answers
 anything; one process, one fd, no socket in between. Both forms deliver the same
 events through the same code, and the choice is about deployment, not semantics:
@@ -241,27 +241,35 @@ inside a `mktemp` directory, leaving the source tree clean.
 ./esidx update /etc.idx --dir /etc/ssl # refresh only that directory, repeatable
 #   updated /etc.idx: ... --dir resolves against the index and refuses anything else
 
-# serve ETP -- what the ETP client speaks
-./esidx serve /etc.idx -p 2121
+# serve ETP -- what the ETP client speaks. 127.0.0.1:2121 is the default bind
+./esidx serve /etc.idx
 #   esidx serving 1622 entries from /etc.idx on 127.0.0.1:2121 (loaded in 0.3 ms)
 
 # ...and keep that index current while serving it
-./esidx serve /etc.idx -p 2121 --refresh=5 --save=300
+./esidx serve /etc.idx --refresh=5 --save=300
 #   esidx: reconciling in place every 5 s, snapshot written every 300 s
 
 # ...or react to filesystem events as they happen
 sudo ./sfa/sfa-server /                       # the privileged half, once
-./esidx serve /etc.idx -p 2121 --watch --sweep=3600
+./esidx serve /etc.idx --watch --sweep=3600
 #   esidx: watching /etc via /run/sfa.sock -- name changes become visible within one
 #          batch; size/mtime still follow --refresh/--deep; an event the proxy cannot
 #          place costs a full pass
 
-# ...or with no proxy at all: this process opens the fanotify group and becomes esidx
-sudo ./esidx serve /etc.idx -p 2121 --watch-embed=/etc --drop-to=esidx --sweep=3600
+# ...or with no proxy at all: this process opens the fanotify group and becomes esidx.
+# The tree to mark defaults to the snapshot's root and the user to become defaults to
+# the snapshot's owner, so --watch-embed needs no arguments.
+sudo ./esidx serve /etc.idx --watch-embed --sweep=3600
+#   watch: --drop-to not given: becoming esidx, the owner of /etc.idx
+#          (pass --drop-to=USER to choose another)
 #   watch: dropped to esidx (uid 998 gid 998); kept CAP_DAC_READ_SEARCH for event path
 #          resolution, dropped the rest
-#   esidx: watching /etc via the embedded fanotify group (this process) [(embedded)]
+#   esidx: watching /etc via the embedded fanotify group (this process), as esidx [(embedded)]
 ```
+
+The banner names the user the process became, and not only the log line that reports the
+drop: the drop is at INFO, the default level is higher, and "which identity is this service
+running as" is not something an operator should have to raise the log level to find out.
 
 `update` is the same walk in two modes. Without `--deep` it stats one directory
 per changed subtree and notices name changes; on an unchanged `/usr` that is

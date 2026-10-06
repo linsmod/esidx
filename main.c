@@ -37,7 +37,7 @@ static void usage(void)
         "  esidx [-v N] serve <dbfile> [-p port] [--bind addr]\n"
         "                             [-u user [-w pass]] [--no-download] [--once]\n"
 "                             [--refresh=SECS] [--save=SECS] [--watch[=SOCK]]\n"
-"                             [--watch-embed=ROOT --drop-to=USER[:GROUP]]\n"
+"                             [--watch-embed[=ROOT]] [--drop-to=USER[:GROUP]]\n"
 "                             [--sweep=SECS]\n"
         "                             [--no-index[=LIST]]\n"
         "  esidx options <dbfile> [--no-index[=LIST]]\n"
@@ -65,12 +65,17 @@ static void usage(void)
          "        to /run/sfa.sock. esidx itself needs no privilege -- the proxy does, which\n"
          "        is why it is not part of this binary.\n"
          "\n"
-         "serve --watch-embed=ROOT --drop-to=USER[:GROUP] is the single-process form: this\n"
-         "        process opens the fanotify group itself instead of subscribing to a proxy,\n"
-         "        which removes the second daemon and the socket between them. fanotify needs\n"
-         "        CAP_SYS_ADMIN, so the process starts as root and gives the privilege back at\n"
-         "        once the group is open; --drop-to is not optional and ROOT must be the\n"
-         "        snapshot's own root. What survives the drop is CAP_DAC_READ_SEARCH and\n"
+         "serve --watch-embed[=ROOT] [--drop-to=USER[:GROUP]] is the single-process form:\n"
+         "        this process opens the fanotify group itself instead of subscribing to a\n"
+         "        proxy, which removes the second daemon and the socket between them. fanotify\n"
+         "        needs CAP_SYS_ADMIN, so the process starts as root and gives the privilege\n"
+         "        back once the group is open. Both arguments have defaults that cannot be\n"
+         "        wrong, so the usual invocation is just `--watch-embed`: ROOT defaults to the\n"
+         "        snapshot's own root (naming it is allowed and then compared), and --drop-to\n"
+         "        defaults to the snapshot's owner -- the user it was built as, which is the\n"
+         "        one that must be able to read it. A derived drop is printed, and an owner of\n"
+         "        root is refused rather than becoming a privileged service by default.\n"
+         "        What survives the drop is CAP_DAC_READ_SEARCH and\n"
          "        nothing else -- sfa resolves an event's directory with open_by_handle_at(),\n"
          "        which needs exactly that capability, so a process that dropped it would see\n"
          "        every event as unattributable and ask for a full pass after every batch. Use\n"
@@ -489,7 +494,11 @@ static int cmd_serve(int argc, char **argv)
     etp_opts_t o;
     memset(&o, 0, sizeof(o));
     o.bind_addr = "127.0.0.1";
-    o.port = 21;
+    /* 2121, not ETP's conventional 21. The listener is opened *after* the watcher has given
+     * the privilege back (see etp.c), so a privileged port could only ever fail here --
+     * and `serve` without a port would then look like a broken build rather than a default
+     * that cannot work. The banner prints the port either way. */
+    o.port = 2121;
     o.allow_download = 1;
 
     const char *dbfile = NULL;
@@ -527,15 +536,14 @@ static int cmd_serve(int argc, char **argv)
          * two forms cannot be confused for one another at the call site: --watch=SOMETHING
          * is always a socket to connect to, and only --watch-embed means "this process
          * holds the fanotify group". */
-        if (!strncmp(a, "--watch-embed=", 14)) {
-            if (!a[14]) { fprintf(stderr, "serve: --watch-embed needs the tree to mark\n"); return 1; }
-            o.watch_embed = a + 14;
+        if (!strcmp(a, "--watch-embed") || !strncmp(a, "--watch-embed=", 14)) {
+            /* Bare form is the normal spelling, and the empty string is the sentinel for it
+             * (same split as --watch above): the tree to mark is the snapshot's own root, so
+             * naming it again is a second chance to disagree with the file, not information.
+             * --watch-embed=ROOT stays accepted and is compared, for the caller who wants the
+             * check to be performed against what they think they deployed. */
+            o.watch_embed = a[13] == '=' ? a + 14 : "";
             continue;
-        }
-        if (!strcmp(a, "--watch-embed")) {
-            fprintf(stderr, "serve: --watch-embed needs the tree to mark, "
-                            "e.g. --watch-embed=/work\n");
-            return 1;
         }
         if (!strncmp(a, "--drop-to=", 10)) {
             o.drop_to = a + 10;
@@ -580,12 +588,10 @@ static int cmd_serve(int argc, char **argv)
                         "this process never gains privilege to give back\n");
         return 1;
     }
-    if (o.watch_embed && !o.drop_to) {
-        fprintf(stderr, "serve: --watch-embed without --drop-to would leave this process "
-                        "running as root with CAP_SYS_ADMIN. Name the user to become, e.g. "
-                        "--drop-to=esidx (see esidx(1))\n");
-        return 1;
-    }
+    /* --drop-to is not required: etp.c defaults it to the snapshot's owner, which is the
+     * user the snapshot was built as and is refused when that owner is root. Demanding the
+     * flag here would make every deployment type a name that is already in the file's
+     * ownership, and the point of the guard is the refusal, not the typing. */
     if (o.watch_embed && o.watch_sock) {
         fprintf(stderr, "serve: --watch-embed and --watch=SOCK are two different sources of "
                         "events; pass one or the other\n");

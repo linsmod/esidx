@@ -8,7 +8,10 @@ Type=simple
 WorkingDirectory=/var/lib/esidx
 EnvironmentFile=/etc/default/esidx
 # One process for the whole event path: this server opens the fanotify group itself and gives
-# the privilege back before it opens the listener (--watch-embed + --drop-to). That is why
+# the privilege back before it opens the listener (--watch-embed). The tree it marks comes
+# from the snapshot itself -- stating it again here would only be a second chance to disagree
+# with the file -- and the user it becomes is named explicitly, because the privilege boundary
+# is the one thing this unit should say out loud. That is why
 # there is no User= here: User= would either start it unprivileged, and opening a group marked
 # on a mount needs CAP_SYS_ADMIN, or leave it root for its whole life -- which is the
 # two-process split's answer, and still available (README, "Deployment"): run sfa-server
@@ -21,7 +24,7 @@ EnvironmentFile=/etc/default/esidx
 # --no-download is not a knob either. RETR returns file *contents* over the data connection,
 # so leaving it off turns a search service into an anonymous file server for everything under
 # ESIDX_ROOT. Take the flag out of this line, in a drop-in, if that is what you want.
-ExecStart=/usr/bin/esidx -v 3 serve ${ESIDX_DB} -p ${ESIDX_PORT} --bind ${ESIDX_BIND} --no-download --watch-embed=${ESIDX_ROOT} --drop-to=${ESIDX_USER} --sweep=${ESIDX_SWEEP}
+ExecStart=/usr/bin/esidx -v 3 serve ${ESIDX_DB} -p ${ESIDX_PORT} --bind ${ESIDX_BIND} --no-download --watch-embed --drop-to=${ESIDX_USER} --sweep=${ESIDX_SWEEP}
 Restart=always
 RestartSec=2
 # A ceiling for what the process may hold *before* it drops, not the set it runs with: SYS_ADMIN

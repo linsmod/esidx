@@ -54,6 +54,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -1465,25 +1466,60 @@ int etp_serve(const etp_opts_t *opts)
      * pass is the same one the offline update runs, so "the server just started" and "the
      * server is up to date" cannot be different claims. */
     esidx_watch_t *watch = NULL;
+    /* ", as USER", for the banner. The line that reports the drop is at INFO, and the
+     * default log level does not show INFO -- so the identity cannot be reported only
+     * there: "which user is this process now" is part of the startup banner or it is
+     * something an operator has to know to go looking for (found by running the new
+     * default without -v and getting no line at all). */
+    char embed_as[160] = "";
     if (opts->watch_sock || opts->watch_embed) {
         char root[PATH_MAX], err[256];
         path_of(&db, db.root_eid, root, sizeof(root));
         if (opts->watch_embed) {
-            /* The root to mark is stated twice here -- once by the snapshot and once on the
-             * command line -- and they are compared rather than one silently winning. A
-             * watcher on a different tree from the index produces a server that is current
-             * about files it does not have, which reads exactly like "nothing is changing".
+            /* Bare --watch-embed marks the snapshot's own root: the tree whose events make
+             * this index current is the tree that was indexed, so there is no second opinion
+             * to have about it and nothing worth typing. Naming one anyway is allowed and
+             * compared rather than silently winning -- a watcher on a different tree from the
+             * index produces a server that is current about files it does not have, which
+             * reads exactly like "nothing is changing".
              */
             size_t rl = strlen(opts->watch_embed);
             while (rl > 1 && opts->watch_embed[rl - 1] == '/') rl--;
-            if (rl != strlen(root) || strncmp(root, opts->watch_embed, rl) != 0) {
+            if (rl && (rl != strlen(root) || strncmp(root, opts->watch_embed, rl) != 0)) {
                 fprintf(stderr, "watch: --watch-embed=%s but the snapshot's root is %s\n",
                         opts->watch_embed, root);
                 esidx_free(&db);
                 return -1;
             }
+            /* Who to become, when it is not stated: the snapshot's owner. That user is the
+             * one the snapshot was built as (`sudo -u esidx esidx build ...`, which is what
+             * postinst prints) and the one who has to be able to read it either way, so the
+             * default cannot disagree with the deployment that produced the file.
+             *
+             * It is printed, because a derived privilege boundary must not be a silent one --
+             * and it is still refused when that owner is root, by the same guard as an
+             * explicit --drop-to=root. That refusal is the point of keeping the guard rather
+             * than inventing a fallback: a snapshot built by root is a deployment mistake, and
+             * the process must not quietly stay privileged because of it. */
+            char owner[128];
+            const char *drop_to = opts->drop_to;
+            if (!drop_to || !*drop_to) {
+                struct stat st;
+                struct passwd *pw = stat(opts->dbfile, &st) == 0 ? getpwuid(st.st_uid) : NULL;
+                if (!pw || !pw->pw_name) {
+                    fprintf(stderr, "watch: cannot tell who owns %s; pass --drop-to=USER\n",
+                            opts->dbfile);
+                    esidx_free(&db);
+                    return -1;
+                }
+                snprintf(owner, sizeof(owner), "%s", pw->pw_name);
+                drop_to = owner;
+                LOGI("watch: --drop-to not given: becoming %s, the owner of %s "
+                     "(pass --drop-to=USER to choose another)", drop_to, opts->dbfile);
+            }
+            snprintf(embed_as, sizeof(embed_as), ", as %s", drop_to);
             watch = esidx_watch_open_embed(root, &db, opts->watch_sock,
-                                           opts->watch_group, opts->drop_to,
+                                           opts->watch_group, drop_to,
                                            err, sizeof(err));
         } else {
             watch = esidx_watch_open(opts->watch_sock, root, err, sizeof(err));
@@ -1592,12 +1628,13 @@ int etp_serve(const etp_opts_t *opts)
         /* "via" names the proxy for the two-process form and the process's own identity for
          * the embedded one, because in the embedded case the reader of this line will
          * otherwise go looking for a proxy that does not exist. */
-        fprintf(stderr, "esidx: watching %s via %s [%s] -- name changes become visible "
+        fprintf(stderr, "esidx: watching %s via %s%s [%s] -- name changes become visible "
                         "within one batch; size/mtime still follow --refresh/--deep; "
                         "an event the proxy cannot place costs a full pass\n",
                 root,
                 opts->watch_embed ? "the embedded fanotify group (this process)"
                                   : opts->watch_sock,
+                opts->watch_embed ? embed_as : "",
                 esidx_watch_work_mode_str(watch));
     }
     fflush(stderr);

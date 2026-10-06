@@ -11,10 +11,9 @@
 # form still exists (run sfa-server separately and pass --watch=SOCK), and then ESIDX_ROOT has
 # to be named in both places; see README, "Deployment".
 
-# The tree to index. It is marked for events and the snapshot covers it, and the two are
-# compared at startup: a --watch-embed that names a tree the snapshot does not have is
-# refused rather than served, because that shape answers questions about files it never
-# indexed and reads exactly like "nothing is changing".
+# The tree to index. This is what the snapshot- building command below uses, and what a
+# hand-run proxy would mark in the two-process form. The unit does not pass it: `--watch-embed`
+# takes the tree from the snapshot itself, so there is no second place for it to be wrong.
 ESIDX_ROOT=/work
 
 # The snapshot. Nothing builds this for you at install time -- the first one is a full scan,
@@ -40,8 +39,11 @@ ESIDX_BIND=127.0.0.1
 # (CAP_DAC_READ_SEARCH, for turning an event into a path); everything else is dropped, and
 # test_watch.sh asserts both halves of that from outside the process.
 #
-# The user has to exist and has to be able to read ESIDX_ROOT and ESIDX_DB. The package
-# creates it (postinst, as "esidx"); change this only to a user that owns the snapshot.
+# The unit states this explicitly, but the binary would derive the same answer with
+# `--drop-to` omitted: the default is the snapshot's owner, which is who `esidx build` ran as
+# (postinst below). Point it at another user only if that user can read ESIDX_ROOT and
+# ESIDX_DB -- and note that root is refused either way, so a snapshot built by root fails
+# loudly instead of producing a privileged service.
 ESIDX_USER=esidx
 
 # How often to walk the directory stamps and reconcile anything the events could not carry:

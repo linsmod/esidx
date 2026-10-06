@@ -74,6 +74,7 @@ cleanup() {
     [ -n "${SFA_PID:-}" ]   && kill "$SFA_PID"  2>/dev/null
     [ -n "${SERVE_PID:-}" ] && kill "$SERVE_PID" 2>/dev/null
     [ -n "${EMB_PID:-}" ]   && kill "$EMB_PID"  2>/dev/null
+    [ -n "${EMB2_PID:-}" ]  && kill "$EMB2_PID" 2>/dev/null
     wait 2>/dev/null
     if [ "${TEST_KEEP:-0}" = 1 ]; then
         printf 'test_watch.sh: kept %s\n' "$TMP"
@@ -436,8 +437,12 @@ EDB="$EMB/tree.idx"
 chmod 0644 "$EDB"
 
 DROP_USER=${ESIDX_DROP_TO:-nobody}
-"$BIN" -v 3 serve "$EDB" -p 0 --bind 127.0.0.1 \
-    --watch-embed="$EROOT" --drop-to="$DROP_USER" \
+# The snapshot is chowned to the drop target, which is what the packaged deployment looks
+# like (`sudo -u esidx esidx build ...`). That is deliberate here: --drop-to defaults to the
+# snapshot's owner, so making the two the same user is what lets the assertions below test
+# the *derivation* rather than a value that was typed twice.
+chown "$DROP_USER" "$EDB"
+"$BIN" -v 3 serve "$EDB" -p 0 --bind 127.0.0.1 --watch-embed \
     >"$EMB/serve.out" 2>"$EMB/serve.log" &
 EMB_PID=$!
 PORT=""
@@ -453,6 +458,12 @@ else
 fi
 
 if [ -n "$PORT" ] && [ -r "/proc/$EMB_PID/status" ]; then
+    if grep -q "becoming $DROP_USER, the owner of" "$EMB/serve.log" 2>/dev/null; then
+        ok "the user to become defaults to the snapshot's owner (--drop-to omitted)"
+    else
+        bad "the drop target defaults to the snapshot's owner" \
+            "no 'becoming ... owner of' line -- is --drop-to still required, or is the default silent?"
+    fi
     WANT_UID=$(id -u "$DROP_USER" 2>/dev/null)
     UID_NOW=$(sed -n 's/^Uid:[[:space:]]*\([0-9]*\).*/\1/p' "/proc/$EMB_PID/status")
     if [ -z "$WANT_UID" ]; then
@@ -473,10 +484,15 @@ if [ -n "$PORT" ] && [ -r "/proc/$EMB_PID/status" ]; then
         bad "the capability set is one capability" \
             "CapEff: $CAP, expected 0000000000000004 (CAP_DAC_READ_SEARCH)"
     fi
-    if grep -q 'via the embedded fanotify group' "$EMB/serve.out" "$EMB/serve.log" 2>/dev/null; then
-        ok "the banner names the embedded group instead of a proxy"
+    # The user is part of the banner on purpose: the line that reports the drop is at INFO,
+    # and a default run shows no INFO -- so a banner without it leaves "which identity is
+    # this service now" unanswerable at the level the service actually logs at.
+    if grep -q "via the embedded fanotify group (this process), as $DROP_USER" \
+            "$EMB/serve.out" "$EMB/serve.log" 2>/dev/null; then
+        ok "the banner names the embedded group and the user it became"
     else
-        bad "the banner names the embedded group" "no 'via the embedded fanotify group' line"
+        bad "the banner names the group and the user it became" \
+            "no '... (this process), as $DROP_USER' line -- is the identity reported only at INFO?"
     fi
 fi
 
@@ -538,6 +554,38 @@ if [ -n "$PORT" ]; then
         ok "the embedded watcher answers the loss with a sweep"
     else
         bad "the embedded watcher answers the loss with a sweep" "no sweep line reporting a moved directory"
+    fi
+
+    # Both defaults can still be spelled out, and that is what keeps them defaults rather
+    # than the only way: the unit names the user explicitly, and a caller who wants the tree
+    # checked against what they think they deployed names it too.
+    "$BIN" -v 3 serve "$EDB" -p 0 --bind 127.0.0.1 \
+        --watch-embed="$EROOT" --drop-to="$DROP_USER" \
+        >"$EMB/serve2.out" 2>"$EMB/serve2.log" &
+    EMB2_PID=$!
+    PORT2=""
+    for _ in $(seq 1 50); do
+        PORT2=$(sed -n 's/.*on 127\.0\.0\.1:\([0-9]*\).*/\1/p' "$EMB/serve2.log" 2>/dev/null | head -1)
+        [ -n "$PORT2" ] && break
+        sleep 0.1
+    done
+    if [ -n "$PORT2" ]; then
+        ok "the spelled-out form (--watch-embed=ROOT --drop-to=USER) still starts"
+    else
+        bad "the spelled-out form still starts" "$(tail -2 "$EMB/serve2.log" | tr '\n' ' ')"
+    fi
+    kill "$EMB2_PID" 2>/dev/null; wait "$EMB2_PID" 2>/dev/null; EMB2_PID=""
+
+    # ...and naming a tree that is not the snapshot's root is refused, which is the only
+    # reason spelling it out exists: it is a statement about the deployment that can be wrong.
+    if "$BIN" -v 3 serve "$EDB" -p 0 --bind 127.0.0.1 --watch-embed="$TMP" \
+            >/dev/null 2>"$EMB/serve3.log"; then
+        bad "a --watch-embed naming another tree is refused" "it started anyway"
+    elif grep -q "but the snapshot's root is" "$EMB/serve3.log"; then
+        ok "a --watch-embed naming another tree is refused, naming both paths"
+    else
+        bad "a tree that is not the snapshot's root is refused" \
+            "$(tail -2 "$EMB/serve3.log" | tr '\n' ' ')"
     fi
 fi
 
