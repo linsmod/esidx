@@ -131,9 +131,17 @@ case "$1" in
                 || echo "esidx: could not enable the unit; enable it by hand." >&2
             # Cheap, and it turns a unit that cannot parse into an install-time message
             # instead of a boot-time one. Non-fatal: a warning here must not fail the install.
+            #
+            # Only lines that name this file are ours. verify() loads the unit *and everything
+            # it depends on*, so its output can be about units this package has never heard of,
+            # and those lines then look like they came from it: on the first r7000 install it
+            # printed an unrelated nvidia ordering cycle, snapd's unknown key and a third-party
+            # unit's mode bits, all under our name. A real problem with our unit is reported
+            # with our unit's path, so filtering on the file name keeps the signal.
             if command -v systemd-analyze >/dev/null 2>&1; then
-                out=$(systemd-analyze verify "$UNITDIR/esidx.service" 2>&1) || true
-                [ -z "$out" ] || echo "$out" | sed 's/^/esidx: /' >&2
+                systemd-analyze verify "$UNITDIR/esidx.service" 2>&1 \
+                    | grep -F "esidx.service" \
+                    | sed 's/^/esidx: /' >&2 || true
             fi
             # An upgrade replaces the binary *under a running service*, and systemd does not
             # restart it for that: Restart=always is about the process exiting, not about the

@@ -138,8 +138,20 @@ the index is served from memory, so nothing answers while the snapshot loads (8.
 `/work`'s 5 476 485 entries, measured on `r7000`). Without that restart an update would
 install cleanly and the old process would keep answering — `Restart=always` is about the
 process exiting, not about the file changing. A local edit to `/etc/default/esidx` is a
-conffile edit, so dpkg asks what to do (non-interactively it keeps yours and leaves a
-`.dpkg-dist` beside it).
+conffile edit, so dpkg wants a policy for it: with a terminal it asks, and **without one it
+fails** — measured on `r7000`, where a non-interactive `dpkg -i` died on
+`在 conffile 提示时读取标准输入时遭遇 EOF` and left the package unpacked. So an unattended
+upgrade states the policy itself:
+
+```sh
+dpkg -i --force-confold esidx_*.deb          # keep what is on this machine
+DEBIAN_FRONTEND=noninteractive dpkg -i esidx_*.deb   # same, and never prompt
+apt install -o Dpkg::Options::=--force-confold ./esidx_*.deb
+```
+
+`--force-confnew` takes the package's file instead and discards the local values. Note what
+triggers the prompt: dpkg compares whole files, so a change to *comments* in the shipped
+`esidx.default` is enough — there is no "comments only" case.
 
 **One snapshot, one server.** `serve` takes an advisory lock on `<snapshot>.lock` and refuses
 to start when another process holds it, naming that pid. Two servers on one snapshot would each
