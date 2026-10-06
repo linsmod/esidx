@@ -171,6 +171,14 @@ case "$1" in
         [ -n "$port" ] || port=2121
         [ -n "$bind" ] || bind=127.0.0.1
         [ -n "$svc" ] || svc=$SYSUSER
+
+        # The version being installed, read back rather than taken from "$2": dpkg hands a
+        # maintainer script the version it is *replacing*, so "$2" in these messages named the
+        # one that was just thrown away -- measured on r7000, announcing 8904952-dirty while
+        # installing 5abd055-dirty. During configure the status file already holds the new
+        # version, which is what this reads.
+        newver=$(dpkg-query -W -f='${Version}' esidx 2>/dev/null || true)
+        [ -n "$newver" ] || newver=$2
         [ -d "$root" ] || echo "esidx: warning: ESIDX_ROOT=$root does not exist; the server will not start." >&2
 
         if systemctl is-active --quiet esidx.service 2>/dev/null; then
@@ -179,7 +187,7 @@ case "$1" in
             # the snapshot survived -- the state directory is not touched by an upgrade.
             cat <<EOF
 
-esidx $2 installed over a running service. It was restarted onto the new binary and the
+esidx $newver installed over a running service. It was restarted onto the new binary and the
 snapshot at $db was kept (an upgrade never rebuilds it). Configuration is $DEFAULTCFG.
 
   systemctl status esidx
@@ -189,7 +197,7 @@ EOF
         else
             cat <<EOF
 
-esidx $2 installed. One service is enabled and it is not running yet, because the server
+esidx $newver installed. One service is enabled and it is not running yet, because the server
 needs a snapshot and building the first one scans $root:
 
   1. sudo -u $svc esidx build $root -o $db

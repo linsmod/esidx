@@ -200,12 +200,18 @@ uninstall:
 # sfa/ is a hard error above, so the list cannot come out half-empty here.
 GIT       ?= git
 REVISION  := $(shell $(GIT) rev-parse --short=12 HEAD 2>/dev/null)
-DESCRIBE  := $(shell $(GIT) describe --tags --always 2>/dev/null)
+# `describe` without `--always`: a version has to be *ordered*, and a bare hash is not -- dpkg
+# compares digit runs, so 8904952 sorts after 5abd055 and an ordinary upgrade gets announced as
+# a downgrade ("即将把 esidx 从 8904952-dirty 降级到 5abd055-dirty", measured on r7000; apt
+# refuses that outright). With no tag the commit count is used instead, which only grows, and
+# the hash stays in the version so a build can still be traced back to a tree.
+DESCRIBE  := $(shell $(GIT) describe --tags 2>/dev/null)
+COUNT     := $(shell $(GIT) rev-list --count HEAD 2>/dev/null)
 # `git status --porcelain` rather than `describe --dirty`: the latter compares tracked
 # files only, so untracked ones (install.sh before it is committed, docs/todo.md always)
 # would change the package without changing the version string.
 DIRTY     := $(shell test -z "$$($(GIT) status --porcelain 2>/dev/null)" || echo -dirty)
-VERSION   := $(if $(DESCRIBE),$(DESCRIBE),$(REVISION))$(DIRTY)
+VERSION   := $(if $(DESCRIBE),$(DESCRIBE),$(if $(COUNT),0.$(COUNT)+$(REVISION),$(REVISION)))$(DIRTY)
 MTIME     := $(shell $(GIT) show -s --format=%ct HEAD 2>/dev/null || echo 0)
 # Resolved here rather than in the recipe: the recipe writes VERSION-SOURCES inside single
 # quotes, so a `$$(git ...)` in it reaches the file as literal text instead of the hash.
