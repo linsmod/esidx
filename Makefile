@@ -61,6 +61,22 @@ SFA_LIB = sfa/libsfa.c
 OBJS += sfa/libsfa.o
 HDRS += $(SFA_H)
 
+# `all` is etp-probe as well as the server, so one `make` leaves a checkout ready
+# for both suites. It used to be two steps (AGENTS.md 3.1), and the second one was
+# easy to forget: test_etp.sh then stops with "./etp-probe not built", which reads
+# like a broken checkout rather than a missing prerequisite. The probe is one
+# translation unit and ~430 lines, so building it by default costs nothing next to
+# the server itself.
+#
+# .DEFAULT_GOAL is named rather than left to be the first target in the file, because
+# that is a silent trap: adding a rule above `all` -- which is what require-sfa below
+# was -- turns a bare `make` into a no-op that still exits 0. It cost a deployment to
+# find (r7000: `make -j16` returned in 12 ms having built nothing) and it is invisible
+# to anyone who checks for errors instead of for the artefact.
+.DEFAULT_GOAL := all
+
+all: opt dbg sfa-proxy
+
 # Checked in a recipe rather than with $(error) so that `make clean` still works on a
 # checkout that has not finished initialising: everything that compiles depends on this,
 # and clean is the one thing that must not need the dependency to be present.
@@ -70,14 +86,6 @@ require-sfa:
 	    echo "       run: git submodule update --init --recursive" >&2; \
 	    exit 1; \
 	fi
-
-# `all` is etp-probe as well as the server, so one `make` leaves a checkout ready
-# for both suites. It used to be two steps (AGENTS.md 3.1), and the second one was
-# easy to forget: test_etp.sh then stops with "./etp-probe not built", which reads
-# like a broken checkout rather than a missing prerequisite. The probe is one
-# translation unit and ~430 lines, so building it by default costs nothing next to
-# the server itself.
-all: opt dbg sfa-proxy
 
 # The privileged proxy the watcher talks to, built here for the same reason etp-probe and
 # order-ref are: test_watch.sh stopping with "./sfa/sfa-server not built" reads like a
