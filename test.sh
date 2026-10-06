@@ -1717,7 +1717,22 @@ qd() {
                         "$BIN" query "$SKIP_DB" "$@" >"$TMP/out" 2>>"$DIAG" ;;
         sidecar)        "$BIN" query "$SKIP_DB" "$@" >"$TMP/out" 2>>"$DIAG" ;;
         --no-index=*)   "$BIN" query "$SKIP_DB" "$mode" "$@" >"$TMP/out" 2>>"$DIAG" ;;
-    esac
+esac
+
+# Refuse to measure a binary that is older than the code: a build that fails part-way
+# leaves the previous binary in place, and this suite would then pin the *index* against
+# find(1) using the last build while reporting it as this one. The suite cannot know what
+# is inside the binary; the mtime is the cheapest thing it can know. Same guard in all
+# three suites, and deliberately not a shared helper -- they are independent files so that
+# one missing tool cannot take down the other two (AGENTS.md 1.3).
+for f in *.c *.h Makefile sfa/*.c sfa/*.h; do
+    [ -f "$f" ] || continue
+    if [ -x "$BIN" ] && [ "$f" -nt "$BIN" ]; then
+        printf 'test.sh: %s is newer than %s -- build did not run or did not finish\n' \
+            "$f" "$BIN" >&2
+        exit 1
+    fi
+done
     LAST=$(cat "$TMP/out")
 }
 

@@ -335,6 +335,16 @@ binary). The objects are named apart now (`%.o` and `%.dbg.o`), `make` builds bo
 `make opt` / `make dbg` name one. Do not reintroduce a selector that points the gate at
 a single flavour: the whole reason the ASan build finds things is that it is not optional.
 
+**And each suite refuses to measure a binary older than the code.** `make` that fails
+part-way leaves the previous binary in place, and a suite run afterwards does not fail —
+it re-measures the last build and reports it as this one. That is not hypothetical: it
+happened while writing the watcher's work-mode assertion, where a botched edit broke the
+build and `./test_watch.sh` still printed 20/20. All three suites now compare mtimes
+against every `*.c`, `*.h`, the `Makefile` and `sfa/*.[ch]`, and exit 1 with the offending
+file named. The suite cannot know what is inside the binary; the mtime is the cheapest
+thing it can know. The check is repeated in each script rather than shared, on purpose —
+they are independent files so one missing tool cannot take down the other two (§1.3).
+
 One `make` also builds the two test peers (`all: opt dbg` covers `etp-probe` and
 `order-ref` in both flavours), so there is no second step to forget. It used to be
 `make && make etp-probe`, and forgetting it cost an hour's confusion:

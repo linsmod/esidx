@@ -38,6 +38,20 @@ if [ ! -x "$BIN" ]; then
     printf 'test_watch.sh: %s not built -- run `make`\n' "$BIN" >&2
     exit 1
 fi
+
+# Refuse to measure a binary that is older than the code. A build that fails part-way
+# leaves the previous binary in place, and every assertion below would then pass against
+# the *last* build while reporting it as this one -- which is the same shape as the run
+# that looked sanitised and was not (AGENTS.md 3.1), and it cost the same hour to find.
+# The suite cannot know what is inside the binary; this is the cheapest thing it can know.
+for f in *.c *.h Makefile sfa/*.c sfa/*.h; do
+    [ -f "$f" ] || continue
+    if [ "$f" -nt "$BIN" ]; then
+        printf 'test_watch.sh: %s is newer than %s -- build did not run or did not finish\n' \
+            "$f" "$BIN" >&2
+        exit 1
+    fi
+done
 if [ ! -x "$PROBE" ]; then
     printf 'test_watch.sh: %s not built -- run `make`\n' "$PROBE" >&2
     exit 1

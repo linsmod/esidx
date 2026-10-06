@@ -176,7 +176,22 @@ start_server() {
         refreshb) SRV_PID4=$pid; SRV_PORTB=$port; SRVB_ERR=$err ;;
         overlay)  SRV_PID5=$pid; SRV_PORTO=$port; SRVO_ERR=$err ;;
         *) echo "unknown server tag '$tag'"; exit 1 ;;
-    esac
+esac
+
+# Refuse to measure a binary that is older than the code: a build that fails part-way
+# leaves the previous binary in place, and this suite would then pin the *wire* against
+# the last build while reporting it as this one. The suite cannot know what is inside the
+# binary; the mtime is the cheapest thing it can know. Same guard in all three suites, and
+# deliberately not a shared helper -- they are independent files so that one missing tool
+# cannot take down the other two (AGENTS.md 1.3).
+for f in *.c *.h Makefile sfa/*.c sfa/*.h; do
+    [ -f "$f" ] || continue
+    if [ -x "$BIN" ] && [ "$f" -nt "$BIN" ]; then
+        printf 'test_etp.sh: %s is newer than %s -- build did not run or did not finish\n' \
+            "$f" "$BIN" >&2
+        exit 1
+    fi
+done
     echo "   server '$tag': pid $pid on 127.0.0.1:$port"
 }
 start_server main
