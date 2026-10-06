@@ -708,6 +708,17 @@ resolve to nothing and are counted, not applied [B4]. A rename arrives as one ev
 with both paths (5.17+ `FAN_RENAME`), so both sides are marked and no cookie pairing is
 needed.
 
+Two things the mark's width forces on the client. The mark covers a whole filesystem on any
+kernel that rejects the mount form, so paths outside this index arrive too — measured on a
+fixture that wrote 100 files inside the root and 100 beside it, **196 events of which 96
+were outside** — and they are dropped on a path-component boundary, after the index root,
+because one proxy may serve several indexes with different roots and a proxy started
+without a prefix must not be able to mark a directory this index has never heard of. And
+the mark mode is the one fact that explains that traffic, so it is in the log: `sfa`
+reports the mode it negotiated in its welcome message and the banner prints it
+(`[FILESYSTEM|RENAME_PAIR|ONDIR|PATH_LOOKUP]`), because otherwise "half the events I am sent
+are for paths I do not index" has no answer anywhere in the log.
+
 What this layer does **not** cover is as much a part of its design as what it does.
 `CLOSE_WRITE` and `ATTRIB` are deliberately not subscribed: listing a directory cannot
 see an attribute change, so subscribing would buy a reconcile per write and still leave
