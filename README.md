@@ -511,6 +511,15 @@ the performance comes from, the last two are where the interoperability risk was
   the same query as `path:sub1/x.conf`. `regex:` is the exception, because there `\`
   is the escape it is everywhere else. AGENTS.md §5.2 records the deviation; `test.sh`
   and `test_etp.sh` pin it.
+- **A client that stops reading costs its slot, not the loop.** The serve loop is
+  single-threaded, so a blocking write to one client would be a blocking write for
+  every client, for the watcher's batches and for the sweep. Replies go to a
+  non-blocking socket and what does not fit is queued (`POLLOUT` picks it up when the
+  socket drains); a client that has queued a reply and accepted none of it for
+  `--stall-ms` (default 10 s) is dropped with a line in the log, and the queue is
+  capped at 32 MB. Measured on a 20 000-entry tree with a client pinned to a 2 KB
+  receive buffer: 803 KB queued, another client answered in 15 ms, the stalled one
+  gone 10 s later. `test_etp.sh` §1b pins it.
 - **A directory's SIZE is the sentinel `18446744073709551615`**, not the real
   4096. Everything does not index folder sizes by default; a client parses that
   into a signed 64-bit field, overflows, swallows the exception, and shows

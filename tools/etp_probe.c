@@ -47,6 +47,11 @@
  *   sendraw <text>     send without reading anything
  *   query              read a query block (after a sendraw EVERYTHING QUERY),
  *                      print `COUNT <n>` and one `ROW ...` line per result
+ *   rcvbuf <bytes>     shrink this connection's receive buffer, so that a client
+ *                      which never reads stalls the server on any size of tree:
+ *                      Linux still advertises a window from its free receive
+ *                      space, so "stopped reading" alone only bites once the
+ *                      reply outgrows a few hundred KB
  *   close              close the connection
  *
  * Exit status is 0 if the exchange completed without a protocol error, 1
@@ -404,6 +409,15 @@ int main(int argc, char **argv)
             snprintf(last_reply, sizeof(last_reply), "%s", g_line);
         } else if (!strcmp(line, "sendraw")) {
             send_line(arg);
+        } else if (!strcmp(line, "rcvbuf")) {
+            /* A client that stops reading still has a window -- Linux advertises one from its
+             * own free receive space -- so on a small tree a non-reading client never stalls the
+             * server at all and the shape cannot be reproduced. Pinning the buffer makes it
+             * reproducible: whatever the reply is, the server runs out of room within a few
+             * hundred bytes and has to queue. */
+            int v = atoi(arg);
+            if (setsockopt(g_fd, SOL_SOCKET, SO_RCVBUF, &v, sizeof(v)) != 0)
+                proto_error("setsockopt(SO_RCVBUF) failed");
         } else if (!strcmp(line, "recv")) {
             /* read a reply that was not consumed by the directive that caused it,
              * e.g. the trailing 226 after a transfer */

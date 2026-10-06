@@ -817,7 +817,29 @@ keeps its own index current instead of serving the snapshot it loaded. The serve
 loop is single-threaded, which is what makes it safe rather than lucky — the pass
 runs between two `poll()` turns, so no client is half-way through a command while
 the index moves — and what bounds what a pass may cost: a pass that stalls the loop
-stalls every client. So the serving pass refuses compaction (`EU_NOCOMPACT`,
+stalls every client. **A client can stall the loop too, and does not any more.** Replies used to
+go out with a blocking `send()` on a socket that was itself blocking, so one client that stopped
+reading froze everything: not the other clients, not the watcher's batches, not the sweep — and
+the freeze was invisible from inside, because the loop was not at `poll()` to notice it. The
+write side is now the mirror of the read side: a non-blocking socket, a per-client queue, and
+`POLLOUT` when there is something queued. Three consequences worth writing down:
+
+- **The queue is what a client that stopped reading costs.** Measured on a 20 000-entry fixture
+  with a client pinned to a 2 KB receive buffer: 803 KB queued, another client answered in 15 ms,
+  and the stalled one dropped 10 s later with a line in the log. Before it, the second client
+  waited for the first one to close.
+- **A stalled client is not "detected" so much as given up on.** TCP says nothing about a peer
+  that is connected and not reading; the only signals are the sender's own `EAGAIN` and whatever
+  timeout the server imposes on it. So the deadline is wall clock, not a count of rounds — a
+  burst can produce hundreds of `EAGAIN`s inside one turn and a turn can be microseconds long,
+  which is the same conclusion sfa's proxy reached for its subscribers after trying the counting
+  one first. `--stall-ms=MS` makes it the operator's number, because the right value belongs to
+  the link rather than to the server, and a 32 MB queue cap backstops a client that never reads.
+- **A finished block is queued, not dropped.** `c_write()` used to write what it could and
+  discard the rest, so a client that stopped reading half way through an answer got a truncated
+  reply and a server that had forgotten it had anything left to say.
+
+So the serving pass refuses compaction (`EU_NOCOMPACT`,
 `esidx_compact()` is a full rescan plus a `finalize`), and `--save=SECS` is a
 separate knob from the refresh interval because a snapshot write is the whole file
 and has nothing to do with how stale the index may be. `--watch` and `--refresh` are

@@ -72,8 +72,9 @@ SRV_PID2=""
 SRV_PID3=""
 SRV_PID4=""
 SRV_PID5=""
+SRV_PID6=""
 cleanup() {
-    for p in "$SRV_PID" "$SRV_PID2" "$SRV_PID3" "$SRV_PID4" "$SRV_PID5"; do
+    for p in "$SRV_PID" "$SRV_PID2" "$SRV_PID3" "$SRV_PID4" "$SRV_PID5" "$SRV_PID6"; do
         [ -n "$p" ] && kill "$p" 2>/dev/null
     done
     rm -rf "$TMP"
@@ -179,6 +180,7 @@ start_server() {
         refresha) SRV_PID3=$pid; SRV_PORTA=$port; SRVA_ERR=$err ;;
         refreshb) SRV_PID4=$pid; SRV_PORTB=$port; SRVB_ERR=$err ;;
         overlay)  SRV_PID5=$pid; SRV_PORTO=$port; SRVO_ERR=$err ;;
+        stall)    SRV_PID6=$pid; SRV_PORTS=$port; SRVS_ERR=$err ;;
         *) echo "unknown server tag '$tag'"; exit 1 ;;
 esac
 
@@ -324,6 +326,75 @@ EOF
 expect "  530 Not logged on" "$(pwire | tail -1 | cut -c1-3)" "530"
 
 kill "$SRV_PID2" 2>/dev/null; SRV_PID2=""
+
+# ------------------------------------------- 1b: a client that stops reading
+#
+# The loop is single-threaded (see the structure comment at the top of etp.c), which is only safe
+# while nothing in it blocks on a client. A reply used to go out with a blocking send(), so a
+# client that asked for a lot and then read nothing stopped the entire server: no other client
+# answered, no filesystem event was applied, no sweep ran -- and none of that was visible from
+# inside, because the loop was not at poll() to notice it. Replies are now queued on a
+# non-blocking socket, and a client that does not start draining loses its slot.
+say "1b. a client that stops reading costs it its slot, not the loop"
+
+# 4000 entries, and every column switched on below, because what has to happen is a reply the
+# socket cannot take: a client that does not read still has a window of a few hundred KB, and a
+# 14-entry fixture's answer fits in it, so nothing would ever be queued and the test would pass
+# without testing anything. Measured: 400 entries queued nothing, 2000 entries with four columns
+# queued 18 KB, and the kernel decides the rest.
+mkdir -p "$TMP/stall/d"
+for i in $(seq 1 4000); do : >"$TMP/stall/d/f$i.txt"; done
+"$BIN" build "$TMP/stall" -o "$TMP/stall.idx" >/dev/null 2>&1
+SRV_DB="$TMP/stall.idx" start_server stall --stall-ms=1000
+
+# sendraw for every command and no `query`: this client reads its welcome and then nothing, so
+# the reply has nowhere to go. The probe's rcvbuf is what makes that true on a small tree.
+cat >"$TMP/stall.script" <<'EOF'
+rcvbuf 2048
+sendraw USER anonymous
+sendraw EVERYTHING PATH_COLUMN 1
+sendraw EVERYTHING SIZE_COLUMN 1
+sendraw EVERYTHING DATE_MODIFIED_COLUMN 1
+sendraw EVERYTHING ATTRIBUTES_COLUMN 1
+sendraw EVERYTHING COUNT 5000
+sendraw EVERYTHING SEARCH ext:txt
+sendraw EVERYTHING QUERY
+sleep 4000
+EOF
+"$PROBE" "$SRV_PORTS" "$TMP/stall.script" >"$TMP/stall.out" 2>&1 &
+STALL_CLIENT=$!
+sleep 1
+
+t0=$(date +%s%N)
+etp "another client, while the first is not reading" "$SRV_PORTS" <<'EOF'
+send USER anonymous
+send EVERYTHING COUNT 1
+send EVERYTHING SEARCH ext:txt
+sendraw EVERYTHING QUERY
+query
+EOF
+t1=$(date +%s%N)
+elapsed=$(( (t1 - t0) / 1000000 ))
+expect "  the other client is answered, row and all" "$(prows)" "1"
+if [ "$elapsed" -lt 5000 ]; then
+    ok "  and promptly (${elapsed} ms)"
+else
+    bad "  and promptly" "took ${elapsed} ms: the loop was inside the other client's send()"
+fi
+
+wait "$STALL_CLIENT" 2>/dev/null
+expect "  the stalled client is dropped, and the log says so" \
+    "$(grep -c 'no progress for' "$SRVS_ERR")" "1"
+
+etp "and the server is still serving afterwards" "$SRV_PORTS" <<'EOF'
+send USER anonymous
+send EVERYTHING COUNT 1
+send EVERYTHING SEARCH ext:txt
+sendraw EVERYTHING QUERY
+query
+EOF
+expect "  the next client is answered too" "$(prows)" "1"
+kill "$SRV_PID6" 2>/dev/null; SRV_PID6=""
 
 # ------------------------------------------- 2: the client's exact query sequence
 

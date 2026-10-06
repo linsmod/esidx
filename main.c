@@ -46,7 +46,7 @@ static void usage(void)
         "                             [-u user [-w pass]] [--no-download] [--once]\n"
 "                             [--refresh=SECS] [--save=SECS] [--watch[=SOCK]]\n"
 "                             [--watch-embed[=ROOT]] [--drop-to=USER[:GROUP]]\n"
-"                             [--sweep=SECS]\n"
+"                             [--sweep=SECS] [--stall-ms=MS]\n"
         "                             [--no-index[=LIST]]\n"
         "  esidx options <dbfile> [--no-index[=LIST]]\n"
         "\n"
@@ -64,6 +64,14 @@ static void usage(void)
         "        is design 12 risk 8 stated for this configuration. --save=SECS writes\n"
         "        the snapshot on a timer and on a clean exit, and needs --refresh or\n"
         "        --watch.\n"
+        "\n"
+        "serve --stall-ms=MS sets how long a client may have a reply queued and accept\n"
+        "        none of it before it is dropped (default 10000). Replies are written to a\n"
+        "        non-blocking socket and what does not fit stays queued, so a client that\n"
+        "        stops reading costs it its slot rather than the whole loop; MS is how long the\n"
+        "        server waits before deciding it is not coming back. The queue is also capped\n"
+        "        at 32 MB, so a client that never reads cannot make the server grow without\n"
+        "        bound.\n"
         "\n"
         "serve --watch[=SOCK] subscribes to sfa, a separate privileged proxy that turns\n"
         "        kernel filesystem events into absolute paths over a unix socket, and\n"
@@ -649,6 +657,20 @@ static int cmd_serve(int argc, char **argv)
             o.sweep_secs = v;
             continue;
         }
+        if (!strncmp(a, "--stall-ms=", 11)) {
+            int v = secs_arg(a, "--stall-ms");
+            if (v < 0) return 1;
+            /* A floor, and not only for the obvious reason: this number is also how long a
+             * wedged client stays in the table before the loop notices, so a value of zero
+             * would drop clients whose queue simply had not been reached yet. The suite runs
+             * with a second rather than ten. */
+            if (v < 100) {
+                fprintf(stderr, "serve: --stall-ms=%d is below the 100 ms floor\n", v);
+                return 1;
+            }
+            o.stall_ms = (uint64_t)v;
+            continue;
+        }
         if (a[0] == '-') {
             fprintf(stderr, "serve: unknown option %s\n", a);
             return 1;
@@ -662,7 +684,7 @@ static int cmd_serve(int argc, char **argv)
                 "usage: esidx serve <snapshot> [-p port] [--bind addr]\n"
                 "                    [-u user [-w pass]] [--no-download] [--once]\n"
                 "                    [--refresh=SECS] [--save=SECS] [--watch[=SOCK]]\n"
-                "                    [--sweep=SECS]\n");
+                "                    [--sweep=SECS] [--stall-ms=MS]\n");
         return 1;
     }
     /* Checked here rather than in watch.c, because both of these are spelling mistakes a

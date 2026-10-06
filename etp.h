@@ -69,6 +69,11 @@ typedef struct {
      * it. Independent of --watch: a deployment with no proxy can still close this hole, and
      * one with a proxy may still want the belt to the braces. */
     int         sweep_secs;
+   /* How long a client may have a reply queued and accept none of it before it is dropped, in
+    * ms; 0 means STALL_MS. It is an option because the right value is a property of the link,
+    * not of the server: 10 s is generous for a LAN and stingy for a phone on a bad cell
+    * connection, and an operator is the only one who knows which they are serving. */
+   uint64_t    stall_ms;
     /* Which derived indexes to leave unbuilt, already resolved by main.c: serve owns
      * its own esidx_t, so the flag cannot be re-read here without a second place that
      * decides. `no_index` is only read when `have_no_index` is set. */

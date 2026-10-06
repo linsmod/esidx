@@ -79,17 +79,47 @@
  * 4096-byte "folder size" in the browse list. */
 #define SIZE_UNKNOWN     "18446744073709551615"
 
+/* A client that has accepted nothing for this long is dropped (see c_flush). Wall clock, not a
+ * count of poll turns: sfa's proxy reached the same conclusion for the same reason -- a burst can
+ * produce hundreds of EAGAINs inside one turn, and a turn can be microseconds long, so counting
+ * turns drops clients that are draining normally. */
+#define STALL_MS         10000
+/* Backstop for a client that never reads: far more than any reply a client asks for (they page
+ * with COUNT), and past it the queue is a socket attached to a memory leak. */
+#define WQUEUE_MAX       (32u * 1024u * 1024u)
+
 /* ------------------------------------------------------------------ helpers */
 
 /* growable output buffer: a query reply can be a few hundred KB and must not be
- * assembled in a fixed stack frame */
+ * assembled in a fixed stack frame.
+ *
+ * `off` is how much of `p` has already gone to the socket. It exists because the reply goes to
+ * a client that may not be reading (see c_flush): what is left has to stay queued across poll
+ * turns, and moving the remainder to the front every turn is O(n^2) on a block big enough to
+ * matter. A builder that never has pending bytes leaves it at 0 and never pays for it. */
 typedef struct {
     char  *p;
-    size_t n, cap;
+    size_t n, cap, off;
 } obuf_t;
+
+static size_t obuf_pending(const obuf_t *b) { return b->n - b->off; }
+
+/* Drop the written prefix, keeping the NUL where the helpers below expect it. */
+static void obuf_compact(obuf_t *b)
+{
+    if (!b->off) return;
+    memmove(b->p, b->p + b->off, b->n - b->off);
+    b->n -= b->off;
+    b->off = 0;
+    if (b->p) b->p[b->n] = '\0';
+}
 
 static void obuf_add(obuf_t *b, const char *s, size_t n)
 {
+    /* Compact when the dead prefix is worth reclaiming, not on every append: a client that has
+     * stopped reading can have a long queue, and memmove-ing the remainder each time is the
+     * quadratic this offset exists to avoid. */
+    if (b->off > 4096 && b->off * 2 >= b->n) obuf_compact(b);
     if (b->n + n + 1 > b->cap) {
         size_t nc = b->cap ? b->cap * 2 : 16384;
         while (nc < b->n + n + 1) nc *= 2;
@@ -156,6 +186,10 @@ typedef struct {
     char     rbuf[CTL_BUF];
     size_t   rlen;
     obuf_t   wbuf;
+    /* When the client last stopped accepting bytes, in ms; 0 while it is keeping up. See
+     * c_flush(): this is how "the client gave up on the reply" becomes something the loop can
+     * act on, since a socket says nothing about a peer that is simply not reading. */
+    uint64_t stall_ms;
 
     /* ---- state the 32 subcommands mutate (design §1.1) ---- */
     match_opts_t mo;
@@ -210,19 +244,38 @@ static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
 /* ------------------------------------------------------------------ replies */
 
+/* Write what the socket will take, and keep the rest.
+ *
+ * The client socket is non-blocking and this is the only place that writes to it, which is what
+ * turns a client that stopped reading from a stopped server into a slow client. Before this,
+ * c_flush() sat in a blocking send() until the peer's window opened: one client that stopped
+ * reading froze the whole loop -- no other client answered, no event was applied, no sweep ran --
+ * and the freeze was invisible from inside, because the loop was not at poll() to notice it.
+ *
+ * Three outcomes, and the middle one is the point:
+ *   drained      the queue empties and the stall clock is cleared
+ *   EAGAIN       the peer is not reading: the rest stays queued, the clock starts, and the loop
+ *                stops asking until poll() says the socket is writable again
+ *   EPIPE, ...   the client is gone -- the slot is marked dead and the loop frees it
+ */
 static void c_flush(client_t *c)
 {
-    size_t off = 0;
-    while (off < c->wbuf.n) {
-        ssize_t w = send(c->fd, c->wbuf.p + off, c->wbuf.n - off, MSG_NOSIGNAL);
-        if (w <= 0) {
-            if (w < 0 && (errno == EINTR || errno == EAGAIN)) continue;
-            break;
+    while (obuf_pending(&c->wbuf) > 0) {
+        ssize_t w = send(c->fd, c->wbuf.p + c->wbuf.off,
+                         obuf_pending(&c->wbuf), MSG_NOSIGNAL);
+        if (w > 0) { c->wbuf.off += (size_t)w; continue; }
+        if (w < 0 && errno == EINTR) continue;
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (!c->stall_ms) c->stall_ms = ts_us() / 1000;
+            return;
         }
-        off += (size_t)w;
+        LOGD("client write failed: %s -- dropping it", strerror(errno));
+        c->fd = -1;
+        return;
     }
-    c->wbuf.n = 0;
+    c->wbuf.off = c->wbuf.n = 0;
     if (c->wbuf.p) c->wbuf.p[0] = '\0';
+    c->stall_ms = 0;
 }
 
 /* One reply line, formatted at whatever length it needs to be.
@@ -263,17 +316,24 @@ static void c_reply(client_t *c, const char *fmt, ...)
     c_flush(c);
 }
 
+/* A finished reply block goes into the client's queue and then out as far as the socket takes
+ * it. The block was assembled in one piece (send_query_results), so whatever could not be
+ * written is *copied* into the queue rather than dropped: the old c_write() dropped it, which is
+ * how a client that stopped reading half way through an answer ended up with a truncated reply
+ * and a server that had forgotten it had anything left to say. */
 static void c_write(client_t *c, const obuf_t *b)
 {
-    size_t off = 0;
-    while (off < b->n) {
-        ssize_t w = send(c->fd, b->p + off, b->n - off, MSG_NOSIGNAL);
-        if (w <= 0) {
-            if (w < 0 && (errno == EINTR || errno == EAGAIN)) continue;
-            break;
+    size_t left = obuf_pending(b);
+    if (left) {
+        obuf_add(&c->wbuf, b->p + b->off, left);
+        if (obuf_pending(&c->wbuf) > WQUEUE_MAX) {
+            LOGW("client: %.1f MB queued and still not reading; dropping it",
+                 (double)obuf_pending(&c->wbuf) / 1048576.0);
+            c->fd = -1;
+            return;
         }
-        off += (size_t)w;
     }
+    c_flush(c);
 }
 
 /* -------------------------------------------------- the query result block */
@@ -627,6 +687,16 @@ static void everything_cmd(const esidx_t *db, client_t *c,
 /* The ETP client never uses a data connection; these exist so that an
  * ordinary FTP client can LIST and RETR (design §1.3, ref G4). */
 
+/* Every socket this server writes through is non-blocking, and the reason is the same one as in
+ * c_flush(): a blocking write to a peer that stopped reading stops the whole process, and this
+ * loop is the whole process. Linux does not pass O_NONBLOCK to an accepted socket, so it is set
+ * here rather than at socket() time. */
+static void set_nonblock(int fd)
+{
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl >= 0) (void)!fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+}
+
 static void data_close(client_t *c)
 {
     if (c->pasv_listen >= 0) { close(c->pasv_listen); c->pasv_listen = -1; }
@@ -649,10 +719,15 @@ static int data_open(client_t *c)
     close(c->pasv_listen);
     c->pasv_listen = -1;
     if (fd < 0) return -1;
+    set_nonblock(fd);
     c->data_fd = fd;
     return fd;
 }
 
+/* The data connection is not queued: it is one request and one answer, and the answer goes to a
+ * socket this same loop has to keep serving. So a peer that stops reading it aborts the transfer,
+ * with a line in the log, instead of parking the process in send() -- the same trade the control
+ * connection makes with a stall clock, except that here there is nothing to come back for. */
 static void data_send(client_t *c, const char *s, size_t n)
 {
     int fd = data_open(c);
@@ -660,8 +735,15 @@ static void data_send(client_t *c, const char *s, size_t n)
     size_t off = 0;
     while (off < n) {
         ssize_t w = send(fd, s + off, n - off, MSG_NOSIGNAL);
-        if (w <= 0) { if (w < 0 && errno == EINTR) continue; break; }
-        off += (size_t)w;
+        if (w > 0) { off += (size_t)w; continue; }
+        if (w < 0 && errno == EINTR) continue;
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            LOGW("data connection: peer stopped reading with %zu bytes left; aborting the transfer",
+                 n - off);
+        else
+            LOGD("data connection: %s -- aborting the transfer", strerror(errno));
+        data_close(c);
+        return;
     }
 }
 
@@ -1652,6 +1734,9 @@ int etp_serve(const etp_opts_t *opts)
                           ? (uint64_t)opts->save_secs * 1000000ULL : 0;
     const uint64_t sweep_us = opts->sweep_secs > 0
                           ? (uint64_t)opts->sweep_secs * 1000000ULL : 0;
+    /* Resolved once: the stall deadline is read every turn for every client, and the option is
+     * not something that changes while the server runs. */
+    const uint64_t stall_ms = opts->stall_ms ? opts->stall_ms : STALL_MS;
     uint64_t next_refresh = ts_us() + refresh_us;
     uint64_t next_save    = ts_us() + save_us;
     uint64_t next_sweep   = ts_us() + sweep_us;
@@ -1709,6 +1794,27 @@ int etp_serve(const etp_opts_t *opts)
             next_watch = ts_us();
         }
 
+        /* A client whose queue has not moved for STALL_MS is dropped, and this is the only place
+         * that can notice: poll() returning 0 skips the dispatch below entirely, so a peer that
+         * never drains would otherwise sit there until the process was restarted. It belongs with
+         * the other deadlines for the same reason, and the 1000 ms poll timeout puts it within a
+         * second of the deadline.
+         *
+         * Wall clock, not a count of rounds: a burst can produce hundreds of EAGAINs inside one
+         * turn and a turn can be microseconds long, so counting rounds drops clients that are
+         * draining normally. sfa's proxy settled on the same rule for the same reason, and
+         * recorded that it had tried the counting one first. */
+        for (size_t i = 0; i < MAX_CLIENTS; i++) {
+            client_t *c = &clients[i];
+            if (c->fd < 0 || c->stall_ms == 0) continue;
+            uint64_t stalled_ms = now / 1000 - c->stall_ms;
+            if (stalled_ms < stall_ms) continue;
+            LOGW("client %d: %.1f KB queued and no progress for %llu ms; dropping it",
+                 (int)i, (double)obuf_pending(&c->wbuf) / 1024.0,
+                 (unsigned long long)stalled_ms);
+            client_free(c);
+        }
+
         struct pollfd pfd[MAX_CLIENTS + 2];
         int nfd = 0;
         pfd[nfd].fd = s;
@@ -1718,7 +1824,9 @@ int etp_serve(const etp_opts_t *opts)
         for (size_t i = 0; i < MAX_CLIENTS; i++) {
             if (clients[i].fd < 0) continue;
             pfd[nfd].fd = clients[i].fd;
-            pfd[nfd].events = POLLIN;
+            /* A client with bytes queued is waiting for the socket to turn writable, and asking
+             * for POLLOUT is what makes "the peer stopped reading" a wait rather than a stall. */
+            pfd[nfd].events = obuf_pending(&clients[i].wbuf) > 0 ? (POLLIN | POLLOUT) : POLLIN;
             map[nfd - 1] = (int)i;
             nfd++;
         }
@@ -1782,6 +1890,7 @@ int etp_serve(const etp_opts_t *opts)
                     send(cfd, busy, strlen(busy), MSG_NOSIGNAL);
                     close(cfd);
                 } else {
+                    set_nonblock(cfd);
                     client_init(&clients[slot], cfd);
                     c_reply(&clients[slot], ETP_WELCOME "\r\n");
                     served++;
@@ -1810,10 +1919,18 @@ int etp_serve(const etp_opts_t *opts)
 
         for (int i = 1; i < nfd; i++) {
             if (i == widx) continue;
-            if (!(pfd[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
             client_t *c = &clients[map[i - 1]];
-            if (pfd[i].revents & POLLIN) client_read(opts, &db, c);
-            else if (pfd[i].revents & (POLLHUP | POLLERR)) c->fd = -1;
+            /* POLLOUT is the other half of the non-blocking write: the socket has room again,
+             * so the queued tail goes out. POLLIN is a separate question and can be set at the
+             * same time -- a client that has caught up and is already asking for the next page
+             * arrives with both -- so the flush goes first and a flush that marked the client
+             * dead skips the read rather than reading from a closed fd. */
+            if (pfd[i].revents & POLLOUT) c_flush(c);
+            if (pfd[i].revents & POLLIN) {
+                if (c->fd >= 0) client_read(opts, &db, c);
+            } else if (pfd[i].revents & (POLLHUP | POLLERR)) {
+                c->fd = -1;
+            }
             if (c->fd < 0) {
                 LOGI("client %d disconnected", map[i - 1]);
                 client_free(c);
