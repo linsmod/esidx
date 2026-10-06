@@ -11,3 +11,7 @@
 /dist/
 *.idx
 *.db
+
+# the chat backup that tracks the plan; it is never committed and never packaged, and
+# leaving it untracked-but-visible made every `make dist` version string say -dirty
+/docs/todo.md
