@@ -1981,10 +1981,15 @@ the depth-1 case kept beside it as the control that has to keep working.
    - `text_match()` retried every plain substring against the *Windows* path form
      (`backslash_form()`), so `name:nm` matched every row under `/tmp/nm`: a term
      that names a file also matched every file below a directory of that name. The
-     retry is right for `path:` (clients do send backslashes — the reference's client
+     retry was right for `path:` (clients do send backslashes — the reference's client
      joins `path + "\" + name`, and spelling the PATH column POSIX does not change
-     what it sends back) and wrong for `name:`. It is now scoped to the terms that
-     Everything does — measured on one directory against voidtools' own server on
+     what it sends back) and wrong for `name:`. For the non-regex cases it is now gone
+     rather than scoped: the *value* is collapsed into one spelling (`collapse_seps()`),
+     so `sub1\x.conf`, `sub1\\x.conf` and the mixed `/work\sub` are one query — which a
+     single subject-side retry could never cover, since it can only ever match one
+     spelling. `backslash_form()` survives for `regex:` alone, where `\` is the escape
+     and a pattern cannot be rewritten without changing what it means. The name half is
+     what Everything does — measured on one directory against voidtools' own server on
      :21: `esidx` answers 3 there, the three entries *named* esidx, where reading
      the path as well would answer 280.
    - `wc_match()`'s single-`*` loop (`regex.c:619`) exited on the end of the

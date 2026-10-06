@@ -21,6 +21,16 @@ separator in it matches the **filename**, a term with a separator in it (or an
 explicit `path:`) matches the **path**, and `path:` with a value that starts with
 a star is a "contains anywhere in the path" test.
 
+A separator there is anyone's: `/`, `\` and `\\` all delimit components, and a run
+of them is one separator. The client joins `path + "\" + name`, so a POSIX
+`/work/sub` comes back as `/work\sub`, and one more layer of quoting -- or a
+Windows habit -- makes that `sub1\\x.conf`; all of them name the same path, so the
+value is collapsed into one spelling before it is matched. The exception is
+`regex:`, where `\` is the escape it is in every other regex and `\\` is a literal
+backslash: a pattern is never rewritten, and the path it has to match is offered in
+the other spelling instead. design §12.9/§12.10 carry the measurements, `test.sh`
+the rows.
+
 It also does not say whether a macro, or a `file:`/`folder:` modifier, may be
 *followed* by a term. That one changes the whole result set rather than a row:
 `folder:abc` is the folder filter **AND** the term `abc`, not "the folders, and

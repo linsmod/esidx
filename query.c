@@ -400,10 +400,12 @@ static void normalise(const char *s, char *out, size_t outsz, unsigned mode)
  * Returns false if it could not be allocated.
  *
  * This is no longer how the wire spells a path -- the PATH column is POSIX (etp.c, AGENTS.md
- * §5.2) -- but it is still how some clients *send* one: the reference's client joins
- * `path + "\" + name`, so a path handed out as `/work/sub` comes back as `/work\sub`, and a
- * user typing on Windows spells it with '\' as well. Text leaves retry against this form when
- * the POSIX one misses, rather than refusing a term that names a file we have. */
+ * §5.2) -- and a plain or wildcard term no longer needs it either: that value is collapsed into
+ * one spelling instead (collapse_seps), which is what makes `sub1\x.conf` and `sub1\\x.conf`
+ * work. What is left here is the *regex* case, where '\' is the escape and `\\` is a literal
+ * backslash: rewriting such a pattern would answer a different question, so the subject is
+ * offered in the other spelling instead. That is what keeps a regex written against the Windows
+ * shape (`gamma\\inner$`, test_etp.sh) matching. */
 static bool backslash_form(const esidx_t *db, eid_t id, scratch_t *sc)
 {
     if (!sc->buf) { sc->buf = malloc(65536); sc->cap = 65536; }
@@ -411,6 +413,30 @@ static bool backslash_form(const esidx_t *db, eid_t id, scratch_t *sc)
     path_of(db, id, sc->buf, sc->cap);
     for (char *p = sc->buf; *p; p++) if (*p == '/') *p = '\\';
     return true;
+}
+
+/* One spelling for a path *value*: '\', '\\' and '/' are all the separator, and runs of them
+ * collapse to a single '/'. The client is not obliged to know which one we want -- the
+ * reference's client joins `path + "\" + name`, so a POSIX path we handed out comes back as
+ * `/work\sub`, and a user on Windows types `sub1\x.conf` -- while a doubled '\' is what that
+ * same spelling becomes after one more layer of quoting. Normalising the *value* is what makes
+ * all of them the same query; a subject-side retry (which this replaces) could only ever match
+ * one spelling, so the doubled and mixed forms fell through it.
+ *
+ * Its own function rather than a call to normalise_path(), because the two answer different
+ * questions: that one names a directory, so it drops a trailing separator (a directory's own
+ * path has none); this one is a pattern fragment, where a trailing separator is meaningful --
+ * `path:/usr/` must keep matching what is under /usr, and a `path:` value whose star is followed
+ * by a separator must stay "a separator and then anything". */
+static void collapse_seps(const char *in, char *out, size_t outsz)
+{
+    size_t o = 0;
+    for (const char *p = in; *p && o + 2 < outsz; p++) {
+        char c = (*p == '\\') ? '/' : *p;
+        if (c == '/' && o > 0 && out[o - 1] == '/') continue;
+        out[o++] = c;
+    }
+    out[o] = '\0';
 }
 
 /* Whole-word test used by ww: and by prefix:/suffix: on a word boundary. */
@@ -467,14 +493,26 @@ static int text_match(const esidx_t *db, eid_t id, const ast_t *t,
      * same directory. So the separator is the switch, MOD_PATH is that switch said
      * out loud, and both of them select the same subject.
      *
-     * The backslash_form() retry that follows belongs to the same half of the rule. A client
-     * that joins `path + "\" + name` builds its patterns out of the paths it was handed, and
-     * it joins with '\' however the wire spelled them -- the PATH column is POSIX now, so what
-     * comes back for `/work/sub` is `/work\sub` -- so a term written for a Windows-shaped path
-     * cannot match `/home/x` and the client will keep sending it. Running that retry for a
-     * *name* is what turned `name:sub1` and a bare `sub1` into "the directory and both things
-     * in it". */
+     * The value is then collapsed into one spelling when the term reads a path and is not a
+     * regex. A client that joins `path + "\" + name` builds its patterns out of the paths it was
+     * handed -- and it joins with '\' however the wire spelled them, so the POSIX `/work/sub`
+     * comes back as `/work\sub` -- and the reference spells whole paths Windows-style, so
+     * `sub1\x.conf`, `sub1\\x.conf` and `sub1/x.conf` all arrive here. Collapsing the *value* is
+     * what makes the doubled and the mixed spelling work; the subject-side retry this replaces
+     * could only ever match one of the three.
+     *
+     * Widening a *name* term's subject is what once turned `name:sub1` and a bare `sub1` into
+     * "the directory and both things in it" -- which is why the subject is only widened here,
+     * under path_scope, and never for a name. */
     const int path_scope = (m & MOD_PATH) || strpbrk(pat, "/\\") != NULL;
+
+    /* Regexes keep the raw value: there '\' is the escape and `\\` is a literal backslash, so
+     * rewriting the pattern would answer a different question than the one asked. */
+    static __thread char pnorm[4096];
+    if (path_scope && !(m & MOD_REGEX)) {
+        collapse_seps(pat, pnorm, sizeof(pnorm));
+        pat = pnorm;
+    }
 
     const char *subj;
     if (path_scope) {
@@ -518,12 +556,7 @@ static int text_match(const esidx_t *db, eid_t id, const ast_t *t,
         normalise(pat, pb, sizeof(pb), nm);
         normalise(subj, nb, sizeof(nb), nm);
         if (!pb[0]) return 1;                    /* the term reduced to nothing */
-        if (strcasestr(nb, pb)) return 1;
-        if (path_scope && backslash_form(db, id, sc)) {
-            normalise(sc->buf, nb, sizeof(nb), nm);
-            return strcasestr(nb, pb) != NULL;
-        }
-        return 0;
+        return strcasestr(nb, pb) != NULL;
     }
 
     if (wildcard_present(pat)) {
@@ -534,18 +567,12 @@ static int text_match(const esidx_t *db, eid_t id, const ast_t *t,
          * at once. */
         if (!path_scope) return wildcard_match(pat, subj, nocase);
 
-        /* In a *path* it means "somewhere in here" (see wildcard_match_in), and
-         * `\` is a separator there rather than an escape -- the reference answers
-         * 38 for "esidx", a backslash and a star, the same 38 it answers with a
-         * forward slash, and the same 38 `find -maxdepth 1` counts, so the
-         * backslash is not escaping the star. Comparing both sides in POSIX
-         * spelling is what makes the client's own spelling work without a second
-         * pass over the wire form. */
-        static __thread char ppat[4096];
-        size_t o = 0;
-        for (const char *p = pat; *p && o < sizeof(ppat) - 1; p++)
-            ppat[o++] = (*p == '\\') ? '/' : *p;
-        ppat[o] = '\0';
+        /* In a *path* it means "somewhere in here" (see wildcard_match_in), and a backslash is a
+         * separator there rather than an escape -- the reference answers 38 for "esidx", a
+         * backslash and a star, the same 38 it answers with a forward slash, and the same 38
+         * `find -maxdepth 1` counts, so the backslash is not escaping the star. The value was
+         * collapsed into POSIX spelling above (collapse_seps), so the matcher below sees one
+         * spelling and no longer needs its own conversion. */
 
         /* `path:` with a leading star is Everything's contains form, and it is the
          * only shape where a star crosses a separator. On one directory the
@@ -566,8 +593,8 @@ static int text_match(const esidx_t *db, eid_t id, const ast_t *t,
          * directory's 3 -- the entries *named* esidx -- and a bare `*PC/esidx*` is 1
          * where contains would be 267, so neither an anchored path: value nor a
          * bare term with a separator in it may take this branch. */
-        if ((m & MOD_PATH) && ppat[0] == '*') {
-            const char *body = ppat + 1;
+        if ((m & MOD_PATH) && pat[0] == '*') {
+            const char *body = pat + 1;
             while (*body == '*') body++;
             size_t blen = strlen(body);
             bool open = blen && body[blen - 1] == '*';
@@ -582,7 +609,7 @@ static int text_match(const esidx_t *db, eid_t id, const ast_t *t,
              * shapes fail closed rather than matching something odd */
             return ends_with(subj, lit, nocase);
         }
-        return wildcard_match_in(ppat, subj, nocase);
+        return wildcard_match_in(pat, subj, nocase);
     }
 
     if (m & MOD_WHOLE)
@@ -633,9 +660,7 @@ static int text_match(const esidx_t *db, eid_t id, const ast_t *t,
     }
 
     if (!*pat) return 1;
-    if (strcasestr(subj, pat)) return 1;
-    if (path_scope && backslash_form(db, id, sc)) return strcasestr(sc->buf, pat) != NULL;
-    return 0;
+    return strcasestr(subj, pat) != NULL;
 }
 
 /* ------------------------------------------------------- extension macros */

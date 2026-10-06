@@ -139,8 +139,9 @@ static uint64_t to_filetime(int64_t unix_sec)
  * a deliberate deviation, recorded in AGENTS.md §5.2.
  *
  * What it costs is paid on the way *in* rather than out: a client that joins with '\' composes
- * `/work\sub`, so `parent:` and `path:` values arrive in either spelling and are normalised
- * (query.c's normalise_path(), plus backslash_form()'s retry). What it buys is that the path a
+ * `/work\sub`, so `parent:` and `path:` values arrive in either spelling and in mixed ones, and
+ * are normalised there (query.c: `normalise_path()` for a directory name, `collapse_seps()` for
+ * a non-regex pattern). What it buys is that the path a
  * client echoes back is the path on disk, which is the one a reader can check.
  *
  * Kept as a comment where the conversion used to be, because the reverse -- turning every '/'

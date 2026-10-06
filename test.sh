@@ -783,6 +783,21 @@ q 'sub1\*.conf'              ; expect "a backslash separates there too"  "$(n "$
 q 'sub1/*'                   ; expect "a star stops at the next separator" "$(n "$LAST")" "2"
 q 'ub1/*'                    ; expect "a wildcard may not start mid-component" "$(n "$LAST")" "0"
 q 'ub1/x.conf'               ; expect "but a literal may: it is a substring" "$(n "$LAST")" "1"
+# The three spellings of a separator are one separator. A client that joins `path + "\" + name`
+# turns `/work/sub` into `/work\sub`, and one more layer of quoting -- or a Windows habit -- makes
+# that `\\`, so all of them have to name the same path (AGENTS.md §5.2). The value is collapsed
+# into one spelling before matching; a regex is excluded, because there '\' is the escape and `\\`
+# is a literal backslash, which the last assertion pins.
+q 'sub1\x.conf'              ; expect "a backslash is a separator here too"  "$(n "$LAST")" "1"
+q 'sub1\\x.conf'             ; expect "a doubled backslash is one separator" "$(n "$LAST")" "1"
+q 'sub1///x.conf'            ; expect "so is a run of separators"            "$(n "$LAST")" "1"
+# A mixed spelling is the client's own shape: `path + "\" + name` puts one separator of each
+# kind into one value. The terms in this section are relative because the section indexes the
+# flat fixture -- an absolute `$TREE/...` names a tree this DB does not hold.
+q 'sub1\deep/leaf.txt'       ; expect "a mixed spelling is one path"          "$(n "$LAST")" "1"
+q 'sub1\\*'                  ; expect "wildcards collapse the same way"      "$(n "$LAST")" "2"
+q 'path:regex:sub1\\x'       ; expect "regex is not collapsed: \\ is a literal backslash" \
+    "$(n "$LAST")" "1"
 # `path:` + a value that *starts* with a star is Everything's contains form -- the
 # one shape where a star crosses a separator. Reference, same directory:
 #   path:*esidx*   ->  280 = every path containing esidx (ours 268: the reference's
