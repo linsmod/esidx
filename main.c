@@ -525,10 +525,22 @@ static int singleton_lock(const char *dbfile)
      * hand-run `serve` of the same snapshot runs as the service user. Read-only is enough to
      * hold a lock, so a refused write-open falls back rather than refusing a legal start. */
     int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-    if (fd < 0) fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
-        fprintf(stderr, "serve: cannot open the lock file %s: %s\n", path, strerror(errno));
-        return -1;
+        /* The errno that matters is this one, not the fallback's. open(O_RDONLY) without
+         * O_CREAT reports ENOENT for a file that does not exist however the creation failed,
+         * and the difference is the whole diagnosis: "no such file" reads like the snapshot
+         * moved, while the real cause -- EACCES on a directory this identity may not write,
+         * read-only file system -- says what to change. Measured the hard way: the packaged
+         * service reported ENOENT for a lock file it was refused permission to create. */
+        int werr = errno;
+        fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            fprintf(stderr, "serve: cannot open the lock file %s: %s\n", path, strerror(werr));
+            fprintf(stderr, "serve: holding it needs a directory this identity may create the "
+                            "file in, or an existing lock file it may read (a lock needs no "
+                            "write access)\n");
+            return -1;
+        }
     }
 
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {

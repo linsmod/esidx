@@ -17,6 +17,17 @@ EnvironmentFile=/etc/default/esidx
 # two-process split's answer, and still available (README, "Deployment"): run sfa-server
 # separately and pass --watch=${ESIDX_SOCKET} instead of --watch-embed.
 #
+# Group= is the one identity line that *is* set, and it is here for a permission that is easy
+# to miss: this unit starts as root, but the CapabilityBoundingSet below does not include
+# CAP_DAC_OVERRIDE, so until it drops, uid 0 cannot ignore file modes -- root in name only. The
+# lock file that keeps one snapshot from being served twice lives in the state directory, which
+# is owned by this group and group-writable (2775, postinst), and it is created *before* the
+# drop: without Group=esidx that creation is EACCES in a directory the process does not own, and
+# the service answers "cannot open the lock file" instead of starting. Measured on r7000 right
+# after the lock was added -- which is why the state directory's mode and this line are one
+# decision rather than two.
+Group=esidx
+#
 # What the drop keeps is measured, not chosen: CAP_DAC_READ_SEARCH survives because
 # open_by_handle_at needs it to turn an event into a path, and without it every batch becomes a
 # full sweep. The numbers are in watch.c, next to the code.

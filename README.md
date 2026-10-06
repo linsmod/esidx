@@ -153,6 +153,17 @@ that a server has loaded is the operator's call. The server keeps answering from
 memory, and a `--save` would write that copy back over the rebuild, so rebuild and then restart
 (which is what an upgrade does), or build to another path.
 
+The lock lives beside the snapshot, which makes its permissions part of the deployment: it is
+created **before** the server gives its privilege back, and the unit's capability set does not
+include `CAP_DAC_OVERRIDE` — so until it drops, the process is uid 0 that cannot ignore file
+modes, and a directory owned by someone else at 0755 refuses it. Hence `/var/lib/esidx` is
+`esidx:esidx` **2775** (package-owned, setgid, group-writable), the unit runs `Group=esidx`, and
+`postinst` puts `ESIDX_USER` and the installing user in that group: three identities write in
+there — the process before the drop, the user it becomes, and the admin building snapshots — and
+a directory can belong to only one of them. The failure this replaces is worth recognising:
+`serve: cannot open the lock file …` at startup on a directory that looks perfectly writable on
+a shell, because an ordinary root shell *does* have `CAP_DAC_OVERRIDE` and the service does not.
+
 `make deb-verify` unpacks the package and **runs what came out of it**: the packaged server
 builds a snapshot, the packaged proxy probes fanotify, the unit's `ExecStart` names a binary
 the package actually installs (a unit pointing at `/usr/local/bin` while the package installs

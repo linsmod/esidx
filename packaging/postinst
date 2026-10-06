@@ -50,10 +50,9 @@ case "$1" in
         done
 
         # 1. the user and group. The user is what the server becomes once the fanotify group
-        #    is open (--drop-to=), and it owns the snapshot; the group is only its primary
-        #    group now -- there is no socket group to join, because the privileged half is the
-        #    same process (it still creates a socket, for the two-process form's callers, but
-        #    nothing in this package connects to it).
+        #    is open (--drop-to=), and it owns the snapshot; the group is what shares the state
+        #    directory between the three identities that write there, and what the unit runs in
+        #    before it drops (Group=esidx, see the unit).
         if ! getent group "$SYSGROUP" >/dev/null 2>&1; then
             addgroup --system "$SYSGROUP" >/dev/null 2>&1 \
                 || die "cannot create group $SYSGROUP"
@@ -65,10 +64,52 @@ case "$1" in
                 || die "cannot create user $SYSUSER"
         fi
 
-        # 2. the state directory. The snapshot is data, not a system file: it is excluded
-        #    from conffiles precisely so that an upgrade never asks about it, because it is
-        #    large, regenerable and nobody edits it.
-        install -d -o "$SYSUSER" -g "$SYSGROUP" -m 0755 "$VARLIB"
+        # 1b. who the server will become, read here rather than at the end: it decides the group
+        #     membership below, and reading a variable after the thing it configures is how a
+        #     script ends up arranging one deployment and describing another.
+        svc=$(read_kv ESIDX_USER)
+        [ -n "$svc" ] || svc=$SYSUSER
+
+        # 2. the state directory: the snapshot and the lock file live here. It is owned by the
+        #    dedicated user and shared with the dedicated group -- 2775, not 0755 -- because
+        #    three identities write here and only one of them is that user:
+        #      - the unit's process *before* it gives the privilege back. Its capability set
+        #        does not include CAP_DAC_OVERRIDE, so uid 0 is "other" as far as file modes are
+        #        concerned: it may create the lock file here only by belonging to the group that
+        #        owns the directory (Group=esidx). With the old 0755 the lock could not be
+        #        created at all and the service died with "cannot open the lock file" instead of
+        #        starting -- measured on r7000, immediately after the lock was added.
+        #      - the user the server becomes (ESIDX_USER), which rewrites the snapshot when
+        #        --save is on; it is put in this group below.
+        #      - the admin who runs `esidx build -o ...` and inspects the result: the invoking
+        #        user is put in this group below too.
+        #    setgid, so whatever any of the three creates keeps the group instead of becoming
+        #    writable by one of them and inaccessible to the other two.
+        install -d -o "$SYSUSER" -g "$SYSGROUP" -m 2775 "$VARLIB"
+
+        # 2b. group membership for the two identities above that are not the dedicated user.
+        #     The package does this rather than printing instructions, because a deployment that
+        #     needs an admin to remember two usermod calls is one that gets half-arranged -- and
+        #     the half that is missing here is the half that can write the state directory.
+        if [ "$svc" != "$SYSUSER" ] && getent passwd "$svc" >/dev/null 2>&1; then
+            if ! id -nG "$svc" 2>/dev/null | tr ' ' '\n' | grep -qx "$SYSGROUP"; then
+                usermod -aG "$SYSGROUP" "$svc" || die "cannot add $svc to $SYSGROUP"
+                echo "esidx: ESIDX_USER=$svc added to $SYSGROUP, so it can write $VARLIB." >&2
+            fi
+        fi
+        # The user who installed it is not part of the privilege boundary -- it runs no part of
+        # the service -- but it is the identity that builds snapshots into $VARLIB by hand.
+        if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ] && [ "$SUDO_USER" != "$SYSUSER" ]; then
+            if ! id -nG "$SUDO_USER" 2>/dev/null | tr ' ' '\n' | grep -qx "$SYSGROUP"; then
+                if usermod -aG "$SYSGROUP" "$SUDO_USER" 2>/dev/null; then
+                    echo "esidx: $SUDO_USER added to $SYSGROUP, so $VARLIB is reachable from" >&2
+                    echo "       that account as well (log out and back in for it to apply)." >&2
+                else
+                    echo "esidx: could not add $SUDO_USER to $SYSGROUP; add it by hand to work" >&2
+                    echo "       in $VARLIB." >&2
+                fi
+            fi
+        fi
 
         # 3. A unit in /etc/systemd/system overrides the packaged one in /usr/lib. That is
         #    systemd's design and it is correct for an admin who means it -- but it is also
@@ -115,8 +156,8 @@ case "$1" in
         # package created: the index is a view of what that identity may read, and building it
         # as anyone else quietly produces a smaller one -- the service then answers as if the
         # files were not there. Measured on r7000: 5 372 563 entries as the service account
-        # against 5 476 485 as the deploying user, 1 407 directories the difference.
-        svc=$(read_kv ESIDX_USER)
+        # against 5 476 485 as the deploying user, 1 407 directories the difference. That is why
+        # the command below is printed with $svc (read in step 1b).
         [ -n "$db" ] || db=$VARLIB/root.idx
         [ -n "$root" ] || root=/
         [ -n "$port" ] || port=2121

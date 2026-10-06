@@ -20,8 +20,12 @@ ESIDX_ROOT=/work
 # which does not belong in a maintainer script -- so it is usually absent until you run:
 #     sudo -u esidx esidx build "$ESIDX_ROOT" -o "$ESIDX_DB"
 # The server refuses to start without it: a search service answering from no snapshot would
-# answer from nothing. The snapshot must stay readable (and writable, for --save) by
-# ESIDX_USER, which is why the state directory is owned by it.
+# answer from nothing. The snapshot must stay readable by ESIDX_USER, and writable by it if
+# --save is on. That is arranged with the group rather than with ownership: the directory is
+# owned by the dedicated user and shared with the dedicated group (2775, postinst), and
+# ESIDX_USER is put in that group. Three identities write here -- the unit's process before it
+# drops, the user it becomes, and the admin who builds snapshots -- and a directory can belong
+# to only one of them.
 #
 # Keep this path off /tmp. The unit sets PrivateTmp=yes, so its /tmp is a private mount and
 # the host's /tmp is not visible inside it -- put the snapshot there and the unit dies at
