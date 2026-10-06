@@ -658,14 +658,19 @@ static int cmd_serve(int argc, char **argv)
             continue;
         }
         if (!strncmp(a, "--stall-ms=", 11)) {
-            int v = secs_arg(a, "--stall-ms");
-            if (v < 0) return 1;
-            /* A floor, and not only for the obvious reason: this number is also how long a
-             * wedged client stays in the table before the loop notices, so a value of zero
-             * would drop clients whose queue simply had not been reached yet. The suite runs
-             * with a second rather than ten. */
-            if (v < 100) {
-                fprintf(stderr, "serve: --stall-ms=%d is below the 100 ms floor\n", v);
+            /* Not secs_arg(): that one parses seconds and says so, in both the accepted range
+             * and the error -- "needs a number of seconds (0..86400)" under a flag whose unit
+             * is milliseconds, with a day for a ceiling. A patience knob is not worth a
+             * confidently wrong message. */
+            const char *val = a + 11;
+            char *end = NULL;
+            long v = strtol(val, &end, 10);
+            /* The 100 ms floor is not tidiness: this number is also how long a wedged client
+             * stays in the table before the loop notices, so a value below a poll turn or two
+             * would drop clients whose queue simply had not been reached yet. */
+            if (!*val || (end && *end) || v < 100 || v > 3600000) {
+                fprintf(stderr, "serve: --stall-ms needs 100..3600000 milliseconds (0.1 s to\n"
+                                "       1 h), not '%s'\n", val);
                 return 1;
             }
             o.stall_ms = (uint64_t)v;
