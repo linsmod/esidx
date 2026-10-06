@@ -1,0 +1,100 @@
+#ifndef ESIDX_WATCH_H
+#define ESIDX_WATCH_H
+
+/* The watcher's job is narrow: turn "something changed" into the set of directories that
+ * need listing again, which is the same answer `esidx_update()` computes from directory
+ * stamps -- only obtained without polling.
+ *
+ * The events come from sfa (a submodule, its own repository) rather than from a fanotify
+ * group of our own, and that is a decision about privilege rather than about code:
+ * fanotify_init() needs CAP_SYS_ADMIN, so a server that called it directly could only be
+ * a root process. esidx must not need root to serve a search index, so the capability
+ * lives in one small separate daemon and this file is its client.
+ *
+ * What a kernel event can tell us and what the names pass can act on are not the same set,
+ * and the difference decides the subscription (esidx_watch_open):
+ *
+ *   CREATE / DELETE / MOVED  a *name* appeared, vanished or changed side. Listing the
+ *                            directory that holds the name finds it, which is what
+ *                            reconcile_dir() does.
+ *   CLOSE_WRITE / ATTRIB     an existing entry's *attributes* moved. Listing the parent
+ *                            directory cannot see it -- the name is the same -- so there
+ *                            is nothing for a names pass to do, and subscribing would buy
+ *                            a directory listing per write and still leave size/mtime
+ *                            stale. §12 risk 8 is therefore unchanged by this layer; the
+ *                            per-file path is a separate one.
+ *
+ * So the guarantee this layer adds is narrow and worth stating exactly. While the server is
+ * connected, every name change *the proxy reports* reaches the index within one event batch.
+ * What the proxy could not report arrives as its loss signal instead of silence
+ * (SFA_EV_UNRESOLVED, and SFA_EV_OVERFLOW for a kernel queue that ran over), and that
+ * subscription is not optional: the proxy filters the signal on the subscriber's mask like
+ * any other event, so a client that leaves those bits out is never told what it missed.
+ *
+ * The answer to a loss signal is a mark of the root, and that answer is narrower than the
+ * signal deserves: a root mark is a pass that descends into a directory only when that
+ * directory's stamp moved, so it reaches a change whose ancestors' stamps moved and does not
+ * reach one buried under unchanged directories -- the same limit the offline names pass has
+ * (test.sh, "changes below an unchanged directory"), and the reason a periodic pass is still
+ * worth having. Widening it is the sweep pass, which does not exist yet.
+ *
+ * Attribute freshness remains a --refresh/--deep question, unchanged by any of this.
+ */
+
+#include <stddef.h>
+#include <stdint.h>
+#include "esidx.h"
+
+typedef struct esidx_watch esidx_watch_t;
+
+typedef struct {
+    uint64_t events;     /* event messages read off the socket */
+    uint64_t marked;     /* dirty marks made, before esidx_refresh_dirs() de-duplicates */
+    uint64_t outside;    /* events for a path outside the index root (the mark covers a
+                         * whole filesystem, so this is the normal case for a busy machine) */
+    uint64_t unknown;    /* under the root, but the parent directory is not in the index:
+                         * a subtree that was removed, or an event between the startup
+                         * repair pass and the first reconcile (ref B4) */
+uint64_t overflow;   /* the kernel queue overflowed; a full pass is the only honest answer */
+    uint64_t unresolved; /* the proxy reported events it could not attribute to a path, or had
+                          * to drop because this client was not draining fast enough. Treated like
+                          * an overflow rather than ignored: an event we cannot name is an event
+                          * we must not pretend to have handled, and one signal covers a whole
+                          * read batch, so this counts batches rather than events. */
+    uint64_t batches;    /* drain() calls that marked something */
+} watch_stats_t;
+
+/* Connect and subscribe. `root` is the index root and is compared against event paths
+ * without a trailing slash; the reason esidx does its own prefix test is in
+ * sfa/issues/closed/subscribe-prefix-filter.md: the mark is a whole filesystem, so an index
+ * on /usr is sent every change made anywhere on it. The proxy grew a `--prefix` option for
+ * that, and an operator should use it -- but the test stays here anyway, because one proxy
+ * may serve several indexes with different roots and a proxy started with no prefix (or a
+ * wider one) must not be able to mark a directory this index has never heard of. Measured on
+ * a fixture that wrote 100 files inside the root and 100 beside it: 196 events, 96 of them
+ * outside, i.e. half the stream is spent on paths `under_root()` throws away.
+ *
+ * `err` receives a one-line reason on failure. Returns NULL on failure. */
+esidx_watch_t *esidx_watch_open(const char *sock_path, const char *root,
+                                char *err, size_t errlen);
+
+/* The socket, for the caller's poll set. -1 only before a successful open. */
+int esidx_watch_fd(const esidx_watch_t *w);
+
+/* Read every message the socket has ready and mark the parent directory of each path.
+ * Called when poll() says the fd is readable, and it must drain rather than take one
+ * message: a batch of 10 000 events in a build tree is one reconcile per *directory*
+ * after de-duplication, and taking one message per poll would pay the reconcile N times.
+ *
+ * Returns the number of marks made, 0 if there was nothing to do, -1 on a protocol or
+ * socket error, and -2 if the proxy went away. -2 is not the same as 0 and must not be
+ * folded into it: sfa_recv() reports "nothing to read" and "peer closed" identically, and
+ * the difference between an index that is current and one that has quietly stopped being
+ * current is exactly this return value (esidx_watch_drain peeks to tell them apart). */
+int esidx_watch_drain(esidx_watch_t *w, esidx_t *db);
+
+const watch_stats_t *esidx_watch_stats(const esidx_watch_t *w);
+
+void esidx_watch_close(esidx_watch_t *w);
+
+#endif /* ESIDX_WATCH_H */

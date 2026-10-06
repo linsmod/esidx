@@ -54,11 +54,24 @@ Each layer has its own suite, and they are separate files on purpose:
 |---|---|---|
 | `test.sh` | the **index**, against `find(1)`; plus a **language** suite against a flat fixture | scan, storage or parsing is wrong |
 | `test_etp.sh` | the **wire**, against the ETP client's own parsing rules | a reply would not be understood by the client |
+| `test_watch.sh` | the **watcher**: kernel events → dirty directories → visible rows | an event is mapped to the wrong directory, or the index is not current within one batch. Needs root and skips without it — see below |
 | `round.sh` | nothing — it is the end-to-end demonstration and the source of the numbers in the docs | (prints timings; asserts nothing) |
 | `cmp_ref.sh` | nothing — it re-measures every expected value quoted against the reference server (§1.4) | (prints a table; when the two indexes differ by more than 0 it prints the entries that make up the difference and stats each one, so a delta is classified rather than assumed; `--strict` exits 1 on a row the delta does not explain) |
 
 Run the index suite before the protocol suite. A parse regression shows up as a
 protocol failure otherwise, and you will spend an hour in the wrong file.
+
+`test_watch.sh` is **not** part of `make check`, on purpose: it needs `CAP_SYS_ADMIN`
+(the `sfa` proxy is the privileged half) and every machine without that privilege would
+fail the gate on a feature the protocol does not need. It skips with the reason printed
+when `sfa-server --probe` says no, so "it did not run" and "it passed" are never
+confused. Run it by hand after touching `watch.c`, `etp.c`'s poll loop, or the dirty
+set — and both flavours:
+
+```sh
+make && ./test_watch.sh
+ESIDX_BUILD=dbg ASAN_OPTIONS=detect_leaks=1 ./test_watch.sh
+```
 
 **A number in a comment is only worth something if the command that produced it is
 in the repo.** Every expected value this project quotes against the reference —
@@ -397,6 +410,7 @@ Record that in the commit message. Examples from this codebase:
 | `sort:attributes:` and `sort:inverse_size:` on the CLI silently sorted by **name** | `main.c` carried its own list of sort keys beside the 22-name table the ETP path uses, and the two drifted. The ETP wire was always right, so `test_etp.sh` could not see it; and a name sort and an attribute sort return the same *rows*, so a row count could not either. What found it was a measurement that made no sense — a numeric key 2.4x faster than the same key with an integer compare. The CLI now goes through `sort_from_etp_name()` and **refuses** an unknown key |
 | `sort -f` is not a case-insensitive byte order, and neither is `tr A-Z a-z \| sort` | GNU sort folds for *equality* but orders by the original bytes; under `LC_ALL=C` it compares bytes **signed** while `strcasecmp` compares unsigned, so any byte >= 0x80 lands in the other half of the order. Both agree with `strcasecmp` on a lower-case fixture, so an assertion written against them passes for the wrong reason — which is how a `sort -f` oracle survived a commit. The oracle is `tools/order_ref.c`, which *is* `strcasecmp` |
 | a name sort ordered two names that differ only in case by their raw bytes, not by id | the ranked path never copies the display name into the arena — that is what the rank is for — so `dn` stayed a pointer to the **unfolded** name and `cmp_folded` `memcmp`-ed the bytes as stored, which is not `strcasecmp`. Every order fixture had distinct names, so the tie-break was unreachable, and the no-rank fallback (which *does* fold `dn`) silently disagreed with the ordinary path about the same rows. A bug in one level of a multi-level sort is invisible until a fixture reaches that level — and `order-ref -c` cannot express it either, since it sorts the file it is given, so the case assertion compares against `find(1)`'s order (the id order) with `cmp` |
+| a rename at depth 2 was invisible to the names pass | the reach of the stamp gate was never asked as a question: `reconcile_dir()` descends by comparing a **child's** stamp, so a directory is reached only through its parent, and an isolated change moves only the stamp of the directory holding the name. Every fixture change sat at depth 1 (`test.sh`'s `INC/one.txt`, `INC/a/three.txt`) or created a subtree whose *top* was a direct child of the root (which B5 descends into), and design §7's table asserted "correct for anything that changes a name" — so the claim and the fixtures agreed with each other and neither was checked against `find`. Found by the watcher's loss path: `SFA_EV_UNRESOLVED` answers with a mark of the root, a rename the proxy cannot resolve is invisible until a deep pass, and `test_watch.sh` asserted the convergence. Fixed in the same shape as every other entry here: a failing assertion first (a create and a rename at `a/b`, one level of depth for contrast), then the fix, then §12 risk 8 rewritten to state the reach instead of the intent |
 | a new row was invisible to `size:`/`dm:`/`dc:`, the result cache never compared `db->epoch`, and a skipped sorted array could be merged into existence | all three are on the path `esidx update` takes and on no other: it exits, so the next process rebuilds the sorted arrays from the columns (`esidx_add` never pushed them), the epoch could not move under a live connection (serve never called `esidx_update`), and the delta it left behind died with it. 337 + 217 green assertions, and two of the three were *promised in a header* — `esidx.h:485` and design §6.4. The reachability test needs a process that appends and answers in the same breath, so it needed `serve --refresh` to exist first: one connection, two identical QUERYs, the disk changed in between, and no `cache hit` in the log |
 
 ### 3.5 A test that cannot fail is worse than no test

@@ -1,0 +1,3 @@
+[submodule "sfa"]
+	path = sfa
+	url = https://github.com/linsmod/sub-fanotify.git

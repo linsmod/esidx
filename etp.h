@@ -42,6 +42,12 @@ typedef struct {
      * it blocks the serve loop for as long as it takes to write, and how often that is
      * worth doing is a policy question about I/O, not about staleness. */
     int         save_secs;
+    /* The sfa socket to subscribe to, or NULL for no watcher. --refresh and --watch are
+     * two answers to the same question (what changed) and are independent: either one
+     * makes the server self-updating, either one makes a --save timer meaningful, and
+     * either one makes the startup repair pass necessary, because a change between the
+     * snapshot on disk and the subscription is invisible to the subscription. */
+    const char *watch_sock;
     /* Which derived indexes to leave unbuilt, already resolved by main.c: serve owns
      * its own esidx_t, so the flag cannot be re-read here without a second place that
      * decides. `no_index` is only read when `have_no_index` is set. */

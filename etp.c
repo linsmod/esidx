@@ -44,6 +44,7 @@
 #include "etp.h"
 #include "syntax.h"
 #include "timer.h"
+#include "watch.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -1301,6 +1302,99 @@ static void serve_refresh(esidx_t *db)
         LOGW("refresh: reconcile failed; still serving the index as it was");
 }
 
+/* How long a batch may keep growing before it is applied.
+ *
+ * Measured on WSL2, 1000 files written by 8 parallel processes: 975 batches, 1.03 events
+ * each, 1.00 directory each, no overflow -- the drain loop keeps up with a fast writer
+ * easily. That is the good news and the bad news at once: keeping up means events arrive
+ * one at a time, and the dirty set is de-duplicated per batch, so the cost is one
+ * reconcile *per event* -- 0.4-0.7 ms each here, which is 0.5 s of a loop that answers
+ * nobody for a build that wrote 1000 files. The set would collapse 975 marks into one
+ * listing if the batches were bigger, and the only thing that makes them bigger is waiting.
+ *
+ * 50 ms because the alternative is invisible and this is not: a search box showing a
+ * result 50 ms later is not a thing a person notices, and the index it is reading is
+ * reconciled 50x less often under exactly the load that needs it. The mark count is the
+ * other half -- a burst larger than WATCH_COALESCE_MARKS is applied at once rather than
+ * waiting, so the wait can never turn into an unbounded delay for a tree that is being
+ * written hard. */
+#define WATCH_COALESCE_MS   50
+#define WATCH_COALESCE_MARKS 256
+
+/* Drain the watcher. The marks are not applied here: they go into the pending count and
+ * the loop applies them when the batch has stopped growing (see WATCH_COALESCE_MS). The
+ * two are separate because the mark is cheap and batched while the apply is what costs,
+ * and because the moment to apply is a decision the loop has to make with its own timers
+ * in view. */
+static int serve_watch(esidx_t *db, esidx_watch_t **w)
+{
+    /* Read before the drain, not after: the counters are session totals and the line below
+     * is about this poll turn. Taking the difference after the drain would print 0. */
+    const watch_stats_t *ws = esidx_watch_stats(*w);
+    uint64_t events_before = ws ? ws->events : 0;
+
+    int marked = esidx_watch_drain(*w, db);
+    if (marked == -2) {
+        /* The proxy went away. Not fatal: the index is intact and --refresh, if it is set,
+         * still repairs it. What must not happen is silently carrying on as though the
+         * events were still coming, so this is a warning and the watcher is dropped. */
+        ws = esidx_watch_stats(*w);
+        LOGW("watch: the sfa proxy at fd %d is gone after %llu events; no longer watching. "
+             "The index is as it stands -- use --refresh to keep repairing it",
+             esidx_watch_fd(*w), (unsigned long long)(ws ? ws->events : 0));
+        esidx_watch_close(*w);
+        *w = NULL;
+        return 0;
+    }
+    if (marked < 0) {
+        LOGW("watch: the connection failed; dropping the watcher");
+        esidx_watch_close(*w);
+        *w = NULL;
+        return 0;
+    }
+    if (!marked) return 0;
+
+    ws = esidx_watch_stats(*w);
+    LOGD("watch: %llu event(s) -> %d mark(s) (%llu outside the root, "
+         "%llu not in the index)",
+         (unsigned long long)((ws ? ws->events : 0) - events_before), marked,
+         (unsigned long long)(ws ? ws->outside : 0),
+         (unsigned long long)(ws ? ws->unknown : 0));
+    return marked;
+}
+
+/* Apply whatever the watcher has marked. This is the expensive half, and the log line is
+ * the only place its cost is visible, so it says which of the two mechanisms asked for it:
+ * `from` is "the watcher" or "the timer", because a line that did not distinguish them
+ * would hide which one is doing the work in a configuration that has both. */
+static void serve_apply_watch(esidx_t *db, esidx_watch_t *w, int *pending, const char *from)
+{
+    int marks = *pending;
+    *pending = 0;
+    if (!marks) return;
+
+    update_stats_t st;
+    uint64_t t0 = ts_us();
+    if (esidx_refresh_dirs(db, EU_NOCOMPACT, &st) != 0) {
+        LOGW("watch: reconcile of %d mark(s) failed; still serving the index as it was",
+             marks);
+        return;
+    }
+    /* `marks` is what the events asked for and `dirs_reconciled` is what it cost, and the
+     * gap between them is the point of the coalescing window: one listing per directory,
+     * however many events named it. Printing only the first would read as one directory
+     * pass per event. */
+    const watch_stats_t *ws = esidx_watch_stats(w);
+    LOGI("watch: %s applied %d mark(s) over %u director%s -> %u added, %u removed, "
+         "%u refreshed in %.1f ms (%llu events so far, %llu outside the root, %llu not in "
+         "the index)",
+         from, marks, st.dirs_reconciled, st.dirs_reconciled == 1 ? "y" : "ies",
+         st.added, st.removed, st.refreshed, (double)(ts_us() - t0) / 1000.0,
+         (unsigned long long)(ws ? ws->events : 0),
+         (unsigned long long)(ws ? ws->outside : 0),
+         (unsigned long long)(ws ? ws->unknown : 0));
+}
+
 /* Write the snapshot, but only if something has changed since the last write.
  *
  * `since` is the epoch the file on disk corresponds to, so "nothing changed" needs no
@@ -1348,11 +1442,31 @@ int etp_serve(const etp_opts_t *opts)
      * rather than one it inherited. */
     uint64_t saved_epoch = db.epoch;
 
-    /* One pass before the listener exists, not on the first tick: a client that
-     * connects in the first interval must be answered from an index that has already
-     * looked, and the pass is the same one the offline update runs, so "the server just
-     * started" and "the server is up to date" cannot be different claims. */
-    if (opts->refresh_secs > 0) {
+    /* Subscribe *before* the repair pass, not after it. A change made between the snapshot on
+     * disk and the subscription is invisible to the subscription, so the pass is the only
+     * thing that can catch it; a change made during the pass queues in the socket and is
+     * applied by the first drain. The other order leaves a window in which a change is
+     * reported to nobody and the server calls itself current.
+     *
+     * One pass before the listener exists, not on the first tick: a client that connects
+     * in the first interval must be answered from an index that has already looked, and the
+     * pass is the same one the offline update runs, so "the server just started" and "the
+     * server is up to date" cannot be different claims. */
+    esidx_watch_t *watch = NULL;
+    if (opts->watch_sock) {
+        char root[PATH_MAX], err[256];
+        path_of(&db, db.root_eid, root, sizeof(root));
+        watch = esidx_watch_open(opts->watch_sock, root, err, sizeof(err));
+        if (!watch) {
+            /* Refusing to start is the point: a --watch that silently does nothing is a
+             * server that answers from a frozen index and logs nothing, which is the
+             * failure mode this layer exists to remove. */
+            fprintf(stderr, "watch: %s\n", err);
+            esidx_free(&db);
+            return -1;
+        }
+    }
+    if (opts->refresh_secs > 0 || watch) {
         uint64_t r0 = ts_us();
         serve_refresh(&db);
         LOGI("serve: startup repair pass in %.1f ms", (double)(ts_us() - r0) / 1000.0);
@@ -1416,6 +1530,20 @@ int etp_serve(const etp_opts_t *opts)
                             "snapshot only on a clean exit\n",
                     opts->refresh_secs);
     }
+    if (watch) {
+        char root[PATH_MAX];
+        path_of(&db, db.root_eid, root, sizeof(root));
+        /* Saying what the subscription does *not* cover is part of the banner: names
+         * become current, attributes do not (§12 risk 8), and an operator reading only
+         * the first line would otherwise assume otherwise. The middle clause is the other
+         * half of the same honesty -- a batch the proxy could not attribute to a path is
+         * answered with a full pass rather than skipped, so "current" does not quietly
+         * depend on the proxy having resolved everything. */
+        fprintf(stderr, "esidx: watching %s via %s -- name changes become visible "
+                        "within one batch; size/mtime still follow --refresh/--deep; "
+                        "an event the proxy cannot place costs a full pass\n",
+                root, opts->watch_sock);
+    }
     fflush(stderr);
 
     client_t clients[MAX_CLIENTS];
@@ -1428,6 +1556,16 @@ int etp_serve(const etp_opts_t *opts)
                           ? (uint64_t)opts->save_secs * 1000000ULL : 0;
     uint64_t next_refresh = ts_us() + refresh_us;
     uint64_t next_save    = ts_us() + save_us;
+
+    /* Either mechanism can change the index, and a server that changed it and exits without
+     * writing is a day of work thrown away -- so the clean-exit save is keyed on this, not
+     * on the refresh timer alone. */
+    const int mutating = opts->refresh_secs > 0 || watch != NULL;
+
+    /* Marks the watcher has made and not yet applied, and the moment this batch has been
+     * quiet long enough to be worth a reconcile. `next_watch == 0` means nothing pending. */
+    int pending_marks = 0;
+    uint64_t next_watch = 0;
 
     uint64_t served = 0;
     while (!g_stop) {
@@ -1446,8 +1584,16 @@ int etp_serve(const etp_opts_t *opts)
             serve_save(&db, opts->dbfile, &saved_epoch, "timer");
             next_save = ts_us() + save_us;
         }
+        /* Apply the watcher's batch once it has stopped growing, or immediately if it grew
+         * past the cap. Checked here, with the other deadlines, for the reason the comment
+         * above this loop gives: poll() returning 0 is how the loop wakes up at all. */
+        if (pending_marks &&
+            (next_watch == 0 || ts_us() >= next_watch)) {
+            serve_apply_watch(&db, watch, &pending_marks, "a batch of events");
+            next_watch = 0;
+        }
 
-        struct pollfd pfd[MAX_CLIENTS + 1];
+        struct pollfd pfd[MAX_CLIENTS + 2];
         int nfd = 0;
         pfd[nfd].fd = s;
         pfd[nfd].events = POLLIN;
@@ -1459,6 +1605,14 @@ int etp_serve(const etp_opts_t *opts)
             pfd[nfd].events = POLLIN;
             map[nfd - 1] = (int)i;
             nfd++;
+        }
+        /* Last, so pfd[0] stays the listener and map[i - 1] stays the client mapping --
+         * both of which the loop below hard-codes. */
+        int widx = -1;
+        if (watch) {
+            pfd[nfd].fd = esidx_watch_fd(watch);
+            pfd[nfd].events = POLLIN;
+            widx = nfd++;
         }
         /* Wake for whichever comes first: a client, or the next deadline. Without the
          * second term the timer resolution is the 1000 ms poll timeout, which happens to
@@ -1473,6 +1627,14 @@ int etp_serve(const etp_opts_t *opts)
         if (save_us && next_save > now) {
             int64_t ms = (int64_t)((next_save - now) / 1000);
             if (ms < tmo) tmo = (int)ms;
+        }
+        /* Same for the coalescing deadline, or a pending batch would wait for the poll
+         * timeout (up to 1000 ms) instead of its own 50 ms -- the wait would then be
+         * quantised to something an order of magnitude larger than the one that was asked
+         * for. */
+        if (pending_marks && next_watch > now) {
+            int64_t ms = (int64_t)((next_watch - now) / 1000);
+            if (ms < tmo) tmo = ms > 0 ? (int)ms : 1;
         }
         int r = poll(pfd, (nfds_t)nfd, tmo);
         if (r < 0) {
@@ -1504,7 +1666,25 @@ int etp_serve(const etp_opts_t *opts)
             }
         }
 
+        /* The watcher before the clients, not after: its work is a directory reconcile,
+         * which is bounded by the number of marked directories and is what makes the
+         * answer to the client that caused it correct. Doing it the other way round would
+         * answer that client from the index as it was when it asked. */
+        if (widx >= 0 && (pfd[widx].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
+            int marks = serve_watch(&db, &watch);
+            if (marks) {
+                pending_marks += marks;
+                /* Every drain pushes the deadline out, so a batch is applied once the
+                 * events stop arriving rather than once after the first one. A batch past
+                 * the cap gets next_watch 0, which the check above treats as due now --
+                 * that is how a hard burst skips the wait instead of being delayed by it. */
+                next_watch = pending_marks >= WATCH_COALESCE_MARKS
+                           ? 0 : ts_us() + WATCH_COALESCE_MS * 1000ULL;
+            }
+        }
+
         for (int i = 1; i < nfd; i++) {
+            if (i == widx) continue;
             if (!(pfd[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
             client_t *c = &clients[map[i - 1]];
             if (pfd[i].revents & POLLIN) client_read(opts, &db, c);
@@ -1518,15 +1698,20 @@ int etp_serve(const etp_opts_t *opts)
     }
 
 done:
+    /* A batch that was still inside its coalescing window when the server was asked to
+     * stop is applied rather than dropped: with --once that window is the whole lifetime
+     * of a change made while the one client was connected. */
+    if (pending_marks) serve_apply_watch(&db, watch, &pending_marks, "the last batch");
     for (size_t i = 0; i < MAX_CLIENTS; i++) client_free(&clients[i]);
     close(s);
     g_listen_fd = -1;
     /* On a clean exit, write what this process changed -- a refresh that is only ever in
      * memory is a day of work thrown away by a restart, and the next startup would pay
-     * for the repair pass this file would have made 0.1 ms. Not done when refresh is
-     * off: then the index is exactly what was loaded, and rewriting a 300 MB snapshot to
-     * say so is the wrong answer. */
-    if (refresh_us) serve_save(&db, opts->dbfile, &saved_epoch, "clean exit");
+     * for the repair pass this file would have made 0.1 ms. Not done when nothing can
+     * have changed: then the index is exactly what was loaded, and rewriting a 300 MB
+     * snapshot to say so is the wrong answer. */
+    if (mutating) serve_save(&db, opts->dbfile, &saved_epoch, "clean exit");
+    esidx_watch_close(watch);
     esidx_free(&db);
     fprintf(stderr, "esidx: stopped after %llu client(s)\n",
             (unsigned long long)served);

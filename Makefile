@@ -41,11 +41,27 @@ PREFIX  ?= /usr/local
 BINDIR  ?= $(PREFIX)/bin
 INSTALL ?= install
 
-HDRS = esidx.h syntax.h etp.h log.h timer.h lexer.h
+HDRS = esidx.h syntax.h etp.h log.h timer.h lexer.h watch.h
 
 # storage + index (design §4, §5) | syntax (§6.1) | execution (§6.3) | protocol (§1)
-OBJS = store.o index.o scan.o trigram.o lexer.o parser.o regex.o query.o log.o etp.o main.o
+# | watcher (watch.c is in the collection layer with scan.c: it marks directories)
+OBJS = store.o index.o scan.o trigram.o lexer.o parser.o regex.o query.o log.o etp.o watch.o main.o
 DBG_OBJS = $(OBJS:.o=.dbg.o)
+
+# The watcher's client SDK comes from sfa, a submodule in its own repository, and it is
+# optional on purpose. Without it the binary still builds, `--watch` says the feature is
+# not built in, and every other command is unaffected -- which is the right behaviour for
+# a checkout nobody cloned a submodule into. It is also why the dependency is a wildcard
+# rather than a plain name: a missing file must not stop the build before the rule runs.
+SFA_H   = sfa/sfa.h
+SFA_LIB = sfa/libsfa.c
+ifneq ($(wildcard $(SFA_H)),)
+OBJS   += sfa/libsfa.o
+SFA_DEF = -DESIDX_HAVE_SFA=1
+HDRS   += $(SFA_H)
+endif
+CFLAGS    += $(SFA_DEF)
+DBG_CFLAGS += $(SFA_DEF)
 
 # `all` is etp-probe as well as the server, so one `make` leaves a checkout ready
 # for both suites. It used to be two steps (AGENTS.md 3.1), and the second one was
@@ -53,7 +69,16 @@ DBG_OBJS = $(OBJS:.o=.dbg.o)
 # like a broken checkout rather than a missing prerequisite. The probe is one
 # translation unit and ~430 lines, so building it by default costs nothing next to
 # the server itself.
-all: opt dbg
+all: opt dbg sfa-proxy
+
+# The privileged proxy the watcher talks to, built here for the same reason etp-probe and
+# order-ref are: test_watch.sh stopping with "./sfa/sfa-server not built" reads like a
+# broken checkout rather than a forgotten second step (AGENTS.md 3.1). It lives in the
+# submodule and has its own Makefile, so this only asks for the binary -- if the submodule
+# was never cloned there is nothing to ask for and the watcher suite skips itself.
+sfa-proxy:
+	@if [ -f sfa/Makefile ]; then $(MAKE) -C sfa sfa-server; \
+	  else echo "sfa/ not present -- the watcher is not available in this checkout"; fi
 
 opt: esidx etp-probe order-ref
 dbg: esidx-dbg etp-probe-dbg order-ref-dbg
@@ -71,6 +96,15 @@ esidx-dbg: $(DBG_OBJS)
 # sets of flags, and a target-specific variable on a pattern rule works but reads as magic.
 %.dbg.o: %.c $(HDRS)
 	$(CC) $(DBG_CFLAGS) -c $< -o $@
+
+# The submodule's one translation unit, built with esidx's flags rather than sfa's Makefile
+# so the sanitiser flavour covers it too -- a leak or a bad read in the SDK is as much this
+# project's bug as one in its own code, since the SDK is linked into the binary.
+sfa/libsfa.o: $(SFA_LIB) $(SFA_H)
+	$(CC) $(CFLAGS) -Wno-builtin-macro-redefined -U_GNU_SOURCE -c $< -o $@
+
+sfa/libsfa.dbg.o: $(SFA_LIB) $(SFA_H)
+	$(CC) $(DBG_CFLAGS) -Wno-builtin-macro-redefined -U_GNU_SOURCE -c $< -o $@
 
 # The gate, in the order AGENTS.md 3.1 asks for: the index suite before the protocol one,
 # so a parse regression is not read as a protocol fault, and both builds of each.
@@ -124,4 +158,4 @@ uninstall:
 clean:
 	rm -f $(OBJS) $(DBG_OBJS) esidx esidx-dbg etp-probe etp-probe-dbg order-ref order-ref-dbg
 
-.PHONY: all opt dbg check test test-etp test-all install uninstall clean
+.PHONY: all opt dbg sfa-proxy check test test-etp test-all install uninstall clean

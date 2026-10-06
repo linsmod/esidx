@@ -36,7 +36,7 @@ static void usage(void)
         "  esidx [-v N] query <dbfile> [expr ...] [--no-index[=LIST]]\n"
         "  esidx [-v N] serve <dbfile> [-p port] [--bind addr]\n"
         "                             [-u user [-w pass]] [--no-download] [--once]\n"
-        "                             [--refresh=SECS] [--save=SECS]\n"
+        "                             [--refresh=SECS] [--save=SECS] [--watch[=SOCK]]\n"
         "                             [--no-index[=LIST]]\n"
         "  esidx options <dbfile> [--no-index[=LIST]]\n"
         "\n"
@@ -52,7 +52,16 @@ static void usage(void)
         "        index current instead of serving a snapshot until it is restarted.\n"
         "        It answers at most one deep pass interval behind on attributes, which\n"
         "        is design 12 risk 8 stated for this configuration. --save=SECS writes\n"
-        "        the snapshot on a timer and on a clean exit, and needs --refresh.\n"
+        "        the snapshot on a timer and on a clean exit, and needs --refresh or\n"
+        "        --watch.\n"
+        "\n"
+        "serve --watch[=SOCK] subscribes to sfa, a separate privileged proxy that turns\n"
+        "        kernel filesystem events into absolute paths over a unix socket, and\n"
+        "        marks the directory each change happened in. Name changes become visible\n"
+        "        within one event batch instead of one --refresh interval; size and mtime\n"
+        "        are unchanged, because listing a directory cannot see them. SOCK defaults\n"
+        "        to /run/sfa.sock. esidx itself needs no privilege -- the proxy does, which\n"
+        "        is why it is not part of this binary.\n"
         "\n"
         "derived indexes (design D4: none of them are in the snapshot, so this is a\n"
         "choice about this process and the same file serves both settings):\n"
@@ -480,6 +489,16 @@ static int cmd_serve(int argc, char **argv)
             o.save_secs = v;
             continue;
         }
+        /* Bare --watch takes the default socket; --watch=PATH names one. The split from
+         * the other flags is that this one has a usable default, so requiring a value
+         * would be a worse spelling. */
+        if (!strcmp(a, "--watch") || !strncmp(a, "--watch=", 8)) {
+            /* Empty string rather than NULL for the bare form: NULL has to stay "no
+             * watcher", since that is how a server without --watch is spelled. The empty
+             * string then means "the default socket", which is what watch.c resolves. */
+            o.watch_sock = a[7] == '=' ? a + 8 : "";
+            continue;
+        }
         if (a[0] == '-') {
             fprintf(stderr, "serve: unknown option %s\n", a);
             return 1;
@@ -492,14 +511,14 @@ static int cmd_serve(int argc, char **argv)
         fprintf(stderr,
                 "usage: esidx serve <snapshot> [-p port] [--bind addr]\n"
                 "                    [-u user [-w pass]] [--no-download] [--once]\n"
-                "                    [--refresh=SECS] [--save=SECS]\n");
+                "                    [--refresh=SECS] [--save=SECS] [--watch[=SOCK]]\n");
         return 1;
     }
-    if (o.save_secs > 0 && o.refresh_secs == 0) {
+    if (o.save_secs > 0 && o.refresh_secs == 0 && !o.watch_sock) {
         /* Refused rather than ignored: with nothing to reconcile, the epoch never moves
          * and every tick would find the snapshot already current. */
-        fprintf(stderr, "serve: --save=%d needs --refresh; there is nothing to save\n",
-                o.save_secs);
+        fprintf(stderr, "serve: --save=%d needs --refresh or --watch; there is nothing "
+                        "to save\n", o.save_secs);
         return 1;
     }
     o.dbfile = dbfile;

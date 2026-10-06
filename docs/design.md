@@ -657,8 +657,8 @@ statement about its *own* entries and nothing else:
 
 | Pass | Stats | Correct for | `/usr`, idle | `/usr`, worst case |
 |---|---|---|---|---|
-| **names** | one per directory whose parent changed, plus every new file | anything that changes a name | **0.1 ms** (15 dirs) | 110 ms |
-| **deep** | every entry | also size, mtime and ctime | 4.23 s (8 590 dirs) | 4.23 s |
+| **names** | one per directory whose parent changed, plus every new file | a name change that moves a directory between the root and the name — **not** an isolated change at depth ≥ 2 (§12 risk 8) | **0.1 ms** (15 dirs) | 110 ms |
+| **deep** | every entry | also size, mtime and ctime, and every name | 4.23 s (8 590 dirs) | 4.23 s |
 
 Directory-mtime skip [A2] is the names pass: a directory whose mtime is unchanged
 is not descended into. The deep pass exists because we store size, mtime and ctime
@@ -673,12 +673,91 @@ replacement merge into one row, and two hard links in one directory share an
 inode and collapse into one row. Matching names costs a `strcmp` per entry against
 children already in the index and makes both cases fall out correctly.
 
-fanotify [B1][B2][B3] replaces both passes with events when running as root, with
-the names pass kept as the repair path for whatever happened while the daemon was
-down; inotify [B8] is the unprivileged fallback. Events under a deleted directory
-are skipped [B4], a directory create triggers a recursive scan [B5], and events are
-drained in batches [B7]. Not started: until it exists, the periodic pass is the
-mechanism, and it is measurable (§10).
+**Events.** The dirty set needs something to fill it, and the two candidates are
+fanotify and inotify. What is built is neither directly: `sfa`, a separate privileged
+proxy (a submodule), holds the fanotify group and rebroadcasts events as absolute paths
+over a unix socket, and `watch.c` subscribes to it. The reason is privilege, not code —
+`fanotify_init()` needs `CAP_SYS_ADMIN`, so a server that called it itself could only be
+a root process, and an index server should not need to be root. `esidx serve
+--watch[=SOCK]` is the client half.
+
+The plan this replaces assumed three things that measurement contradicted, so the
+mechanism was rewritten around what the kernel actually does (all of it re-derivable —
+`sfa-server --probe` prints the negotiation for any machine):
+
+- **One mark per directory is not needed, and `FAN_EVENT_ON_CHILD` does not mean what
+  B3 assumed.** `ON_CHILD` is the immediate children of the marked object: a change two
+  levels down is silent under an inode mark. What does cover a whole filesystem is
+  `FAN_MARK_FILESYSTEM` *without* that bit, which reports every object on it.
+- **`FAN_MARK_MOUNT` is not always available.** Measured on WSL2 (6.18): every name
+  event is `EINVAL` on a mount mark, while a filesystem mark takes all of them
+  (`--probe` prints `MOUNT 1/7, FILESYSTEM 7/7`). `sfa` negotiates per event bit and per
+  mark type and uses whichever covers more, which is the only reason this works on a
+  kernel where the upstream recipe fails.
+- **`metadata_len` cannot be used to find the info record.** WSL2 under-reports it (24,
+  the header size, while `event_len` is larger), so a reader that gates on it sees "no
+  info record" and no file handle at all. Records must be walked by each record's own
+  `len` (`sfa-server.c` `find_fid_info`), which is what the proxy does.
+
+The rule the layer turns on is one sentence: **an event names an object, and the only
+thing a reconcile can do about it is list the directory that holds its name**, so every
+event marks `dirname(path)` — including a directory that has just appeared, because
+`di_lookup()` resolves directories the index already has and a new one has no id to mark.
+The parent's pass adds it and descends into it [B5]. Events under a deleted directory
+resolve to nothing and are counted, not applied [B4]. A rename arrives as one event
+with both paths (5.17+ `FAN_RENAME`), so both sides are marked and no cookie pairing is
+needed.
+
+What this layer does **not** cover is as much a part of its design as what it does.
+`CLOSE_WRITE` and `ATTRIB` are deliberately not subscribed: listing a directory cannot
+see an attribute change, so subscribing would buy a reconcile per write and still leave
+size and mtime stale. **§12 risk 8 therefore stands unchanged** — the names become
+current within one event batch, attributes still follow `--refresh`/`--deep` — and the
+startup banner says so, because a first line that only mentioned freshness would be read
+as more than it is.
+
+Two facts about cost, measured (WSL2, `test_watch.sh`'s own fixture, 1000 files written
+by 8 parallel processes into one directory):
+
+- **A watcher that keeps up is a watcher that pays per event.** 1014 events arrived in
+  1013 batches of ~1, because the drain loop is faster than the writer. The dirty set is
+  de-duplicated per *batch*, so that shape costs one reconcile per event: 975 batches,
+  975 directory listings, ~0.5 s of a serve loop that answers nobody.
+- **So a batch waits for itself to finish growing**, 50 ms or 256 marks, whichever comes
+  first (`WATCH_COALESCE_MS`). The same burst then costs 5 batches and 6 listings — 927
+  marks, 154 per listing — about 6 ms of reconcile. The wait is invisible in a search
+  box and the saving is two orders of magnitude under exactly the load that needs it;
+  the cap is what stops the wait from becoming unbounded for a tree being written hard.
+
+A proxy that goes away is reported and dropped, never treated as "no events": the index
+is left as it stands and `--refresh`, if set, keeps repairing it. That is why
+`esidx_watch_drain()` returns −2 for a dead peer and 0 for a drained batch — the same
+`recv` reports both, and the difference between an index that is current and one that has
+quietly stopped being current is that return value.
+
+The periodic pass is kept, for two reasons that measurement gave rather than taste: it
+covers whatever happened while the server was down (the subscription is created after
+the snapshot is read, so a startup repair pass runs first), and it covers an event the
+proxy could not attribute to a path.
+
+**What the proxy loses is a signal now rather than silence, and the signal's answer is
+narrower than the signal.** `sfa` reports two ways of not knowing: a kernel queue that ran
+over (`SFA_EV_OVERFLOW`), and its own — a handle it could not turn back into a path, or
+events it had to drop because one client was not draining (`SFA_EV_UNRESOLVED`, sfa issue
+#2). Both arrive with an empty path and both are answered with a mark of the root.
+Measured on the proxy that emits them: a 500-file `rm -rf` of a nested tree delivers 139
+of 511 events — the rest are lost because the parent directory the event names no longer
+existed when the event was read — and the client is told once per read batch instead of
+never (`test_watch.sh`, "a rename the proxy cannot resolve is reported").
+
+But a mark of the root is **a pass that follows moved stamps down from the root**, and
+that is the whole of its reach: it repairs a bulk change, where every directory on the way
+to it moved, and it does not repair a change buried under directories that never moved.
+That is not a property of the watcher — it is the names pass's own limit, and it is sharp
+(§12 risk 8). The watcher is immune on the common path, because it marks the directory the
+event *names* rather than the root; the loss-signal path is the one that inherits the
+limit. Widening it means comparing every directory's stamp rather than only the ones a
+walk reaches, and that — a **sweep** — is not built.
 
 **In place.** `esidx serve --refresh=SECS` runs the names pass inside the serving
 process, once before the listener and then every SECS, so a long-running server
@@ -689,7 +768,9 @@ the index moves — and what bounds what a pass may cost: a pass that stalls the
 stalls every client. So the serving pass refuses compaction (`EU_NOCOMPACT`,
 `esidx_compact()` is a full rescan plus a `finalize`), and `--save=SECS` is a
 separate knob from the refresh interval because a snapshot write is the whole file
-and has nothing to do with how stale the index may be. §10 has the three costs
+and has nothing to do with how stale the index may be. `--watch` and `--refresh` are
+independent answers to the same question, either one makes the server self-updating,
+and either one makes `--save` meaningful. §10 has the three costs
 separated, and they differ by three orders of magnitude.
 
 **The dirty set.** "Which directories need a full listing" is a question, and
@@ -809,14 +890,14 @@ Each row: source → what was taken → how it lands here → why it changed.
 
 | # | Source | Taken | Landing here | Why changed |
 |---|---|---|---|---|
-| B1 | `fsearch_folder_monitor_fanotify.c:275` | `fanotify_init(FAN_CLOEXEC\|FAN_NONBLOCK\|FAN_CLASS_NOTIF\|FAN_REPORT_DFID_NAME, O_RDONLY)` | as-is | `FAN_REPORT_DFID_NAME` is what yields a directory fid plus a name |
-| B2 | `fsearch_folder_monitor_fanotify.c:369` | `fanotify_mark(fd, FAN_MARK_ADD\|FAN_MARK_ONLYDIR, MASK, AT_FDCWD, path)` | as-is | directories only |
-| B3 | `fsearch_folder_monitor_fanotify.c:24` | mask includes **`FAN_EVENT_ON_CHILD`** | **key adoption** | one mark covers a whole subtree, sidestepping inotify's per-directory watch and `max_user_watches` |
-| B4 | `fsearch_database_index.c:132-160` | `get_skippable_events()`: drop events under a deleted directory | as-is | saves tens of thousands of no-ops on `rm -rf`; the prefix test requires `str[len] == '/'` |
-| B5 | `fsearch_database_index.c:581` | a create event that is a directory triggers a recursive scan | as-is | a new directory is usually a bulk copy in progress |
+| B1 | `fsearch_folder_monitor_fanotify.c:275` | `fanotify_init(FAN_CLOEXEC\|FAN_NONBLOCK\|FAN_CLASS_NOTIF\|FAN_REPORT_DFID_NAME, O_RDONLY)` | **moved out of esidx** into `sfa` | that call needs `CAP_SYS_ADMIN`, and an index server should not have to be root. The flag set is kept as-is |
+| B2 | `fsearch_folder_monitor_fanotify.c:369` | `fanotify_mark(fd, FAN_MARK_ADD\|FAN_MARK_ONLYDIR, MASK, AT_FDCWD, path)` | **replaced** by a negotiated `FAN_MARK_MOUNT` → `FAN_MARK_FILESYSTEM` fallback | a mount mark is `EINVAL` for every name event on WSL2, so a recipe that only tries the inode form cannot run there at all. `sfa_probe.c` tries both and takes whichever covers more event bits |
+| B3 | `fsearch_folder_monitor_fanotify.c:24` | mask includes **`FAN_EVENT_ON_CHILD`** | **key adoption, corrected** | `ON_CHILD` is the *immediate* children of the marked object, not the subtree: measured, a change two levels down is silent under an inode mark. Coverage comes from a filesystem mark *without* that bit. The intent (no per-directory watch) is kept |
+| B4 | `fsearch_database_index.c:132-160` | `get_skippable_events()`: drop events under a deleted directory | as-is | falls out of `di_lookup()` returning nothing, and is counted (`unknown`) rather than dropped silently |
+| B5 | `fsearch_database_index.c:581` | a create event that is a directory triggers a recursive scan | as-is, and it is the same code as before | a new directory is marked via its **parent**, and the parent's reconcile descends — so B5 needed no new code, only the rule that the parent is what gets marked |
 | B6 | `fsearch_database_index.c:571-576` | pull ancestors out of the index before mutating, put them back after | idea adopted | aggregates must bubble up the parent chain |
-| B7 | `fsearch_database_index.c:199` | `g_async_queue_length()` batch draining | adopted | per-event handling jitters under bulk change |
-| B8 | `fsearch_folder_monitor_*.c` | dual backend dispatched on `event->monitor_kind` | adopted | automatic degradation to inotify without root |
+| B7 | `fsearch_database_index.c:199` | `g_async_queue_length()` batch draining | adopted, plus a **coalescing window** | per-event handling jitters under bulk change. Measured: draining per event costs 975 directory listings for 1000 files, because a watcher that keeps up sees ~1 event per batch. `WATCH_COALESCE_MS` = 50 ms or 256 marks brings that to 6 |
+| B8 | `fsearch_folder_monitor_*.c` | dual backend dispatched on `event->monitor_kind` | **replaced** by "one backend, in another process" | inotify needs no privilege, so a fanotify client needs no fallback — it needs a proxy. The privilege is in `sfa-server`; `esidx` is only ever a client |
 
 ### C. Adopted from FSearch (storage layout)
 
@@ -894,7 +975,7 @@ Each row: source → what was taken → how it lands here → why it changed.
 | 6.3 | execution: candidates → bitmaps → matchers → sort → slice | `query.c` | **done**, including the second-stage FILTER_* pass. The text matcher implements Everything's rule for *what a term reads* — the filename, or the path once the value carries a separator or says `path:` — verified shape by shape against voidtools' server; §12.10 has the table and the two shapes still open. An `ext:` term's id list is sized by the term, not by a fixed 256 (§6.3, and the reason is in the code): a longer list used to be cut with no complaint |
 | 6.4 | result cache | `etp.c` | **done** — the full sorted set is kept and re-sliced, and invalidated by the index epoch |
 | 7 | full scan | `scan.c` | done; concurrency (D6) not started |
-| 7 | incremental | `scan.c` | **done** for the two reconcile passes and the mutation core; `esidx update <db> [--deep]`, and `esidx serve --refresh=SECS` runs the names pass in the serving process (one at startup, then on a timer; §7 "In place"). fanotify/inotify not started |
+| 7 | incremental | `scan.c`, `watch.c` | **done** — the two reconcile passes and the mutation core; `esidx update <db> [--deep]`, `esidx serve --refresh=SECS` (names pass in the serving process), and `esidx serve --watch[=SOCK]`, which subscribes to the `sfa` submodule's privileged fanotify proxy and marks the directory each event names (§7 "Events"). Two limits worth naming here rather than in §12 only: a stamp-pruned pass reaches a change at depth ≥ 2 only if some directory above it also moved (§12 risk 8), and the proxy's own losses arrive as `SFA_EV_OVERFLOW`/`SFA_EV_UNRESOLVED`, whose answer — a mark of the root — inherits that same reach. The **sweep** that would compare every directory's stamp is **not built**. The inotify fallback (B8) is **not** built and is not needed: a proxy means esidx needs no privilege, so there is no second backend to fall back to |
 | 1-3 | FTP + `SITE EVERYTHING` | `etp.c` | **done** — all 32 subcommands, 22 sort names, the data channel for other FTP clients |
 
 **Two things in §6.2 deliberately not built**, with the reasoning recorded
@@ -1786,9 +1867,7 @@ answer anyway.
    between two passes** — or, more practically, a file whose attributes moved
    while its parent's mtime did not is invisible to the names pass until the next
    deep one. That is the whole reason the deep pass exists and the reason its
-   interval is a policy choice rather than a performance one. fanotify is the
-   real answer; until it lands, the honest statement is that the index is at most
-   one deep-pass interval behind on attributes. This is unchanged by
+   interval is a policy choice rather than a performance one. This is unchanged by
    `esidx serve --refresh=SECS` and worth being explicit about, because that flag
    looks like it changes the answer: it does not. It runs the *names* pass, and
    deliberately so — a deep pass stats every entry on the tree, which is 4.23 s on
@@ -1796,6 +1875,47 @@ answer anyway.
    So with `--refresh`, the index is at most `SECS` behind on *names* and still one
    deep-pass interval behind on attributes, and a serving deployment needs
    `esidx update --deep` on its own schedule for those.
+   **`--watch` does not change it either, and that is a decision rather than an
+   omission.** The watcher is told about `CLOSE_WRITE` and `ATTRIB` and does not
+   subscribe to them: listing a directory cannot see an attribute change, so
+   handling them would cost a reconcile per write and still leave size and mtime
+   stale. What it removes is the *first* half of this risk — with `--watch`, a name
+   change is visible within one event batch (~50 ms measured on WSL2) instead of one
+   `SECS` interval, so the window in which a created file is invisible closes. The
+   honest statement for `--watch` is therefore: **names lag by one event batch,
+   attributes still lag by one deep-pass interval.** Closing the second half means a
+   per-file stat on the event's own path (`stat` + `di_lookup_name` + `esidx_touch`),
+   which is a separate layer with its own measurements — it is proportional to real
+   changes rather than to the tree, but it is not free and it was not measured here.
+
+   **The reach of a *stamp-pruned* pass is a separate risk, and it was found by the
+   watcher's own loss path.** `reconcile_dir()` decides to descend into a child by
+   comparing that child's stored stamp with a fresh stat (`scan.c:550`), and it only
+   ever reaches a directory through its parent. A directory's stamp moves when *its own*
+   entries move, so an isolated change at depth ≥ 2 moves the stamp of the directory
+   holding the name — which is reached through a parent whose stamp did not move.
+   Measured, fixture `root/a/b/` (`./esidx update`, no watcher involved):
+
+   | change | names pass | names pass, one level up | deep pass |
+   |---|---|---|---|
+   | create `root/a/b/new.txt` | **not seen** | seen (`root/a/deep.txt`) | seen |
+   | rename `root/a/b/f1.txt` → `f1-renamed.txt` | **not seen**, old row survives | seen | seen |
+
+   So the honest statement about `esidx update` and `--refresh` is **not** "correct for
+   anything that changes a name": it is *correct for a change that moves a directory on
+   the path from the root to the name*, which for an isolated change means depth 1. On a
+   real tree that is the whole tree above the top level, so a file created in
+   `/usr/share/doc/…` is invisible to a names pass — this is why every measurement in
+   §10 quotes the *idle* cost of a pass (0.4-1.1 ms, 48 of 49 directories skipped on
+   their stamp) rather than its cost when something changed. It is also inherited by the
+   startup repair pass and by the watcher's loss-signal response (§7 "Events").
+
+   Two ways out, neither built: a **sweep** that compares every directory's stamp instead
+   of only the ones a walk reaches (correct, and costs one stat per directory — 630 472 of
+   them on `/work` — every time it runs), or the watcher, which sidesteps the question by
+   marking the directory the event names. What is *not* an option is leaving the claim
+   as it stood: it was in §7's pass table, and it was in every test fixture, which is
+   exactly why 349 index assertions had never asked the question (see AGENTS.md §3.4).
 9. **Two text-matching bugs, both pre-existing and both found while writing the
    incremental tests** — both fixed now, and both pinned against the reference
    rather than against our reading of the code:
