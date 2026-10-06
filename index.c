@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 linsmod <linsmod@qq.com>
+ */
 /* Bitmap index (§5.4).
  * Decision D7: dense bitset for P0-P3, zero dependency; swap to CRoaring at P4
  * by keeping this ABI (bs_init/bs_free/bs_set/bs_test/bs_clear).

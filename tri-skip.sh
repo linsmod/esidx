@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 linsmod <linsmod@qq.com>
 # What skipping a derived index costs and what it saves, on one tree, with one binary.
 #
 # The two configurations differ only in ESIDX_SKIP_INDEX, and the *same snapshot* serves

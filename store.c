@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 linsmod <linsmod@qq.com>
+ */
 /* Storage layer: string pool, columnar entry table, directory tree, snapshot.
  * Refs: design §4.1/§4.2/§5.1, decisions D4/D5.
  */

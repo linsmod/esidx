@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 linsmod <linsmod@qq.com>
+ */
 /* Lexer for the Everything search language (everything-syntax.md L2-72).
  *
  * Design notes

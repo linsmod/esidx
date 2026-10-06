@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 linsmod <linsmod@qq.com>
 # postrm -- tidy up on purge, and reload systemd on the way out either way.
 #
 # The state directory and the user are the package's own, so `dpkg -P` takes them away. That

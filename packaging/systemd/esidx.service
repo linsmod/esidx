@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 linsmod <linsmod@qq.com>
 [Unit]
 Description=esidx search index: ETP over TCP, holding its own fanotify group
 Documentation=file:///usr/share/doc/esidx/README.md

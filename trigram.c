@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 linsmod <linsmod@qq.com>
+ */
 /* trigram.c -- the name trigram index of design §5.2.
  *
  * What this is for: a text leaf walks its candidate set and calls text_match() on

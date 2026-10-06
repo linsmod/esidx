@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 linsmod <linsmod@qq.com>
+ */
 /* The watcher: an sfa client whose whole output is a set of dirty directories.
  *
  * The shape of the answer is not ours to choose. A name changed somewhere, and the only

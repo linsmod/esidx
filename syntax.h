@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 linsmod <linsmod@qq.com>
+ */
 #ifndef ESIDX_SYNTAX_H
 #define ESIDX_SYNTAX_H
 

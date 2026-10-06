@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 linsmod <linsmod@qq.com>
+ */
 /* CLI harness and ETP server entry point.
  *   esidx [-v] build <root> -o <dbfile>
  *   esidx [-v] query <dbfile> [expr ...]

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 linsmod <linsmod@qq.com>
 # esidx -- ext4 search index engine. Refs: ../ext4_index_engine_design.md
 #
 #   make            optimised *and* sanitiser builds of everything
@@ -381,6 +383,9 @@ deb: require-sfa
 	@install -m 0644 docs/design.md "$(DEBSTAGE)/usr/share/doc/esidx/design.md"
 	@install -m 0644 docs/everything-syntax.md \
 	    "$(DEBSTAGE)/usr/share/doc/esidx/everything-syntax.md"
+	@# The licence text ships with the binary: the MIT terms require the notice to travel with
+	@# copies, and a package is the copy most people ever see.
+	@install -m 0644 LICENSE "$(DEBSTAGE)/usr/share/doc/esidx/LICENSE"
 	@echo "== control metadata"
 	@# Depends is one libc line, written out, rather than ${shlibs:Depends}: the build is
 	@# C11 plus libc by decision D5, so there is no shared object to load and no library to

@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 linsmod <linsmod@qq.com>
+ */
 /* A small backtracking regular-expression engine (design §2 L2, risk 3).
  *
  * Why not PCRE2: the language we must accept is narrow. Everything's own

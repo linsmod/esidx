@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 linsmod <linsmod@qq.com>
 # prerm -- stop the unit when the package is going away. Not on upgrade: on upgrade dpkg
 # calls this with "upgrade" and the packaged unit is replaced in place, so stopping there
 # would drop a working index for no reason. The postinst of the new version reloads systemd.

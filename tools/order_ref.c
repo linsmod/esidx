@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 linsmod <linsmod@qq.com>
+ */
 /* order_ref -- print names in the order strcasecmp() puts them.
  *
  * A test oracle, and it exists because the two obvious shell substitutes are both

@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 linsmod <linsmod@qq.com>
+ */
 /* etp_probe -- the ETP acceptance client.
  *
  * Built only by `make etp-probe`; not part of the server. Its job is to answer one

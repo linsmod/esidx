@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 linsmod <linsmod@qq.com>
+ */
 /* Full scan (§7 / decision D6).
  *   - getdents64 + big buffer, no opendir/readdir          (ref A3 style)
  *   - openat relative descent, O_NOATIME with EPERM fallback (ref A1, A4)

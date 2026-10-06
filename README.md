@@ -715,5 +715,13 @@ sortcmp.sh     per-sort-key cost for several builds at once (design §10)
 
 ## License
 
-Not yet declared. The protocol baseline it
-implements (`../etp_server-1.0.2.5/`) is MIT, © voidtools / David Carpenter.
+MIT, © 2026 linsmod — the full text is in `LICENSE`, and every source file carries the
+`SPDX-License-Identifier` line, so a file that travels alone still says what it is.
+
+Why MIT rather than something copyleft, given the choice was open: the protocol baseline this
+tree implements (`../etp_server-1.0.2.5/`, MIT, © voidtools / David Carpenter) is *not* part of
+the repository — it sits beside it and is cited by file and line in the comments as the
+behavioural reference — so if any portion here was translated from it rather than rewritten, the
+two licences agree and there is no relicensing question to settle. MIT is also DFSG-free, which
+is what an upload to Debian needs. `sfa/` is MIT for the same reason and is a separate
+repository with its own `LICENSE`.

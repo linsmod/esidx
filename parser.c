@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 linsmod <linsmod@qq.com>
+ */
 /* Recursive-descent parser: token stream -> ast_t (design §6.1).
  *
  * Grammar, from everything-syntax.md L2-8:

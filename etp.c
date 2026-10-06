@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 linsmod <linsmod@qq.com>
+ */
 /* ETP protocol server (design §1, decision D1).
  *
  * Ported from voidtools' Everything Server 1.0.2.5, `src/etp_server.c`, with the
