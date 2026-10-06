@@ -2023,6 +2023,7 @@ the depth-1 case kept beside it as the control that has to keep working.
     | `path:*esidx` | 2 | 2 | no trailing star: ends-with |
     | `path:*PC/esidx*` | 1 | 1 | a value with a separator is a fragment, and a fragment's trailing star cannot cross one |
     | `path:esidx*`, `path:**esidx**` | 3 / 307 | 3 / 295 | no leading star: anchored at a component |
+    | `ww:esidx`, `ww:amd64`, `ww:dirty`, `prefix:esidx` (measured on ShareToPC, not on this directory) | 24 / 11 / 18 / 24 | same | a whole word ends at an underscore: `_` is **not** a word character, on either side. `ww:amd64` is the same rule from the left (`esidx_..._amd64.deb`), and the eleven that made it visible are exactly the `esidx_*.deb` names |
 
     So: a leading star in an explicit `path:` value is what makes it a `contains`
     test, and that is the only place a single star crosses a separator. Everything

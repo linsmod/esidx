@@ -89,6 +89,10 @@ MOUNT="/mnt/$(printf '%s' "${WIN_DIR%%:*}" | tr 'A-Z' 'a-z')"
 TERMS=(
     # no separator in the value: the filename, never the path
     'esidx' 'name:esidx' '*esidx*' '*esidx' 'regex:esidx' 'ww:esidx' 'whole:esidx'
+    # The whole-word boundary, from both sides: `ww:esidx` is bounded by the '_' in the
+    # esidx_*.deb names, `ww:amd64` by the one before it, and `prefix:esidx` uses the same
+    # rule. Three rows because a rule with only one measurement is one measurement.
+    'ww:amd64' 'prefix:esidx'
     'regex:ShareToPC.esidx'
     # path:, or a separator in the value: the path
     'path:esidx' 'esidx/main.c' 'esidx\main.c' 'sidx/main.c'

@@ -439,8 +439,15 @@ static void collapse_seps(const char *in, char *out, size_t outsz)
     out[o] = '\0';
 }
 
-/* Whole-word test used by ww: and by prefix:/suffix: on a word boundary. */
-static int is_word_char(unsigned char c) { return isalnum(c) || c == '_' || c >= 0x80; }
+/* Whole-word test used by ww: and by prefix:/suffix: on a word boundary.
+ *
+ * `_` is deliberately not a word character: everything on the reference spells a whole word
+ * across an underscore. Measured on ShareToPC with cmp_ref.sh -- `ww:esidx` answers 24 there
+ * against 13 here, and the eleven are exactly the `esidx_*.deb` names, "esidx" followed by an
+ * underscore; `ww:amd64` answers 11 against 0, which is the same rule from the other side,
+ * since in `esidx_..._amd64.deb` the "amd64" is preceded by one. Before this said otherwise,
+ * and the underscore is the one character where the two rules part company in practice. */
+static int is_word_char(unsigned char c) { return isalnum(c) || c >= 0x80; }
 
 /* Does the string end with this suffix? The tail of a `path:` value is anchored
  * this way -- `path:*esidx` is the two entries whose path ends in "esidx" on the

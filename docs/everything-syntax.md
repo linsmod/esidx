@@ -124,10 +124,10 @@ disable, or with `?` to enable globally.
 | `prefix:` | match the start of a word |
 | `regex:` | enable regular expressions |
 | `startwith:` | match the start of the filename or property |
-| `suffix:` | match the end of a word |
+| `suffix:` | match the end of a word. **The reference has no such function**: it drops the modifier and matches the bare term (measured, `AGENTS.md` §5.2) |
 | `tostring:` | convert a property to its display string before comparing |
 | `whole:` | match the whole filename or property |
-| `ww:` | whole words only |
+| `ww:` | whole words only. `_` is a boundary, not a word character: `ww:esidx` matches `esidx_x` |
 | `wildcards:` | automatically treat the content as a wildcard pattern |
 
 ## Wildcard syntax inside search modifiers — L65-72

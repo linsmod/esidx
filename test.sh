@@ -798,6 +798,21 @@ q 'sub1\deep/leaf.txt'       ; expect "a mixed spelling is one path"          "$
 q 'sub1\\*'                  ; expect "wildcards collapse the same way"      "$(n "$LAST")" "2"
 q 'path:regex:sub1\\x'       ; expect "regex is not collapsed: \\ is a literal backslash" \
     "$(n "$LAST")" "1"
+# What a word character is, which is a question of its own: everything on the reference spells a
+# whole word *across* an underscore. Its own fixture, so the rule is pinned rather than a count
+# that happens to hold: an underscore after the term, one before it, and neither.
+WWSAVE=$DB
+WWD="$TMP/words"; mkdir -p "$WWD"
+printf x >"$WWD/esidx_x"      # esidx, then _ : a boundary on the right
+printf x >"$WWD/x_esidx"      # _ then esidx  : a boundary on the left, and it ends there
+printf x >"$WWD/esidxx"       # neither      : inside a word
+DB="$TMP/words.idx"; build "$WWD" "$DB" >/dev/null
+q 'ww:esidx'      ; expect "ww: matches across an underscore"        "$(n "$LAST")" "2"
+q 'prefix:esidx'  ; expect "prefix: takes the same boundary"         "$(n "$LAST")" "1"
+q 'suffix:esidx'  ; expect "suffix: anchors the other end"           "$(n "$LAST")" "1"
+q 'suffix:x'      ; expect "and a trailing '_' is a boundary too"    "$(n "$LAST")" "1"
+q 'ww:x'          ; expect "and one letter is a word of its own"     "$(n "$LAST")" "2"
+DB=$WWSAVE
 # `path:` + a value that *starts* with a star is Everything's contains form -- the
 # one shape where a star crosses a separator. Reference, same directory:
 #   path:*esidx*   ->  280 = every path containing esidx (ours 268: the reference's
