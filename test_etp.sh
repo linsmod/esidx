@@ -196,6 +196,24 @@ done
 }
 start_server main
 
+# --------------------------------------------------------- one snapshot, one server
+#
+# A second `serve` of the same snapshot would answer from its own copy of the index and apply
+# its own events, so the two would drift apart with every change under the tree and neither
+# would report it. main.c holds an flock on <db>.lock; this is the outside view of that
+# decision, and it asserts the message names the pid that actually holds it -- a lock file
+# whose contents nobody checks is how the message ends up wrong.
+say "one snapshot, one server"
+if "$BIN" -v 3 serve "$DB" -p 0 --bind 127.0.0.1 >"$TMP/dup.out" 2>"$TMP/dup.err"; then
+    bad "a second serve of the same snapshot is refused" "it started anyway"
+else
+    if grep -q "already being served by pid $SRV_PID" "$TMP/dup.err"; then
+        ok "a second serve is refused, naming the pid that holds the snapshot"
+    else
+        bad "a second serve is refused, naming the holder" "$(tail -1 "$TMP/dup.err")"
+    fi
+fi
+
 # ------------------------------------------------------------------- probe
 #
 # etp <name> <port> [script on stdin]
@@ -276,7 +294,12 @@ EOF
 
 say "1b. password authentication"
 
-start_server auth -u etpuser -w s3cret
+# Its own copy of the snapshot, because a second server on the *same* one is refused now
+# (`serve` holds an flock on <db>.lock, main.c): two servers on one snapshot would answer from
+# two copies of the index and apply two sets of events. What this server is for is the password
+# handshake, and the copy has the same fixture, so nothing here needs the original.
+cp "$DB" "$TMP/auth.idx"
+SRV_DB="$TMP/auth.idx" start_server auth -u etpuser -w s3cret
 
 etp "USER -> 331, wrong PASS -> 530" "$SRV_PORT2" <<'EOF'
 send USER etpuser

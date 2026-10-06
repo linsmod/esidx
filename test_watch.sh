@@ -556,6 +556,12 @@ if [ -n "$PORT" ]; then
         bad "the embedded watcher answers the loss with a sweep" "no sweep line reporting a moved directory"
     fi
 
+    # One snapshot is served by one process (main.c's singleton lock), so the first embedded
+    # server has to go before the second one starts -- which is the honest sequence anyway: the
+    # spelled-out form is the same deployment with its arguments written out, not a second one.
+    # Without this the two tests below would fail on the lock instead of on what they check.
+    kill "$EMB_PID" 2>/dev/null; wait "$EMB_PID" 2>/dev/null; EMB_PID=""
+
     # Both defaults can still be spelled out, and that is what keeps them defaults rather
     # than the only way: the unit names the user explicitly, and a caller who wants the tree
     # checked against what they think they deployed names it too.

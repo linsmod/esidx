@@ -25,6 +25,11 @@
 #include <time.h>
 #include <ctype.h>
 #include <unistd.h>
+/* the serve singleton: open()/flock()/ftruncate() on <dbfile>.lock */
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <sys/file.h>
 
 static void usage(void)
 {
@@ -486,6 +491,72 @@ static int secs_arg(const char *a, const char *what)
     return (int)n;
 }
 
+/* One snapshot, one server.
+ *
+ * `serve` is the only command that keeps the index in memory *and* marks the tree for events,
+ * so two of them on one snapshot is the configuration that must not happen: each answers from
+ * its own copy and each applies its own events, so the two answers drift apart with every
+ * change under the tree -- and the second one's events are invisible to the first. Nothing else
+ * in the system notices: both processes are healthy, both answer, and the disagreement is
+ * silent.
+ *
+ * flock rather than a pid file, for one reason that decides it: the kernel drops the lock when
+ * the process dies, `kill -9` included, so a crash cannot leave a file behind that makes the
+ * next start refuse -- which is the failure mode a pid file has, and the reason a service "will
+ * not start after a reboot". Non-blocking, because the right answer to "this snapshot is
+ * already served" is to say so and exit rather than to wait for a server that may run for
+ * months. The pid is written into the file for the message only; it decides nothing, and the
+ * lock is what is authoritative.
+ *
+ * The fd is deliberately kept for the life of the process: releasing the lock is the kernel's
+ * job at exit, and there is no path in this program that should release it earlier. */
+static int g_serve_lock_fd = -1;
+
+static int singleton_lock(const char *dbfile)
+{
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof(path), "%s.lock", dbfile) >= (int)sizeof(path)) {
+        fprintf(stderr, "serve: %s: too long to name a lock file for\n", dbfile);
+        return -1;
+    }
+
+    /* Write access is only needed for the pid in the message, and the file may well belong to
+     * another user: the packaged service starts as root and so creates it root-owned, while a
+     * hand-run `serve` of the same snapshot runs as the service user. Read-only is enough to
+     * hold a lock, so a refused write-open falls back rather than refusing a legal start. */
+    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        fprintf(stderr, "serve: cannot open the lock file %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        char buf[32];
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        if (n > 0) {
+            buf[n] = '\0';
+            char *nl = strchr(buf, '\n');
+            if (nl) *nl = '\0';
+            fprintf(stderr, "serve: %s is already being served by pid %s; refusing to start "
+                            "a second one\n", dbfile, buf);
+        } else {
+            fprintf(stderr, "serve: %s is already being served (%s); refusing to start a "
+                            "second one\n", dbfile, path);
+        }
+        close(fd);
+        return -1;
+    }
+
+    char pid[32];
+    int n = snprintf(pid, sizeof(pid), "%ld\n", (long)getpid());
+    if (n > 0) {
+        (void)!ftruncate(fd, 0);                    /* fails on the read-only fallback, fine */
+        (void)!pwrite(fd, pid, (size_t)n, 0);
+    }
+    return fd;
+}
+
 /* ETP server (design §1). Loads a snapshot once and answers the client's
  * `EVERYTHING` sequence over a control connection; see etp.c for the protocol
  * notes and the decisions taken from the reference implementation. */
@@ -605,6 +676,12 @@ static int cmd_serve(int argc, char **argv)
         return 1;
     }
     o.dbfile = dbfile;
+    /* One snapshot, one server -- and this is also what lets `build`/`update` be run next to a
+     * live server without either of them finding out the hard way: the snapshot they replace is
+     * not the one being served. Taken before the snapshot is read, so a second start costs
+     * nothing. */
+    g_serve_lock_fd = singleton_lock(dbfile);
+    if (g_serve_lock_fd < 0) return 1;
     /* serve keeps its own esidx_t inside etp_serve(), so the flag travels as two plain
      * fields rather than being re-read from the environment over there: one place
      * decides what this process does not build. */

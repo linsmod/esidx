@@ -141,6 +141,18 @@ process exiting, not about the file changing. A local edit to `/etc/default/esid
 conffile edit, so dpkg asks what to do (non-interactively it keeps yours and leaves a
 `.dpkg-dist` beside it).
 
+**One snapshot, one server.** `serve` takes an advisory lock on `<snapshot>.lock` and refuses
+to start when another process holds it, naming that pid. Two servers on one snapshot would each
+answer from their own copy of the index and apply their own events, so the two answers would
+drift apart with every change under the tree — and nothing on either side would report it. An
+`flock` rather than a pid file, because the kernel releases it even after `kill -9`: a stale pid
+file is how a service ends up refusing to start after a reboot, and the lock's job is to prevent
+a second server, not to survive a crash. `build`, `update` and `query` are one-shot and do not
+take it — which is deliberate and is also the limit of what it covers: rebuilding a snapshot
+that a server has loaded is the operator's call. The server keeps answering from the copy in
+memory, and a `--save` would write that copy back over the rebuild, so rebuild and then restart
+(which is what an upgrade does), or build to another path.
+
 `make deb-verify` unpacks the package and **runs what came out of it**: the packaged server
 builds a snapshot, the packaged proxy probes fanotify, the unit's `ExecStart` names a binary
 the package actually installs (a unit pointing at `/usr/local/bin` while the package installs
