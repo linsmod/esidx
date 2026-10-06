@@ -295,8 +295,28 @@ dist-verify: dist
 	    echo $$? > /tmp/.dv-watch.rc) || true
 	@tail -3 /tmp/.dv-watch.log | sed 's/^/   /'
 	@test "$$(cat /tmp/.dv-watch.rc)" = 0 || { echo "   THE SUITE FAILED -- see /tmp/.dv-watch.log"; exit 1; }
+	@echo "== install.sh, from the unpacked package: it installs, and it refuses mis-spellings"
+	@cd "$(STAGE)/$(PKGNAME)" && { \
+	    if ./install.sh --prefix /tmp/.dv-inst --jobs 4 >/tmp/.dv-inst.log 2>&1; then \
+	        test -x /tmp/.dv-inst/bin/esidx || { echo "   no esidx under the prefix"; exit 1; }; \
+	        test -x /tmp/.dv-inst/bin/sfa-server || { echo "   no sfa-server under the prefix"; exit 1; }; \
+	        echo "   installs esidx and sfa-server under --prefix"; \
+	    else \
+	        tail -3 /tmp/.dv-inst.log | sed 's/^/   /'; echo "   INSTALL FAILED"; exit 1; \
+	    fi; \
+	    if ./install.sh --start --root /tmp --group root >/tmp/.dv-i1 2>&1; then \
+	        echo "   --group without --split was ACCEPTED"; exit 1; fi; \
+	    grep -q 'split form' /tmp/.dv-i1 \
+	        && echo "   --group without --split is refused, naming --split" \
+	        || { echo "   wrong refusal: $$(tail -1 /tmp/.dv-i1)"; exit 1; }; \
+	    if ./install.sh --start --root /tmp --split --drop-to=nobody >/tmp/.dv-i2 2>&1; then \
+	        echo "   --drop-to with --split was ACCEPTED"; exit 1; fi; \
+	    grep -q 'one-process form' /tmp/.dv-i2 \
+	        && echo "   --drop-to with --split is refused" \
+	        || { echo "   wrong refusal: $$(tail -1 /tmp/.dv-i2)"; exit 1; }; \
+	    rm -rf /tmp/.dv-inst /tmp/.dv-inst.log /tmp/.dv-i1 /tmp/.dv-i2; }
 	@rm -rf "$(STAGE)" /tmp/.dv-want /tmp/.dv-have /tmp/.dv-modes /tmp/.dv-watch.log /tmp/.dv-watch.rc
-	@echo "dist-verify: faithful to both commits, builds on its own, watcher suite passes"
+	@echo "dist-verify: faithful to both commits, builds on its own, watcher suite passes, install.sh installs and refuses"
 
 # ---------------------------------------------------------------- Debian package
 #

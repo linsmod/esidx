@@ -134,19 +134,25 @@ On the target:
 
 ```sh
 tar xzf esidx-<version>.tar.gz && cd esidx-<version>
-./install.sh --start --root /work              # build, install, and run the two-process pair
+./install.sh --start --root /work              # build, install, and run it
+./install.sh --start --root /work --split      # the two-process form instead
 ./install.sh --start --root /work --prefix ~/.local    # same, no root for the install
 ./install.sh --stop
 ```
 
-`install.sh` builds from sources and is still the **two-process** deployment: the proxy runs
-as root, the index server as your user, and the socket between them is chgrp'ed to a group you
-name (`--group`, default: your own). The package above ships the one-process form instead;
-`esidx serve --watch-embed` is the same code path either way, and `--watch=SOCK` stays
-available for anyone who wants the split. `install.sh` handles the three things that made
-doing it by hand annoying: the submodule is already inside the package, the socket's group is
-arranged for you, and it refuses to continue rather than half-installing. Without `--start` it
-installs and prints the commands. Logs land in `--logdir` (default `/tmp/esidx-logs`).
+`install.sh` builds from sources and starts the **one-process** form, the same shape the
+package runs: one server that opens the fanotify group as root, gives it back before it opens
+the listener, and keeps only `CAP_DAC_READ_SEARCH`. `--split` asks for the two-process form
+instead — the proxy as root, the index server as your user, and the socket between them
+chgrp'ed to a group you name (`--group`, default: your own) — for a deployment where the index
+server must not even *start* with a capability; `--watch=SOCK` stays available for the same
+reason. `--drop-to=USER` (default: you, which is who built the snapshot) names the identity the
+one-process server keeps, and `--group`/`--socket` are refused without `--split` rather than
+ignored. `install.sh` handles the three things that made doing it by hand annoying: the
+submodule is already inside the package (the embedded watcher is sfa's client code, compiled
+into `esidx`), it refuses to continue rather than half-installing, and the split form's socket
+group is arranged for you. Without `--start` it installs and prints the commands. Logs land in
+`--logdir` (default `/tmp/esidx-logs`).
 
 One `make` leaves the tree ready for everything, and it always builds both
 flavours: the gate needs both, and a selector that could point it at one of them
