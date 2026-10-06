@@ -334,30 +334,51 @@ static ast_t *parse_expr_str(parser_t *p, const char *s)
     return r;
 }
 
-static ast_t *parse_term(parser_t *p, const char *text)
+/* Names that may stand alone *and* be followed by a term: `folder:abc` is `folder:` AND
+ * `abc`, not a filter whose argument is `abc`.
+ *
+ * This is the language, not a convenience. everything-syntax.md files `file:`/`folder:` in
+ * the **Modifiers** table (L37-63) and the six type macros in the **Macros** table (L28-35),
+ * and the general term structure it gives is `[!][search-modifier:][search-function:]<text>`
+ * -- a modifier takes the *following term*, it does not own a value. That document does not
+ * settle the same question for the names Everything spells as argument-less functions, so
+ * those were measured against the reference server on :21 (cmp_ref.sh carries the rows):
+ *
+ *     folder:  1594989   folder:zzzznotfound  0
+ *     image:    422143   image:zzzznotfound   0
+ *     root:          7   root:zzzznotfound    0
+ *     empty:    141171   empty:zzzznotfound   0
+ *
+ * -- every one of them drops the whole result set when a term follows, so all of them are
+ * in this table. `type:` is deliberately absent: Everything documents it as a function
+ * ("files and folders of the given type"), and `type:image` is its argument.
+ *
+ * The value is never silently discarded. Before this, `folder:abc` parsed to a leaf whose
+ * value the executor threw away (`(void)t` in m_folder), so it answered every folder in the
+ * index -- a wrong answer, with no warning and no error, for a spelling the reference
+ * supports. */
+static const char *const prefix_names[] = {
+    "file", "folder", "directory",
+    "audio", "video", "image", "picture",
+    "doc", "document", "archive", "zip", "exe",
+    "root", "empty",
+    NULL
+};
+
+static int term_prefix(const char *name)
+{
+    for (size_t i = 0; prefix_names[i]; i++)
+        if (!strcmp(name, prefix_names[i])) return 1;
+    return 0;
+}
+
+/* One leaf: `fn:value`, `fn:<list>`, `child:<expr>` or a bare term. Takes ownership of
+ * `val` (freed on every path). */
+static ast_t *leaf_node(parser_t *p, const char *fn, char *val, mod_t mod)
 {
     ast_t *n = node(AST_TERM);
-    if (!n) { perr(p, "out of memory"); return NULL; }
-
-    char raw_fn[64], fn[80];
-    /* One heap buffer for the value where there were two 2 KB stack ones, because
-     * SYNTAX_VALUE_MAX is 8 KB and parse_term sits under MAX_DEPTH frames of recursion:
-     * 16 KB per frame is a stack overflow waiting for a query with a lot of brackets in
-     * it. peel_value_mods() shifts the string left in place, so one buffer is all the
-     * two were ever needed for. */
-    char *val = malloc(SYNTAX_VALUE_MAX);
-    if (!val) { ast_free(n); perr(p, "out of memory"); return NULL; }
-
-    if (split_function(text, raw_fn, sizeof(raw_fn), val, SYNTAX_VALUE_MAX)) {
-        const char *rest = peel_mods(raw_fn, &n->mod);
-        snprintf(fn, sizeof(fn), "%s", rest);
-        /* the name may have been nothing but modifiers; then the value can carry
-         * more of them (`path:regex:...`) */
-        if (!*fn) peel_value_mods(val, &n->mod);
-    } else {
-        snprintf(fn, sizeof(fn), "%s", "");
-        snprintf(val, SYNTAX_VALUE_MAX, "%s", text);
-    }
+    if (!n) { free(val); perr(p, "out of memory"); return NULL; }
+    n->mod = mod;
 
     /* bracketed value list */
     size_t vl = strlen(val);
@@ -394,6 +415,89 @@ static ast_t *parse_term(parser_t *p, const char *text)
     free(val);
     if (!n->fn || !n->val) { ast_free(n); perr(p, "out of memory"); return NULL; }
     return n;
+}
+
+/* Left-nested AND, the shape parse_and() builds for juxtaposition. */
+static ast_t *and_with(parser_t *p, ast_t *a, ast_t *b)
+{
+    ast_t *n = node(AST_AND);
+    if (!n) { ast_free(a); ast_free(b); perr(p, "out of memory"); return NULL; }
+    n->a = a;
+    n->b = b;
+    return n;
+}
+
+/* A term is `[!][search-modifier:]*[prefix:]*<text>` and every one of those heads is
+ * colon-separated, so one pass over the token is a loop rather than a single split: the
+ * modifier path already handled `path:regex:foo` (all heads modifiers), but a modifier in
+ * front of a *prefix* sent the rest through as literal text -- `case:folder:abc` matched
+ * the filename "folder:abc". Measured on the reference, `case:folder:zzzznotfound` is 0
+ * and `case:folder:` is the folder count, i.e. the modifier scopes the whole term.
+ *
+ * Two value buffers, alternating: the loop reads one while splitting into the other, and a
+ * single buffer would be overwritten before it was read. */
+static ast_t *parse_term(parser_t *p, const char *text)
+{
+    char raw_fn[64], fn[80];
+    char *buf[2] = { malloc(SYNTAX_VALUE_MAX), malloc(SYNTAX_VALUE_MAX) };
+    if (!buf[0] || !buf[1]) {
+        free(buf[0]); free(buf[1]); perr(p, "out of memory"); return NULL;
+    }
+
+    ast_t *acc = NULL;      /* the prefix leaves seen so far, ANDed */
+    mod_t  mod = 0;
+    const char *cur = text;
+    int    bi = 0;
+
+    for (;;) {
+        if (!split_function(cur, raw_fn, sizeof(raw_fn), buf[bi], SYNTAX_VALUE_MAX)) {
+            /* No head left: the rest of the token is the term itself. split_function() leaves
+             * the buffer untouched when it returns 0 (its "a bare word keeps everything" rule
+             * exists for values like `c:`), so the text has to be copied in here -- reading the
+             * buffer as-is is how this rewrite first answered 0 for every bare word. */
+            snprintf(buf[bi], SYNTAX_VALUE_MAX, "%s", cur);
+            ast_t *leaf = leaf_node(p, "", buf[bi], mod);
+            free(buf[bi ^ 1]);
+            if (!leaf) { ast_free(acc); return NULL; }
+            return acc ? and_with(p, acc, leaf) : leaf;
+        }
+
+        const char *rest = peel_mods(raw_fn, &mod);
+        if (!*rest) {
+            /* the head was nothing but modifiers; the value carries what they scope */
+            peel_value_mods(buf[bi], &mod);
+            cur = buf[bi];
+            bi ^= 1;
+            continue;
+        }
+
+        if (term_prefix(rest)) {
+            ast_t *f = node(AST_TERM);
+            if (!f) { free(buf[0]); free(buf[1]); ast_free(acc); perr(p, "out of memory"); return NULL; }
+            f->fn  = dupstr(rest);
+            f->val = dupstr("");
+            if (!f->fn || !f->val) {
+                ast_free(f); free(buf[0]); free(buf[1]); ast_free(acc);
+                perr(p, "out of memory"); return NULL;
+            }
+            acc = acc ? and_with(p, acc, f) : f;
+            if (!acc) { free(buf[0]); free(buf[1]); return NULL; }
+            cur = buf[bi];
+            bi ^= 1;
+            if (!*cur) {    /* `folder:` on its own: the filter is the whole term */
+                free(buf[0]); free(buf[1]);
+                return acc;
+            }
+            continue;
+        }
+
+        /* a function name, or a name nothing implements: either way it owns the value */
+        snprintf(fn, sizeof(fn), "%s", rest);
+        ast_t *leaf = leaf_node(p, fn, buf[bi], mod);
+        free(buf[bi ^ 1]);
+        if (!leaf) { ast_free(acc); return NULL; }
+        return acc ? and_with(p, acc, leaf) : leaf;
+    }
 }
 
 /* ----------------------------------------------------------------- grammar */

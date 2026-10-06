@@ -334,6 +334,13 @@ size/date constants, and the type macros. Highlights:
 | `sort:` `count:` `offset:` | CLI sugar for the ETP sort/OFFSET/COUNT | — |
 | `<word>` | case-insensitive substring | in-memory scan |
 
+`folder:`, `file:`, the type macros, `root:` and `empty:` may be followed
+**directly** by a term: `folder:abc` is that filter *and* the term `abc`, while
+`folder:` alone is just the filter. The reference settles it and says so in
+measurements — `folder:zzzznotfound` is 0 where `folder:` answers 1 594 989 — see
+`docs/everything-syntax.md` ("what this document does not settle") and the rows
+`cmp_ref.sh` re-measures.
+
 Functions Everything has and ext4 cannot answer — `content:`, `dupe:`,
 `si:`, the media metadata — parse and return no results, with one warning, rather
 than failing the query. `si:` has no Linux counterpart at all (design §12, risk 2).

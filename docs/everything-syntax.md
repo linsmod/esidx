@@ -21,6 +21,29 @@ separator in it matches the **filename**, a term with a separator in it (or an
 explicit `path:`) matches the **path**, and `path:` with a value that starts with
 a star is a "contains anywhere in the path" test.
 
+It also does not say whether a macro, or a `file:`/`folder:` modifier, may be
+*followed* by a term. That one changes the whole result set rather than a row:
+`folder:abc` is the folder filter **AND** the term `abc`, not "the folders, and
+`abc` is somebody else's business". Measured on the reference (`:21`, the probe
+scripts' shape; the nonsense rows are in `cmp_ref.sh` and re-measurable):
+
+| Term | Reference | Reads as |
+|---|---|---|
+| `folder:` | 1 594 989 | the filter alone |
+| `folder:zzzznotfound` | 0 | the value is a term, and it is required |
+| `image:` / `image:zzzznotfound` | 422 143 / 0 | the macros behave the same way |
+| `root:` / `root:zzzznotfound` | 7 / 0 | so do the names that read like argument-less functions |
+| `empty:` / `empty:zzzznotfound` | 141 171 / 0 | |
+| `folder:zzzznotfound zzzznotfound` | 0 | which is what AND means here |
+| `!folder:zzzznotfound` | 12 255 166 | the complement of the row above: `!` negates the whole term, modifier and value together |
+
+`case:folder:zzzznotfound` and `folder:path:zzzznotfound` are 0 as well, so a
+modifier in front of the prefix scopes that same term. Two consequences worth
+writing down, because both were wrong here: `file:.txt` is not `file:` plus noise
+(it selects the `.txt` files, and `file:` alone selects every file), and
+`folder:abc` is not the same query as `abc folder:` only by accident — they are
+the same query by grammar.
+
 ---
 
 ## Operators — L2-8

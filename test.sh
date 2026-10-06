@@ -140,6 +140,50 @@ expect "parent: + folder: -> subdirs"         "$(n "$LAST")" "1"
 q "parent:$TREE/sub1" "file:"
 expect "parent: + file: -> files"             "$(n "$LAST")" "1"
 
+say "prefix names take a term (L28-35 macros, L37-63 modifiers)"
+# `folder:abc` is the filter AND the term, which is what the reference answers (the
+# rows in cmp_ref.sh are the same question asked of both servers). Before this, the
+# value was parsed and then dropped by the executor, so `folder:abc` answered every
+# folder -- a wrong answer with no warning, for a spelling the reference supports.
+
+q "folder:sub1"
+expect "folder:<name> is the filter AND the term"          "$(n "$LAST")" "1"
+
+q "folder:sub"
+expect "folder:<substring> matches both subdirectories"    "$(n "$LAST")" "2"
+
+q "folder:x.conf"
+expect "folder:<a file's name> is empty: the value is a term, not the filter's argument" \
+                                                           "$(n "$LAST")" "0"
+
+q "file:a.txt"
+expect "file:<name> matches the file"                      "$(n "$LAST")" "1"
+
+q "file:sub1"
+expect "file:<a directory's name> is empty"                "$(n "$LAST")" "0"
+
+q "file:.conf"
+expect "file:<extension-shaped term> is the filter AND the term" \
+                                                           "$(n "$LAST")" "3"
+
+q "empty:zzzznotfound"
+expect "empty:<term> is empty: the value is honoured, not dropped" \
+                                                           "$(n "$LAST")" "0"
+
+q "image:zzzznotfound"
+expect "a macro with a term is the macro AND the term"     "$(n "$LAST")" "0"
+
+q "startwith:folder:sub1"
+expect "a modifier in front of a prefix scopes the same term" "$(n "$LAST")" "1"
+
+q "startwith:folder:ub1"
+expect "  ... and is not dropped on the way"               "$(n "$LAST")" "0"
+
+q ""
+TOTAL=$(n "$LAST")
+q "!folder:sub1"
+expect "! negates the whole term, value included"          "$(n "$LAST")" "$((TOTAL - 1))"
+
 q "parent:$TREE/empty"
 expect "parent: of an empty dir -> nothing"   "$(n "$LAST")" "0"
 

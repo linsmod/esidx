@@ -100,6 +100,13 @@ TERMS=(
     '*PC/esidx*'
     # the rest of the matcher, which the reference and we already agreed on
     'stem:main' 'startwith:sub' 'ext:c esidx' 'folder: esidx' 'nope-does-not-exist'
+    # a prefix name followed directly by a term, no space: `folder:abc` is the folder
+    # filter AND the term `abc` (docs/everything-syntax.md, "what this does not settle").
+    # A nonsense term is the whole test: the reference answers 0 where `folder:` alone
+    # answers 1 594 989, so a parser that dropped the value would answer the bare filter
+    # here and this row would say so. `empty:` and a macro are in for the same reason --
+    # every name that can stand alone takes a term, measured on :21.
+    'folder:zzzznotfound' 'image:zzzznotfound' 'empty:zzzznotfound'
 )
 [ $# -gt 0 ] && TERMS=("$@")
 
