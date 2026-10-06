@@ -21,11 +21,13 @@ PREFIX=/usr/local
 DESTDIR=
 GROUP=
 ROOTDIR=
+DBPATH=
 PORT=2121
 SOCKET=
 LOGDIR=
 DO_START=0
 DO_STOP=0
+WITH_DEBUG=0
 JOBS=$(nproc 2>/dev/null || echo 4)
 
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
@@ -41,6 +43,9 @@ while [ $# -gt 0 ]; do
         --group=*)  GROUP=${1#*=}; shift ;;
         --root)    ROOTDIR=$2; shift 2 ;;
         --root=*)  ROOTDIR=${1#*=}; shift ;;
+        --db)      DBPATH=$2; shift 2 ;;
+        --db=*)    DBPATH=${1#*=}; shift ;;
+        --with-debug) WITH_DEBUG=1; shift ;;
         --port)    PORT=$2; shift 2 ;;
         --port=*)  PORT=${1#*=}; shift ;;
         --socket)  SOCKET=$2; shift 2 ;;
@@ -57,41 +62,58 @@ done
 cd "$(dirname "$0")"
 [ -f sfa/sfa.h ] || die "sfa/ is empty -- this tree has no event source (in a git checkout: git submodule update --init --recursive)"
 
-# Privilege: installing under a prefix we cannot write, and starting the proxy at all,
-# both need root. Ask once and reuse, rather than putting sudo in front of every command
-# and letting it prompt four times.
-SUDO=""
-if [ "$(id -u)" -ne 0 ]; then
-    if [ -w "$PREFIX" ] || [ -n "$DESTDIR" ]; then
-        :                                   # writable prefix: no sudo needed for the install
-    elif command -v sudo >/dev/null 2>&1; then
-        SUDO=sudo
-        say "-- prefix $PREFIX is not writable; the privileged steps will ask for a password"
-    else
-        die "$PREFIX is not writable and there is no sudo -- use --prefix ~/.local"
-    fi
+# Privilege is two separate questions and conflating them is a bug I wrote and then deployed:
+# "may I write the install prefix" and "will something here need root" are unrelated. The
+# prefix can be a user directory while the proxy still needs CAP_SYS_ADMIN, and a system
+# prefix can be installed by a root invocation that then needs no further privilege.
+SUDO_INSTALL=""
+SUDO_RUN=""
+[ "$(id -u)" -ne 0 ] && SUDO_RUN=sudo
+if [ "$(id -u)" -ne 0 ] && [ -z "$DESTDIR" ] && [ ! -w "$PREFIX" ]; then
+    command -v sudo >/dev/null 2>&1 \
+        || die "$PREFIX is not writable and there is no sudo -- use --prefix ~/.local"
+    SUDO_INSTALL=sudo
 fi
+
 [ -n "$SOCKET" ] || SOCKET=/tmp/esidx-sfa.sock
 [ -n "$LOGDIR" ] || LOGDIR=/tmp/esidx-logs
+# The snapshot is data, not a system file, so it defaults somewhere the invoking user can
+# write. /var/lib is the right place for a package install, and the wrong default for a
+# per-user prefix install -- which is what made the first deployment attempt die on
+# `mkdir /var/lib/esidx` with no explanation.
+if [ -z "$DBPATH" ]; then
+    if [ "$(id -u)" -eq 0 ] && [ -z "$DESTDIR" ] && [ "$PREFIX" = /usr/local ]; then
+        DBPATH=/var/lib/esidx/root.idx
+    else
+        DBPATH="${XDG_DATA_HOME:-$HOME/.local/share}/esidx/root.idx"
+    fi
+fi
 
 # ---------------------------------------------------------------- build and install
 
-say "== build (make -j$JOBS)"
-make -j"$JOBS"
+# `make opt`, not a bare `make`: the default goal builds both flavours and the sanitiser one
+# is the slowest thing on the target by a wide margin, and an install needs one binary. The
+# watcher suite and the gate want the other flavour and run it themselves.
+say "== build (make opt -j$JOBS)"
+if [ "$WITH_DEBUG" = 1 ]; then
+    make -j"$JOBS"
+else
+    make opt -j"$JOBS"
+fi
 
 say "== install esidx -> $DESTDIR$PREFIX/bin"
-$SUDO make install PREFIX="$PREFIX" DESTDIR="$DESTDIR"
+$SUDO_INSTALL make install PREFIX="$PREFIX" DESTDIR="$DESTDIR"
 
 say "== install the event source (headers + SDK + the proxy) -> $DESTDIR$PREFIX"
 # sfa's install is what puts sfa-server on PATH; without it there is no --watch, so it is
 # not optional here even though it was optional in the build.
-$SUDO make -C sfa install PREFIX="$PREFIX" DESTDIR="$DESTDIR"
+$SUDO_INSTALL make -C sfa install PREFIX="$PREFIX" DESTDIR="$DESTDIR"
 
 # ---------------------------------------------------------------- run
 
 if [ "$DO_STOP" = 1 ]; then
     say "== stopping"
-    $SUDO pkill -x sfa-server 2>/dev/null || true
+    $SUDO_RUN pkill -x sfa-server 2>/dev/null || true
     pkill -x esidx 2>/dev/null || true
     say "   stopped (proxy and server)"
 fi
@@ -99,10 +121,11 @@ fi
 if [ "$DO_START" != 1 ]; then
     [ "$DO_STOP" = 1 ] && exit 0
     say ""
-    say "installed. To index $DESTDIR$PREFIX and serve it with live events:"
-    say "  sudo $PREFIX/bin/sfa-server ${ROOTDIR:-/} --group $(id -un) $SOCK   # privileged half"
-    say "  $PREFIX/bin/esidx build ${ROOTDIR:-/} -o /var/lib/esidx/root.idx  # once"
-    say "  $PREFIX/bin/esidx serve /var/lib/esidx/root.idx -p $PORT --watch=$SOCK --sweep=3600"
+    say "installed. Snapshot path: $DBPATH"
+    say "To index and serve ${ROOTDIR:-/} with live events:"
+    say "  sudo $PREFIX/bin/sfa-server ${ROOTDIR:-/} --group $(id -un) $SOCKET   # privileged half"
+    say "  $PREFIX/bin/esidx build ${ROOTDIR:-/} -o $DBPATH                      # once"
+    say "  $PREFIX/bin/esidx serve $DBPATH -p $PORT --watch=$SOCKET --sweep=3600"
     say "or let this script do all three:  ./install.sh --start --root ${ROOTDIR:-/}"
     exit 0
 fi
@@ -121,32 +144,33 @@ command -v "$PREFIX/bin/esidx" >/dev/null 2>&1 \
 [ -n "$GROUP" ] || GROUP=$(id -gn)
 getent group "$GROUP" >/dev/null 2>&1 || die "no such group: $GROUP"
 
-mkdir -p "$LOGDIR" 2>/dev/null || $SUDO mkdir -p "$LOGDIR"
+mkdir -p "$LOGDIR" 2>/dev/null || $SUDO_RUN mkdir -p "$LOGDIR"
 
 say "== stop anything left over, then start clean"
-$SUDO pkill -x sfa-server 2>/dev/null || true
+$SUDO_RUN pkill -x sfa-server 2>/dev/null || true
 pkill -x esidx 2>/dev/null || true
 sleep 0.5
 rm -f "$SOCKET"
 
-DB=/var/lib/esidx/root.idx
-if [ ! -f "$DB" ]; then
-    say "== building the first snapshot of $ROOTDIR (this is the slow step)"
-    $SUDO mkdir -p "$(dirname "$DB")"
-    $SUDO "$PREFIX/bin/esidx" build "$ROOTDIR" -o "$DB"
+if [ ! -f "$DBPATH" ]; then
+    say "== building the first snapshot of $ROOTDIR into $DBPATH (this is the slow step)"
+    mkdir -p "$(dirname "$DBPATH")" 2>/dev/null \
+        || $SUDO_RUN mkdir -p "$(dirname "$DBPATH")" \
+        || die "cannot create $(dirname "$DBPATH") -- pass --db PATH somewhere writable"
+    $SUDO_RUN "$PREFIX/bin/esidx" build "$ROOTDIR" -o "$DBPATH"
 fi
 
 say "== 1/2 the privileged half: sfa-server as root, marked on $ROOTDIR"
-$SUDO setsid nohup "$PREFIX/bin/sfa-server" "$ROOTDIR" --group "$GROUP" "$SOCKET" \
+$SUDO_RUN setsid nohup "$PREFIX/bin/sfa-server" "$ROOTDIR" --group "$GROUP" "$SOCKET" \
     >"$LOGDIR/sfa.log" 2>&1 </dev/null &
 for _ in $(seq 50); do [ -S "$SOCKET" ] && break; sleep 0.2; done
 [ -S "$SOCKET" ] || { say "   FAILED to start; see $LOGDIR/sfa.log"; exit 1; }
-ls -l "$SOCK" | sed 's/^/   /'
+ls -l "$SOCKET" | sed 's/^/   /'
 say "   negotiated: $(grep -o 'mark 模式.*' "$LOGDIR/sfa.log" | head -1)"
 
 say "== 2/2 the unprivileged half: esidx as $(id -un), watching it"
-setsid nohup "$PREFIX/bin/esidx" -v 3 serve "$DB" -p "$PORT" --bind 127.0.0.1 \
-    --watch="$SOCK" --sweep=3600 >"$LOGDIR/esidx.log" 2>&1 </dev/null &
+setsid nohup "$PREFIX/bin/esidx" -v 3 serve "$DBPATH" -p "$PORT" --bind 127.0.0.1 \
+    --watch="$SOCKET" --sweep=3600 >"$LOGDIR/esidx.log" 2>&1 </dev/null &
 for _ in $(seq 100); do grep -q 'esidx serving' "$LOGDIR/esidx.log" 2>/dev/null && break; sleep 0.2; done
 grep -E 'esidx serving|esidx: watching' "$LOGDIR/esidx.log" | sed 's/^/   /'
 grep -q 'esidx serving' "$LOGDIR/esidx.log" || { say "   FAILED to start; see $LOGDIR/esidx.log"; exit 1; }
