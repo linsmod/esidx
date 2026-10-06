@@ -298,6 +298,18 @@ else
     bad "the banner states the attribute caveat" "no such line in the banner"
 fi
 
+# 10b. the banner must carry the proxy's own report of how it negotiated. One assertion for
+#      the SDK call rather than for the text: the mark mode is the answer to "why am I sent
+#      events for a filesystem I do not index" (FAN_MARK_FILESYSTEM covers a whole
+#      filesystem and is the fallback where the mount form is rejected), and it is in the
+#      handshake precisely so a client can print it.
+if grep -qE 'watching .* via .* \[(MARK_MOUNT|FILESYSTEM)' "$TMP/serve.out" "$TMP/serve.log" 2>/dev/null; then
+    ok "the banner reports the proxy's mark mode"
+else
+    bad "the banner reports the proxy's mark mode" \
+        "no '[MARK_MOUNT|...]' in the banner -- is the handshake still sfa_connect()?"
+fi
+
 # 11. a rename the proxy cannot deliver, and the only reason we ever learn about it.
 #     sfa puts a rename's two paths in one 4096-byte buffer and drops the event if they do
 #     not both fit, so a rename at ~2100 characters produces no MOVED at all -- not a wrong

@@ -52,7 +52,35 @@ struct esidx_watch {
     watch_stats_t st;
     int         gone;        /* the proxy closed the connection */
     int         want_sweep;  /* the proxy lost events: the dirty set cannot be trusted */
+#ifdef SFA_WF_MARK_MOUNT
+    uint32_t    work_mode;   /* SFA_WF_*, as the handshake reported it */
+    char        work_str[96];
+#endif
 };
+
+uint32_t esidx_watch_work_mode(const esidx_watch_t *w)
+{
+#ifdef SFA_WF_MARK_MOUNT
+    return w ? w->work_mode : 0;
+#else
+    (void)w;
+    return 0;
+#endif
+}
+
+const char *esidx_watch_work_mode_str(const esidx_watch_t *w)
+{
+#ifdef SFA_WF_MARK_MOUNT
+    return w ? w->work_str : "(no proxy)";
+#else
+    /* An sfa older than the working-mode handshake. The Makefile treats a missing submodule
+     * as a supported checkout, and a stale one is the same class of surprise: it must build
+     * and lose this line, not fail to compile. Hence the guard on the macro rather than on
+     * the SDK function, which has no feature-test macro of its own. */
+    (void)w;
+    return "(not reported by this sfa)";
+#endif
+}
 
 esidx_watch_t *esidx_watch_open(const char *sock_path, const char *root,
                                 char *err, size_t errlen)
@@ -62,7 +90,17 @@ esidx_watch_t *esidx_watch_open(const char *sock_path, const char *root,
      * already spells that as NULL, so the distinction never has to leave this function. */
     if (sock_path && !*sock_path) sock_path = NULL;
 
-    int fd = sfa_connect(sock_path);
+    /* sfa_connect2 when the proxy is new enough to have it, because the handshake is where
+     * the mark mode is reported and that is the answer to "why is this client being sent
+     * events for a filesystem it does not index". sfa_connect() remains the fallback and
+     * costs nothing but the line in the banner. */
+    int fd;
+#ifdef SFA_WF_MARK_MOUNT
+    struct sfa_welcome welcome;
+    fd = sfa_connect2(sock_path, &welcome);
+#else
+    fd = sfa_connect(sock_path);
+#endif
     if (fd < 0) {
         snprintf(err, errlen, "cannot reach the sfa proxy at %s: %s",
                  sock_path ? sock_path : SFA_SOCKET_PATH, strerror(errno));
@@ -93,6 +131,13 @@ esidx_watch_t *esidx_watch_open(const char *sock_path, const char *root,
         return NULL;
     }
     w->rootlen = rl;
+#ifdef SFA_WF_MARK_MOUNT
+    w->work_mode = welcome.flags;
+    /* sfa's own formatter, so the names in our banner are the ones the proxy's own log and
+     * documentation use; "(not reported)" comes back for a flags == 0 handshake, which is
+     * what an older server sends. */
+    sfa_work_flags_str(welcome.flags, w->work_str, sizeof(w->work_str));
+#endif
     return w;
 }
 
@@ -260,6 +305,8 @@ esidx_watch_t *esidx_watch_open(const char *sock_path, const char *root,
 int esidx_watch_fd(const esidx_watch_t *w) { return w ? w->fd : -1; }
 int  esidx_watch_wants_sweep(const esidx_watch_t *w) { (void)w; return 0; }
 void esidx_watch_clear_sweep(esidx_watch_t *w) { (void)w; }
+uint32_t esidx_watch_work_mode(const esidx_watch_t *w) { (void)w; return 0; }
+const char *esidx_watch_work_mode_str(const esidx_watch_t *w) { (void)w; return "(not built in)"; }
 int  esidx_watch_drain(esidx_watch_t *w, esidx_t *db) { (void)w; (void)db; return -1; }
 const watch_stats_t *esidx_watch_stats(const esidx_watch_t *w) { (void)w; return NULL; }
 void esidx_watch_close(esidx_watch_t *w) { (void)w; }

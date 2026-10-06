@@ -1564,12 +1564,16 @@ int etp_serve(const etp_opts_t *opts)
          * become current, attributes do not (§12 risk 8), and an operator reading only
          * the first line would otherwise assume otherwise. The middle clause is the other
          * half of the same honesty -- a batch the proxy could not attribute to a path is
-         * answered with a full pass rather than skipped, so "current" does not quietly
-         * depend on the proxy having resolved everything. */
-        fprintf(stderr, "esidx: watching %s via %s -- name changes become visible "
+         * answered with a sweep rather than skipped, so "current" does not quietly depend
+         * on the proxy having resolved everything. The bracketed work mode is the proxy's
+         * own report of how it negotiated, and it is here because the mark mode is the
+         * answer to "why am I being sent events outside my index": FAN_MARK_FILESYSTEM
+         * covers a whole filesystem and is the fallback where the mount form is rejected.
+         */
+        fprintf(stderr, "esidx: watching %s via %s [%s] -- name changes become visible "
                         "within one batch; size/mtime still follow --refresh/--deep; "
                         "an event the proxy cannot place costs a full pass\n",
-                root, opts->watch_sock);
+                root, opts->watch_sock, esidx_watch_work_mode_str(watch));
     }
     fflush(stderr);
 

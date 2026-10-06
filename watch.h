@@ -95,12 +95,22 @@ int esidx_watch_fd(const esidx_watch_t *w);
  * current is exactly this return value (esidx_watch_drain peeks to tell them apart). */
 int esidx_watch_drain(esidx_watch_t *w, esidx_t *db);
 
+/* What the proxy says it is doing, as reported in its handshake (sfa's SFA_WF_* bits). The
+ * one an operator needs is the mark mode: on a kernel where FAN_MARK_MOUNT rejects the
+ * name events, sfa falls back to FAN_MARK_FILESYSTEM and the mark covers a whole
+ * filesystem, which is the entire reason this client filters on the root at all -- so
+ * without it in the log, "half my traffic is for paths I do not have" has no answer.
+ * Returns 0 from a proxy too old to report anything, which is a fact and not an error. */
+uint32_t    esidx_watch_work_mode(const esidx_watch_t *w);
+const char *esidx_watch_work_mode_str(const esidx_watch_t *w);
+
 /* Has the proxy told us it lost events since the last time this was cleared? A loss is the
  * one thing an event cannot describe, so the answer to it cannot be an event: the dirty set
  * has to be rebuilt from the filesystem, which is esidx_sweep_dirs(). Kept as a flag
  * rather than acted on here because the sweep costs one stat per directory (measured on
- * r7000: 94 ms for /usr's 34 811, 1941 ms for /work's 651 894) and belongs in the serve
- * loop's apply step with the other expensive thing, not inside a poll turn. */
+ * r7000: 77 ms for /usr's 34 810, 1.6 s for /work's 651 896, both with this code) and
+ * belongs in the serve loop's apply step with the other expensive thing, not inside a poll
+ * turn. */
 int esidx_watch_wants_sweep(const esidx_watch_t *w);
 
 /* Clear it. Called by whoever runs the sweep, so a sweep that fails to start is not
