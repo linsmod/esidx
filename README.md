@@ -53,6 +53,9 @@ a file, states what is outstanding, and carries the current measurements.
 ## Build
 
 ```sh
+git clone --recurse-submodules https://github.com/linsmod/esidx   # or:
+git submodule update --init --recursive                           # in an existing clone
+
 make            # both flavours: -O2 (log level = warn) and
                  # -O0 -g + AddressSanitizer/UBSan (log level = debug)
 make opt        # just the optimised build
@@ -60,6 +63,11 @@ make dbg        # just the sanitiser one
 make check      # the gate: both suites against both builds
 make clean
 ```
+
+**The `sfa` submodule is a dependency, not an option.** It is the privileged half of the
+event source (`--watch`), its pointer is committed in the tree, and the build stops with one
+line if `sfa/sfa.h` is missing rather than handing back a server that has no watcher and
+does not say so. `make clean` still works without it — nothing that compiles needs it.
 
 One `make` leaves the tree ready for everything, and it always builds both
 flavours: the gate needs both, and a selector that could point it at one of them

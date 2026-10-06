@@ -48,20 +48,28 @@ HDRS = esidx.h syntax.h etp.h log.h timer.h lexer.h watch.h
 OBJS = store.o index.o scan.o trigram.o lexer.o parser.o regex.o query.o log.o etp.o watch.o main.o
 DBG_OBJS = $(OBJS:.o=.dbg.o)
 
-# The watcher's client SDK comes from sfa, a submodule in its own repository, and it is
-# optional on purpose. Without it the binary still builds, `--watch` says the feature is
-# not built in, and every other command is unaffected -- which is the right behaviour for
-# a checkout nobody cloned a submodule into. It is also why the dependency is a wildcard
-# rather than a plain name: a missing file must not stop the build before the rule runs.
+# The watcher's client SDK comes from sfa, a submodule in its own repository. It is a
+# DEPENDENCY, not an option, and the build says so rather than working around it: the
+# pointer is committed in the tree, so "sfa is not there" is a checkout nobody finished
+# (`git clone` without `--recurse-submodules`, or a `git submodule update` never run), not a
+# configuration to support. Building anyway would hand back a server with no watcher, no
+# loss signal and no sweep-on-loss, and nothing about it would say so until someone passed
+# `--watch` and read an error -- which is the failure mode this project keeps arguing
+# against (AGENTS.md 6, failures are visible).
 SFA_H   = sfa/sfa.h
 SFA_LIB = sfa/libsfa.c
-ifneq ($(wildcard $(SFA_H)),)
-OBJS   += sfa/libsfa.o
-SFA_DEF = -DESIDX_HAVE_SFA=1
-HDRS   += $(SFA_H)
-endif
-CFLAGS    += $(SFA_DEF)
-DBG_CFLAGS += $(SFA_DEF)
+OBJS += sfa/libsfa.o
+HDRS += $(SFA_H)
+
+# Checked in a recipe rather than with $(error) so that `make clean` still works on a
+# checkout that has not finished initialising: everything that compiles depends on this,
+# and clean is the one thing that must not need the dependency to be present.
+require-sfa:
+	@if [ ! -f "$(SFA_H)" ]; then \
+	    echo "esidx: $(SFA_H) is missing: the sfa submodule is not checked out." >&2; \
+	    echo "       run: git submodule update --init --recursive" >&2; \
+	    exit 1; \
+	fi
 
 # `all` is etp-probe as well as the server, so one `make` leaves a checkout ready
 # for both suites. It used to be two steps (AGENTS.md 3.1), and the second one was
@@ -74,14 +82,13 @@ all: opt dbg sfa-proxy
 # The privileged proxy the watcher talks to, built here for the same reason etp-probe and
 # order-ref are: test_watch.sh stopping with "./sfa/sfa-server not built" reads like a
 # broken checkout rather than a forgotten second step (AGENTS.md 3.1). It lives in the
-# submodule and has its own Makefile, so this only asks for the binary -- if the submodule
-# was never cloned there is nothing to ask for and the watcher suite skips itself.
+# submodule and has its own Makefile; the error above has already established that sfa/ is
+# present, so this is only asking for the binary.
 sfa-proxy:
-	@if [ -f sfa/Makefile ]; then $(MAKE) -C sfa sfa-server; \
-	  else echo "sfa/ not present -- the watcher is not available in this checkout"; fi
+	@$(MAKE) -C sfa sfa-server
 
-opt: esidx etp-probe order-ref
-dbg: esidx-dbg etp-probe-dbg order-ref-dbg
+opt: require-sfa esidx etp-probe order-ref
+dbg: require-sfa esidx-dbg etp-probe-dbg order-ref-dbg
 
 esidx: $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
@@ -158,4 +165,4 @@ uninstall:
 clean:
 	rm -f $(OBJS) $(DBG_OBJS) esidx esidx-dbg etp-probe etp-probe-dbg order-ref order-ref-dbg
 
-.PHONY: all opt dbg sfa-proxy check test test-etp test-all install uninstall clean
+.PHONY: require-sfa all opt dbg sfa-proxy check test test-etp test-all install uninstall clean
