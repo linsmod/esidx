@@ -28,6 +28,7 @@ LOGDIR=
 DO_START=0
 DO_STOP=0
 WITH_DEBUG=0
+SUDO_STDIN=0
 JOBS=$(nproc 2>/dev/null || echo 4)
 
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
@@ -46,6 +47,7 @@ while [ $# -gt 0 ]; do
         --db)      DBPATH=$2; shift 2 ;;
         --db=*)    DBPATH=${1#*=}; shift ;;
         --with-debug) WITH_DEBUG=1; shift ;;
+        --sudo-stdin) SUDO_STDIN=1; shift ;;
         --port)    PORT=$2; shift 2 ;;
         --port=*)  PORT=${1#*=}; shift ;;
         --socket)  SOCKET=$2; shift 2 ;;
@@ -77,6 +79,26 @@ fi
 
 [ -n "$SOCKET" ] || SOCKET=/tmp/esidx-sfa.sock
 [ -n "$LOGDIR" ] || LOGDIR=/tmp/esidx-logs
+
+# The proxy needs CAP_SYS_ADMIN, so `--start` needs root exactly once, at the beginning,
+# and the ticket then covers every later call. Three ways to be here, and the difference
+# matters because the failure otherwise arrives four steps later as sudo's own message:
+#   a terminal       -- `sudo -v` prompts once, which is the normal case
+#   --sudo-stdin     -- the password arrives on stdin, for `ssh host 'install.sh --start'`
+#   neither          -- refused here, with the two ways out named
+if [ "$DO_START" = 1 ] && [ "$(id -u)" -ne 0 ]; then
+    if [ "$SUDO_STDIN" = 1 ]; then
+        sudo -S -v >/dev/null 2>&1 || true      # consumes one line of stdin
+    elif [ -t 0 ]; then
+        say "-- the event proxy needs root; one password prompt follows"
+        sudo -v || die "sudo failed"
+    else
+        die "--start needs root and there is no terminal to ask on.
+       Either run this from a terminal, or run 'sudo -v' first (the ticket lasts about
+       15 minutes), or pipe the password in with --sudo-stdin."
+    fi
+fi
+
 # The snapshot is data, not a system file, so it defaults somewhere the invoking user can
 # write. /var/lib is the right place for a package install, and the wrong default for a
 # per-user prefix install -- which is what made the first deployment attempt die on
