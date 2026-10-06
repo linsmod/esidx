@@ -154,10 +154,17 @@ rm -f "$SOCKET"
 
 if [ ! -f "$DBPATH" ]; then
     say "== building the first snapshot of $ROOTDIR into $DBPATH (this is the slow step)"
-    mkdir -p "$(dirname "$DBPATH")" 2>/dev/null \
-        || $SUDO_RUN mkdir -p "$(dirname "$DBPATH")" \
-        || die "cannot create $(dirname "$DBPATH") -- pass --db PATH somewhere writable"
-    $SUDO_RUN "$PREFIX/bin/esidx" build "$ROOTDIR" -o "$DBPATH"
+    # No sudo by default: the snapshot path defaults under the invoking user's own data
+    # directory precisely so that the slow step needs no privilege. sudo appears here only
+    # when someone pointed --db somewhere else that we cannot write.
+    DBBUILD=""
+    if ! mkdir -p "$(dirname "$DBPATH")" 2>/dev/null; then
+        [ -n "$SUDO_RUN" ] || die "cannot create $(dirname "$DBPATH") -- pass --db PATH somewhere writable, or run this with a tty so sudo can ask"
+        $SUDO_RUN mkdir -p "$(dirname "$DBPATH")"
+        DBBUILD="$SUDO_RUN"
+    fi
+    # shellcheck disable=SC2086
+    $DBBUILD "$PREFIX/bin/esidx" build "$ROOTDIR" -o "$DBPATH"
 fi
 
 say "== 1/2 the privileged half: sfa-server as root, marked on $ROOTDIR"

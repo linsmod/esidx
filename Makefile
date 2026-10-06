@@ -197,6 +197,9 @@ DESCRIBE  := $(shell $(GIT) describe --tags --always 2>/dev/null)
 DIRTY     := $(shell test -z "$$($(GIT) status --porcelain 2>/dev/null)" || echo -dirty)
 VERSION   := $(if $(DESCRIBE),$(DESCRIBE),$(REVISION))$(DIRTY)
 MTIME     := $(shell $(GIT) show -s --format=%ct HEAD 2>/dev/null || echo 0)
+# Resolved here rather than in the recipe: the recipe writes VERSION-SOURCES inside single
+# quotes, so a `$$(git ...)` in it reaches the file as literal text instead of the hash.
+SFA_REV   := $(shell $(GIT) -C sfa rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
 
 DISTDIR   := dist
 PKGNAME   := esidx-$(VERSION)
@@ -230,7 +233,7 @@ dist: require-sfa
 	    [ "$$mode" = 100644 ] && chmod 0644 "$(STAGE)/$(PKGNAME)/sfa/$$f"; \
 	done < "$(DISTDIR)/.sfa-files"
 	@printf '%s\n' '$(VERSION)' > "$(STAGE)/$(PKGNAME)/VERSION"
-	@printf '%s\n' 'esidx $(REVISION) + sfa $$($(GIT) -C sfa rev-parse --short=12 HEAD 2>/dev/null)' \
+	@printf '%s\n' 'esidx $(REVISION) + sfa $(SFA_REV)' \
 	    > "$(STAGE)/$(PKGNAME)/VERSION-SOURCES"
 	@chmod 0644 "$(STAGE)/$(PKGNAME)/VERSION" "$(STAGE)/$(PKGNAME)/VERSION-SOURCES"
 	@tar --sort=name --owner=0 --group=0 --numeric-owner --mtime='@$(MTIME)' \
