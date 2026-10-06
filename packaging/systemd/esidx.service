@@ -1,0 +1,54 @@
+[Unit]
+Description=esidx search index: ETP over TCP, holding its own fanotify group
+Documentation=file:///usr/share/doc/esidx/README.md
+After=network.target local-fs.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/lib/esidx
+EnvironmentFile=/etc/default/esidx
+# One process for the whole event path: this server opens the fanotify group itself and gives
+# the privilege back before it opens the listener (--watch-embed + --drop-to). That is why
+# there is no User= here: User= would either start it unprivileged, and opening a group marked
+# on a mount needs CAP_SYS_ADMIN, or leave it root for its whole life -- which is the
+# two-process split's answer, and still available (README, "Deployment"): run sfa-server
+# separately and pass --watch=${ESIDX_SOCKET} instead of --watch-embed.
+#
+# What the drop keeps is measured, not chosen: CAP_DAC_READ_SEARCH survives because
+# open_by_handle_at needs it to turn an event into a path, and without it every batch becomes a
+# full sweep. The numbers are in watch.c, next to the code.
+#
+# --no-download is not a knob either. RETR returns file *contents* over the data connection,
+# so leaving it off turns a search service into an anonymous file server for everything under
+# ESIDX_ROOT. Take the flag out of this line, in a drop-in, if that is what you want.
+ExecStart=/usr/bin/esidx -v 3 serve ${ESIDX_DB} -p ${ESIDX_PORT} --bind ${ESIDX_BIND} --no-download --watch-embed=${ESIDX_ROOT} --drop-to=${ESIDX_USER} --sweep=${ESIDX_SWEEP}
+Restart=always
+RestartSec=2
+# A ceiling for what the process may hold *before* it drops, not the set it runs with: SYS_ADMIN
+# to open the group, SETPCAP to narrow its own bounding set, SETUID/SETGID to change identity,
+# and DAC_READ_SEARCH, which is the one capability it keeps. Everything else is gone from the
+# runtime set by capset() inside the binary, and test_watch.sh reads that back out of /proc.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_SETPCAP CAP_SETUID CAP_SETGID
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# The snapshot is the one thing it writes (serve --save rewrites it when the epoch has moved),
+# and it lives under /var/lib/esidx, which ProtectSystem=strict would otherwise make read-only.
+ReadWritePaths=/var/lib/esidx
+
+# Default is loopback. Before widening ESIDX_BIND in /etc/default/esidx, read what the bind
+# address decides: with downloads refused the exposure is "anyone who reaches the port can
+# enumerate every filename under ESIDX_ROOT" -- the index, not the files, but on a shared
+# network that is still the whole directory listing. systemd can hold it to the local network
+# with no firewall at all, and these two lines cost nothing while ESIDX_BIND is 127.0.0.1.
+# They are commented out only because a package must not encode one site's topology: adjust
+# the netmask, uncomment, daemon-reload.
+#IPAddressDeny=any
+#IPAddressAllow=localhost 127.0.0.0/8 192.168.0.0/16
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

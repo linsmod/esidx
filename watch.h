@@ -80,7 +80,37 @@ uint64_t overflow;   /* the kernel queue overflowed; a full pass is the only hon
 esidx_watch_t *esidx_watch_open(const char *sock_path, const char *root,
                                 char *err, size_t errlen);
 
-/* The socket, for the caller's poll set. -1 only before a successful open. */
+/* Embedded mode: one process, no proxy, no client socket.
+ *
+ * `sfa_srv_open()` opens the fanotify group *inside this process*, which needs
+ * CAP_SYS_ADMIN -- so the process must start as root, and the only way that is not a
+ * privilege escalation is to give the privilege back immediately. That is what `drop_to`
+ * ("user" or "user:group") is for, and it is not optional: without it this function fails
+ * rather than staying privileged, because a search server that keeps CAP_SYS_ADMIN is the
+ * case the two-process form exists to avoid (sfa_server.h:18-21 says the same about
+ * embedding, from the other side).
+ *
+ * What survives the drop is exactly CAP_DAC_READ_SEARCH, and that is measured rather than
+ * assumed: sfa resolves an event's directory with open_by_handle_at(), which is gated on
+ * that capability, and on r7000 sfa's own probe with the capability dropped reports
+ * `open_by_handle_at: no (Operation not permitted)` plus its own warning that event paths
+ * cannot be resolved. CAP_SYS_ADMIN is the other way round -- needed to open the group,
+ * needed for nothing afterwards. So the process answers queries as an ordinary user holding
+ * the one capability the event path needs.
+ *
+ * `db` is needed here and not in the socket form: events arrive inside sfa_srv_poll(), so
+ * there is no drain() call for the caller to hand the index to, and the callback reaches it
+ * itself. `sock_path` may be NULL (a per-process default) or "" (sfa's default path);
+ * `group` is the socket's group and exists so the file is not left world-accessible.
+ *
+ * `err` receives a one-line reason on failure. Returns NULL on failure. */
+esidx_watch_t *esidx_watch_open_embed(const char *root, esidx_t *db,
+                                      const char *sock_path, const char *group,
+                                      const char *drop_to, char *err, size_t errlen);
+
+/* The socket, for the caller's poll set -- or, in embedded mode, the fanotify fd. Either
+ * way it is one fd and it is the same "there is an event to read" signal, which is why the
+ * serve loop needs no separate branch for the two forms: -1 only before a successful open. */
 int esidx_watch_fd(const esidx_watch_t *w);
 
 /* Read every message the socket has ready and mark the parent directory of each path.

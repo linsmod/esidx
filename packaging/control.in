@@ -1,0 +1,23 @@
+Package: esidx
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: @ARCH@
+Depends: libc6 (>= 2.34)
+Maintainer: @MAINTAINER@
+Installed-Size: @SIZE@
+Description: ext4 search index engine with an Everything (ETP) server
+ esidx walks a directory tree into a snapshot, answers Everything's search language
+ (ext:, dc:, dm:, size:, parent:, path:, wildcards, boolean and grouping) over the ETP
+ protocol, and reconciles that snapshot from kernel filesystem events so it stays current
+ without a periodic rescan.
+ .
+ The event source is a separate privileged process (sfa-server): it holds CAP_SYS_ADMIN
+ because fanotify does, and hands absolute paths over a group-owned socket to an index
+ server that holds no capabilities at all. The split is enforced by the systemd units this
+ package installs, not by a promise in a comment.
+ .
+ This package installs two systemd units and the configuration they read
+ (/etc/default/esidx). It enables them but does not start them: the index server needs a
+ snapshot, and building the first one scans the tree, which does not belong in a package
+ maintainer script. The install output says the two commands.

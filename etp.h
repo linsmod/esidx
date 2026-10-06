@@ -42,6 +42,17 @@ typedef struct {
      * it blocks the serve loop for as long as it takes to write, and how often that is
      * worth doing is a policy question about I/O, not about staleness. */
     int         save_secs;
+    /* Embedded mode: open the fanotify group in this process instead of subscribing to a
+     * proxy, and give the privilege back immediately (watch.c measures exactly what has to
+     * survive the drop). `watch_sock` is ignored in this mode except as the name of the
+     * socket sfa still creates for other clients; NULL takes a per-process default. */
+    const char *watch_embed;
+    /* "user" or "user:group" to become once the group is open. Required with
+     * watch_embed, and refusing to be absent is the point: see watch.h. */
+    const char *drop_to;
+    /* Group for the socket sfa_srv_open() creates. NULL means none -- which is right for a
+     * socket nobody connects to, and wrong for one something else might. */
+    const char *watch_group;
     /* The sfa socket to subscribe to, or NULL for no watcher. --refresh and --watch are
      * two answers to the same question (what changed) and are independent: either one
      * makes the server self-updating, either one makes a --save timer meaningful, and

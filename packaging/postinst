@@ -1,0 +1,134 @@
+#!/bin/sh
+# postinst -- create the system user the server becomes, the state directory, and enable the
+# unit.
+#
+# It deliberately does not start it. The server refuses to run without a snapshot
+# (main.c:247, "load failed"), and the first snapshot is a full scan of ESIDX_ROOT -- 60s
+# on a workstation's /work, a minute and a half on /usr -- which does not belong in a
+# maintainer script: no tty, dpkg's own timeouts, and a failed install halfway through a
+# scan. So this enables and prints the two commands, because a service that is "running" and
+# cannot answer anything is worse than one that is plainly not started yet.
+
+set -e
+
+DEFAULTCFG=/etc/default/esidx
+VARLIB=/var/lib/esidx
+UNITDIR=/usr/lib/systemd/system
+
+# The user and group are hardcoded rather than read from the config file, and the unit names
+# them literally (see the note in esidx.service): one name, in two places that must agree
+# (this script creates it, the unit's --drop-to= names it), and no second place for an admin
+# to change one of them.
+SYSUSER=esidx
+SYSGROUP=esidx
+
+die() { echo "esidx: $*" >&2; exit 1; }
+
+# Read one KEY=value out of the environment file as data. Sourcing it would be one line and
+# would also run whatever else the admin has put in it, with set -e and root.
+read_kv() {
+    [ -f "$DEFAULTCFG" ] || return 0
+    sed -n "s/^[[:space:]]*$1=\(.*\)$/\1/p" "$DEFAULTCFG" | tail -1
+}
+
+case "$1" in
+    configure)
+        # 0. Retire the two-unit deployment this package used to install (esidx-proxy +
+        #    esidx-index). dpkg removes the unit *files* on upgrade because they are no longer
+        #    shipped, but it does not touch the enable symlinks postinst created, and a
+        #    symlink to a unit that no longer exists is a boot-time warning nobody asked for.
+        #    The former pair is stopped as well: a proxy still running from the old package
+        #    would hold a second fanotify mark on the same tree, which is not an error, just
+        #    an event delivered twice to a server that is now its own proxy.
+        OLD="esidx-proxy.service esidx-index.service"
+        if [ -d /run/systemd/system ]; then
+            systemctl stop $OLD >/dev/null 2>&1 || true
+            systemctl disable $OLD >/dev/null 2>&1 || true
+        fi
+        for u in $OLD; do
+            rm -f "/etc/systemd/system/multi-user.target.wants/$u"
+        done
+
+        # 1. the user and group. The user is what the server becomes once the fanotify group
+        #    is open (--drop-to=), and it owns the snapshot; the group is only its primary
+        #    group now -- there is no socket group to join, because the privileged half is the
+        #    same process (it still creates a socket, for the two-process form's callers, but
+        #    nothing in this package connects to it).
+        if ! getent group "$SYSGROUP" >/dev/null 2>&1; then
+            addgroup --system "$SYSGROUP" >/dev/null 2>&1 \
+                || die "cannot create group $SYSGROUP"
+        fi
+        if ! getent passwd "$SYSUSER" >/dev/null 2>&1; then
+            adduser --system --ingroup "$SYSGROUP" --no-create-home \
+                    --home "$VARLIB" --shell /usr/sbin/nologin \
+                    --gecos "esidx index server" "$SYSUSER" >/dev/null 2>&1 \
+                || die "cannot create user $SYSUSER"
+        fi
+
+        # 2. the state directory. The snapshot is data, not a system file: it is excluded
+        #    from conffiles precisely so that an upgrade never asks about it, because it is
+        #    large, regenerable and nobody edits it.
+        install -d -o "$SYSUSER" -g "$SYSGROUP" -m 0755 "$VARLIB"
+
+        # 3. A unit in /etc/systemd/system overrides the packaged one in /usr/lib. That is
+        #    systemd's design and it is correct for an admin who means it -- but it is also
+        #    the shape in which an install "succeeds" and the packaged unit never runs, and
+        #    the only symptom is a service configured the way it was before. Moving it aside
+        #    with a printed reason beats leaving a file that silently outranks the package.
+        for u in esidx; do
+            if [ -e "/etc/systemd/system/$u.service" ]; then
+                mv -f "/etc/systemd/system/$u.service" \
+                      "/etc/systemd/system/$u.service.removed-by-esidx-package"
+                echo "esidx: /etc/systemd/system/$u.service existed and takes precedence over" >&2
+                echo "       the packaged unit. It has been moved to $u.service.removed-by-esidx-package." >&2
+            fi
+        done
+
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            systemctl enable esidx.service >/dev/null 2>&1 \
+                || echo "esidx: could not enable the unit; enable it by hand." >&2
+            # Cheap, and it turns a unit that cannot parse into an install-time message
+            # instead of a boot-time one. Non-fatal: a warning here must not fail the install.
+            if command -v systemd-analyze >/dev/null 2>&1; then
+                out=$(systemd-analyze verify "$UNITDIR/esidx.service" 2>&1) || true
+                [ -z "$out" ] || echo "$out" | sed 's/^/esidx: /' >&2
+            fi
+        else
+            echo "esidx: systemd is not running here; the unit was installed but not enabled." >&2
+        fi
+
+        # 4. say what is left to do, because "installed" and "answering queries" are not the
+        #    same state and only one of them is true right now.
+        db=$(read_kv ESIDX_DB)
+        root=$(read_kv ESIDX_ROOT)
+        port=$(read_kv ESIDX_PORT)
+        [ -n "$db" ] || db=$VARLIB/root.idx
+        [ -n "$root" ] || root=/
+        [ -n "$port" ] || port=2121
+        [ -d "$root" ] || echo "esidx: warning: ESIDX_ROOT=$root does not exist; the server will not start." >&2
+
+        cat <<EOF
+
+esidx $2 installed. One service is enabled and it is not running yet, because the server
+needs a snapshot and building the first one scans $root:
+
+  1. sudo -u $SYSUSER esidx build $root -o $db
+  2. sudo systemctl start esidx
+
+then an ETP client (Everything) can connect to 127.0.0.1:$port. Configuration is
+$DEFAULTCFG; logs are in the journal:
+
+  journalctl -u esidx -f
+
+EOF
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+    *)
+        echo "postinst called with unknown argument '$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

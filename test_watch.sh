@@ -71,8 +71,9 @@ SOCK="$TMP/sfa.sock"
 # TEST_KEEP=1 leaves the tree, the log and the socket behind, which is the only way to read
 # what the server actually said about a failed assertion.
 cleanup() {
-    [ -n "${SFA_PID:-}" ]  && kill "$SFA_PID"  2>/dev/null
+    [ -n "${SFA_PID:-}" ]   && kill "$SFA_PID"  2>/dev/null
     [ -n "${SERVE_PID:-}" ] && kill "$SERVE_PID" 2>/dev/null
+    [ -n "${EMB_PID:-}" ]   && kill "$EMB_PID"  2>/dev/null
     wait 2>/dev/null
     if [ "${TEST_KEEP:-0}" = 1 ]; then
         printf 'test_watch.sh: kept %s\n' "$TMP"
@@ -400,6 +401,144 @@ if query 'name:theta.txt' | grep -qE '^ROW [0-9]+ [A-Z]+ theta\.txt( |$)'; then
     bad "a change with no watcher is NOT picked up" "theta.txt appeared with the proxy dead"
 else
     ok "a change made with the proxy dead is not claimed to be indexed"
+fi
+
+# ---------------------------------------------------------------- embedded form
+#
+# One process for the whole event path: this server holds the fanotify group itself and
+# gives the privilege back before it opens the listener. Two assertions are here that the
+# socket form cannot express, and each is the reason the other mode is not a substitute:
+#
+#   1. **The drop happened, and kept exactly one capability** -- read from the outside, out
+#      of /proc, rather than from the log line the code prints about itself. The failure
+#      guarded is a drop that silently did less; watch.c's own step 5 asks the same question
+#      from the inside. CAP_DAC_READ_SEARCH is the one that must survive: without it
+#      open_by_handle_at fails and every batch becomes a full sweep (measured on r7000, the
+#      numbers are in watch.c).
+#   2. **The loss signal reaches the in-process callback.** The callback is a second delivery
+#      path for the same events, and the loss signals are where the two can disagree -- an
+#      UNRESOLVED that reached a socket client but not the callback would make this mode the
+#      one that never sweeps, which is silent by construction.
+#
+# Its own tree and its own snapshot, because everything above is about a server whose proxy
+# was killed and whose privilege was never given up.
+EMB="$TMP/emb"; EROOT="$EMB/tree"
+mkdir -p "$EROOT/sub"
+# The dropped process has to be able to read the tree and the snapshot, and `mktemp -d`
+# makes $TMP 0700 root -- the same trap that made a fixture unwritable during the r7000
+# deployment work.
+chmod 0755 "$TMP" "$EMB"
+printf 'one\n' > "$EROOT/a.txt"
+printf 'two\n' > "$EROOT/sub/b.txt"
+EDB="$EMB/tree.idx"
+"$BIN" build "$EROOT" -o "$EDB" >"$EMB/build.log" 2>&1 || {
+    printf 'test_watch.sh: embedded fixture build failed\n'; sed 's/^/  /' "$EMB/build.log"; }
+chmod 0644 "$EDB"
+
+DROP_USER=${ESIDX_DROP_TO:-nobody}
+"$BIN" -v 3 serve "$EDB" -p 0 --bind 127.0.0.1 \
+    --watch-embed="$EROOT" --drop-to="$DROP_USER" \
+    >"$EMB/serve.out" 2>"$EMB/serve.log" &
+EMB_PID=$!
+PORT=""
+for _ in $(seq 1 50); do
+    PORT=$(sed -n 's/.*on 127\.0\.0\.1:\([0-9]*\).*/\1/p' "$EMB/serve.log" 2>/dev/null | head -1)
+    [ -n "$PORT" ] && break
+    sleep 0.1
+done
+if [ -n "$PORT" ]; then
+    ok "the embedded server comes up on 127.0.0.1:$PORT with no proxy at all"
+else
+    bad "the embedded server comes up" "no banner: $(tail -2 "$EMB/serve.log" | tr '\n' ' ')"
+fi
+
+if [ -n "$PORT" ] && [ -r "/proc/$EMB_PID/status" ]; then
+    WANT_UID=$(id -u "$DROP_USER" 2>/dev/null)
+    UID_NOW=$(sed -n 's/^Uid:[[:space:]]*\([0-9]*\).*/\1/p' "/proc/$EMB_PID/status")
+    if [ -z "$WANT_UID" ]; then
+        printf 'test_watch.sh: no user %s on this machine; the drop assertions are skipped\n' \
+            "$DROP_USER"
+    elif [ "$UID_NOW" = "$WANT_UID" ]; then
+        ok "the embedded server runs as $DROP_USER (uid $UID_NOW), not root"
+    else
+        bad "the embedded server gives up its uid" "Uid: $UID_NOW, expected $WANT_UID"
+    fi
+    # CapEff is printed as 16 hex digits, so the expected value is exact: bit 2
+    # (CAP_DAC_READ_SEARCH) and nothing else. Anything wider means the drop did less than
+    # the mode promises; anything narrower means event paths can no longer be resolved.
+    CAP=$(sed -n 's/^CapEff:[[:space:]]*//p' "/proc/$EMB_PID/status")
+    if [ "$CAP" = "0000000000000004" ]; then
+        ok "exactly CAP_DAC_READ_SEARCH is kept (CapEff $CAP)"
+    else
+        bad "the capability set is one capability" \
+            "CapEff: $CAP, expected 0000000000000004 (CAP_DAC_READ_SEARCH)"
+    fi
+    if grep -q 'via the embedded fanotify group' "$EMB/serve.out" "$EMB/serve.log" 2>/dev/null; then
+        ok "the banner names the embedded group instead of a proxy"
+    else
+        bad "the banner names the embedded group" "no 'via the embedded fanotify group' line"
+    fi
+fi
+
+if [ -n "$PORT" ]; then
+    printf 'three\n' > "$EROOT/gamma.txt"
+    N=$(await_name gamma.txt)
+    if [ "$N" != "-1" ]; then
+        ok "a create is visible in embedded mode (after ${N} poll interval(s))"
+    else
+        bad "a create is visible in embedded mode" "name:gamma.txt never appeared"
+    fi
+
+    rm "$EROOT/a.txt"
+    if await_absent a.txt; then
+        ok "a delete is applied in embedded mode"
+    else
+        bad "a delete is applied in embedded mode" "name:a.txt still answered"
+    fi
+
+    mv "$EROOT/sub/b.txt" "$EROOT/sub/b-renamed.txt"
+    N=$(await_name b-renamed.txt)
+    if [ "$N" != "-1" ] && await_absent b.txt; then
+        ok "a rename is applied to both sides in embedded mode (after ${N} poll interval(s))"
+    else
+        bad "a rename is applied in embedded mode" "old row still answered, or the new one never appeared"
+    fi
+
+    # The loss path, which is the one assertion that separates "the callback works" from
+    # "the callback is a second source of truth": a rename the proxy cannot put in one
+    # buffer produces no event at all, so dst.dat can only appear if SFA_EV_UNRESOLVED
+    # reached on_event and the watcher answered it with a sweep.
+    EDEEP="$EROOT/deep"
+    mkdir -p "$EDEEP"
+    ESEG=$(printf 'e%.0s' $(seq 1 60))
+    while [ "${#EDEEP}" -lt 2100 ]; do
+        EDEEP="$EDEEP/$ESEG"
+        mkdir -p "$EDEEP"
+    done
+    printf 'deep\n' > "$EDEEP/src.dat"
+    if await_name src.dat >/dev/null; then
+        ok "a ${#EDEEP}-character path is indexed in embedded mode"
+    else
+        bad "the deep fixture is indexed in embedded mode" "src.dat never appeared"
+    fi
+    mv "$EDEEP/src.dat" "$EDEEP/dst.dat"
+    N=$(await_name dst.dat)
+    if [ "$N" != "-1" ] && await_absent src.dat; then
+        ok "a loss signal reaches the in-process callback (after ${N} poll interval(s))"
+    else
+        bad "the loss signal reaches the in-process callback" \
+            "dst.dat never appeared, or src.dat still answers -- is on_event_mask still SFA_WATCH_MASK?"
+    fi
+    if grep -q 'could not attribute to a path' "$EMB/serve.log"; then
+        ok "the embedded watcher reports the loss"
+    else
+        bad "the embedded watcher reports the loss" "no 'could not attribute to a path' line"
+    fi
+    if grep -qE 'sweep: [0-9]+ director\(ies\) compared, [1-9][0-9]* moved' "$EMB/serve.log"; then
+        ok "the embedded watcher answers the loss with a sweep"
+    else
+        bad "the embedded watcher answers the loss with a sweep" "no sweep line reporting a moved directory"
+    fi
 fi
 
 printf 'test_watch.sh: %d passed, %d failed\n' "$PASS" "$FAIL"

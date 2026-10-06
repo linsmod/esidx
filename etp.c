@@ -1465,10 +1465,29 @@ int etp_serve(const etp_opts_t *opts)
      * pass is the same one the offline update runs, so "the server just started" and "the
      * server is up to date" cannot be different claims. */
     esidx_watch_t *watch = NULL;
-    if (opts->watch_sock) {
+    if (opts->watch_sock || opts->watch_embed) {
         char root[PATH_MAX], err[256];
         path_of(&db, db.root_eid, root, sizeof(root));
-        watch = esidx_watch_open(opts->watch_sock, root, err, sizeof(err));
+        if (opts->watch_embed) {
+            /* The root to mark is stated twice here -- once by the snapshot and once on the
+             * command line -- and they are compared rather than one silently winning. A
+             * watcher on a different tree from the index produces a server that is current
+             * about files it does not have, which reads exactly like "nothing is changing".
+             */
+            size_t rl = strlen(opts->watch_embed);
+            while (rl > 1 && opts->watch_embed[rl - 1] == '/') rl--;
+            if (rl != strlen(root) || strncmp(root, opts->watch_embed, rl) != 0) {
+                fprintf(stderr, "watch: --watch-embed=%s but the snapshot's root is %s\n",
+                        opts->watch_embed, root);
+                esidx_free(&db);
+                return -1;
+            }
+            watch = esidx_watch_open_embed(root, &db, opts->watch_sock,
+                                           opts->watch_group, opts->drop_to,
+                                           err, sizeof(err));
+        } else {
+            watch = esidx_watch_open(opts->watch_sock, root, err, sizeof(err));
+        }
         if (!watch) {
             /* Refusing to start is the point: a --watch that silently does nothing is a
              * server that answers from a frozen index and logs nothing, which is the
@@ -1570,10 +1589,16 @@ int etp_serve(const etp_opts_t *opts)
          * answer to "why am I being sent events outside my index": FAN_MARK_FILESYSTEM
          * covers a whole filesystem and is the fallback where the mount form is rejected.
          */
+        /* "via" names the proxy for the two-process form and the process's own identity for
+         * the embedded one, because in the embedded case the reader of this line will
+         * otherwise go looking for a proxy that does not exist. */
         fprintf(stderr, "esidx: watching %s via %s [%s] -- name changes become visible "
                         "within one batch; size/mtime still follow --refresh/--deep; "
                         "an event the proxy cannot place costs a full pass\n",
-                root, opts->watch_sock, esidx_watch_work_mode_str(watch));
+                root,
+                opts->watch_embed ? "the embedded fanotify group (this process)"
+                                  : opts->watch_sock,
+                esidx_watch_work_mode_str(watch));
     }
     fflush(stderr);
 

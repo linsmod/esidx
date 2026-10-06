@@ -5,6 +5,9 @@
 #   make opt        only the optimised build
 #   make dbg        only the sanitiser build
 #   make install    install the esidx binary to $(BINDIR) (default $(PREFIX)/bin)
+#   make dist       a tarball that builds on the target: both repositories, with the suites
+#   make deb        a Debian package instead: binaries, two systemd units, /etc/default/esidx
+#                   (make deb-verify unpacks it and runs what came out)
 #
 # One `make` builds both flavours, and there is no variable that changes that -- the gate
 # in AGENTS.md 3.1 needs both, and a selector that could point it at one of them is how it
@@ -56,10 +59,15 @@ DBG_OBJS = $(OBJS:.o=.dbg.o)
 # loss signal and no sweep-on-loss, and nothing about it would say so until someone passed
 # `--watch` and read an error -- which is the failure mode this project keeps arguing
 # against (AGENTS.md 6, failures are visible).
-SFA_H   = sfa/sfa.h
-SFA_LIB = sfa/libsfa.c
-OBJS += sfa/libsfa.o
-HDRS += $(SFA_H)
+# Three translation units, not one, since the watcher grew embedded mode: libsfa.c is the
+# client SDK, sfa_server.c is the proxy's library half (sfa_srv_*, issue #10) and sfa_probe.c
+# is what that half calls to negotiate fanotify. All three are built with esidx's flags, for
+# the reason below the object rules.
+SFA_H    = sfa/sfa.h
+SFA_SRCS = sfa/libsfa.c sfa/sfa_server.c sfa/sfa_probe.c
+SFA_HDRS = sfa/sfa.h sfa/sfa_server.h sfa/sfa_probe.h
+OBJS += $(SFA_SRCS:.c=.o)
+HDRS += $(SFA_HDRS)
 
 # `all` is etp-probe as well as the server, so one `make` leaves a checkout ready
 # for both suites. It used to be two steps (AGENTS.md 3.1), and the second one was
@@ -112,13 +120,15 @@ esidx-dbg: $(DBG_OBJS)
 %.dbg.o: %.c $(HDRS)
 	$(CC) $(DBG_CFLAGS) -c $< -o $@
 
-# The submodule's one translation unit, built with esidx's flags rather than sfa's Makefile
-# so the sanitiser flavour covers it too -- a leak or a bad read in the SDK is as much this
+# The submodule's translation units, built with esidx's flags rather than sfa's Makefile
+# so the sanitiser flavour covers them too -- a leak or a bad read in the SDK is as much this
 # project's bug as one in its own code, since the SDK is linked into the binary.
-sfa/libsfa.o: $(SFA_LIB) $(SFA_H)
+# -U_GNU_SOURCE cancels the -D in CFLAGS: these files `#define _GNU_SOURCE` themselves, and
+# gcc warns about redefining a glibc builtin macro.
+$(SFA_SRCS:.c=.o): %.o: %.c $(SFA_HDRS)
 	$(CC) $(CFLAGS) -Wno-builtin-macro-redefined -U_GNU_SOURCE -c $< -o $@
 
-sfa/libsfa.dbg.o: $(SFA_LIB) $(SFA_H)
+$(SFA_SRCS:.c=.dbg.o): %.dbg.o: %.c $(SFA_HDRS)
 	$(CC) $(DBG_CFLAGS) -Wno-builtin-macro-redefined -U_GNU_SOURCE -c $< -o $@
 
 # The Makefile is a prerequisite of every object, because a change to it is a change to how
@@ -126,7 +136,7 @@ sfa/libsfa.dbg.o: $(SFA_LIB) $(SFA_H)
 # this, `make` leaves a binary that was built by rules that no longer exist, and the only
 # symptom is the suites' mtime guard refusing to measure it ("build did not run or did not
 # finish"), which is true and much less obvious than a rebuild.
-$(OBJS) $(DBG_OBJS) sfa/libsfa.o sfa/libsfa.dbg.o: Makefile
+$(OBJS) $(DBG_OBJS): Makefile
 
 # The gate, in the order AGENTS.md 3.1 asks for: the index suite before the protocol one,
 # so a parse regression is not read as a protocol fault, and both builds of each.
@@ -288,8 +298,189 @@ dist-verify: dist
 	@rm -rf "$(STAGE)" /tmp/.dv-want /tmp/.dv-have /tmp/.dv-modes /tmp/.dv-watch.log /tmp/.dv-watch.rc
 	@echo "dist-verify: faithful to both commits, builds on its own, watcher suite passes"
 
+# ---------------------------------------------------------------- Debian package
+#
+# A .deb is the *other* deployment story, and the tarball above is the first: `dist` ships
+# sources and builds on the target, a .deb ships binaries and installs them. So this target
+# installs what install.sh installs -- through install.sh's own Makefile targets, not a second
+# file list written out here, because a file list that exists in two places is one that will
+# differ in one of them (AGENTS.md 6, one decision per place).
+#
+# What the package adds over the tarball is the part a tarball cannot carry: systemd units and
+# a maintainer script. The units exist in the repository now, and they are the two that were
+# measured on r7000, minus the things that were only true of that machine (/home/wahaha, log
+# files, default.target, one site's IP allow-list) and plus the things a package needs (a
+# system user, a configuration file the unit reads, journald).
+#
+# What it deliberately does not do is start the services. See packaging/postinst: the index
+# server refuses to run without a snapshot and building the first one is a full scan, which
+# does not belong in a maintainer script.
+
+DEB_NAME  := esidx
+DEB_ARCH  := $(shell dpkg --print-architecture 2>/dev/null || echo unknown)
+# dpkg's version field must begin with a digit and carry no whitespace. `git describe` falls
+# back to the abbreviated hash when a repository has no tags, and a hash's first character is
+# a letter about one time in sixteen -- so this is sanitised here rather than discovered from
+# dpkg-deb's error, which arrives after everything else has been built.
+DEB_VER_SAN := $(shell printf '%s' '$(VERSION)' | tr -c 'A-Za-z0-9.+~-' '-')
+DEB_VER_FST := $(shell printf '%s' '$(DEB_VER_SAN)' | cut -c1)
+DEB_VERSION := $(if $(filter 0 1 2 3 4 5 6 7 8 9,$(DEB_VER_FST)),$(DEB_VER_SAN),0+$(DEB_VER_SAN))
+DEB        := $(DISTDIR)/$(DEB_NAME)_$(DEB_VERSION)_$(DEB_ARCH).deb
+DEBSTAGE   := /tmp/.esidx-deb-$(DEB_VERSION)
+# The maintainer is whoever configured the repository, because that is the only name there
+# is; a checkout with no git identity gets a placeholder rather than a failing target.
+DEB_MNAME  := $(shell $(GIT) config user.name 2>/dev/null || echo esidx)
+DEB_MEMAIL := $(shell $(GIT) config user.email 2>/dev/null || echo root@localhost)
+
+deb: require-sfa
+	@command -v dpkg-deb >/dev/null 2>&1 || { \
+	    echo "esidx: dpkg-deb not found -- a Debian package cannot be built without it." >&2; \
+	    echo "       (this is a build-host tool; the target only needs dpkg to install)" >&2; \
+	    exit 1; }
+	@mkdir -p "$(DISTDIR)"
+	@echo "== build (make opt: the same binary install.sh installs, not both flavours)"
+	@$(MAKE) opt
+	@echo "== stage into a Debian layout under $(DEBSTAGE)"
+	@rm -rf "$(DEBSTAGE)"
+	@mkdir -p "$(DEBSTAGE)/DEBIAN" "$(DEBSTAGE)/usr/bin" "$(DEBSTAGE)/usr/lib/systemd/system" \
+	          "$(DEBSTAGE)/etc/default" "$(DEBSTAGE)/usr/share/doc/esidx"
+	@$(MAKE) install PREFIX=/usr DESTDIR="$(DEBSTAGE)"
+	@# sfa's install-bin, not its install: this is a runtime package, and dev headers and a
+	@# static SDK archive belong to a -dev package that nothing here needs.
+	@$(MAKE) -C sfa install-bin PREFIX=/usr DESTDIR="$(DEBSTAGE)"
+	@install -m 0644 packaging/systemd/esidx.service \
+	    "$(DEBSTAGE)/usr/lib/systemd/system/esidx.service"
+	@install -m 0644 packaging/esidx.default "$(DEBSTAGE)/etc/default/esidx"
+	@install -m 0644 README.md "$(DEBSTAGE)/usr/share/doc/esidx/README.md"
+	@install -m 0644 docs/design.md "$(DEBSTAGE)/usr/share/doc/esidx/design.md"
+	@install -m 0644 docs/everything-syntax.md \
+	    "$(DEBSTAGE)/usr/share/doc/esidx/everything-syntax.md"
+	@echo "== control metadata"
+	@# Depends is one libc line, written out, rather than ${shlibs:Depends}: the build is
+	@# C11 plus libc by decision D5, so there is no shared object to load and no library to
+	@# name, and ${shlibs:Depends} would answer it by asking dpkg-shlibdeps -- which wants a
+	@# debian/rules and a build-dependency closure, a lot of machinery to derive this. The
+	@# comment that used to sit here explaining that was itself the first bug in this
+	@# target: a DEBIAN/control file is RFC822 and has no comment syntax, so dpkg-deb
+	@# rejected it with "field name '#' must be followed by colon". Hence this comment.
+	@size=$$(du -ks --exclude=DEBIAN "$(DEBSTAGE)" | cut -f1); \
+	 sed -e 's|@VERSION@|$(DEB_VERSION)|' -e 's|@ARCH@|$(DEB_ARCH)|' \
+	     -e 's|@SIZE@|'"$$size"'|' -e '/^Maintainer: @MAINTAINER@$$/d' \
+	     packaging/control.in > "$(DEBSTAGE)/DEBIAN/control"; \
+	 printf 'Maintainer: %s <%s>\n' "$(DEB_MNAME)" "$(DEB_MEMAIL)" \
+	     >> "$(DEBSTAGE)/DEBIAN/control"
+	@printf '%s\n' '/etc/default/esidx' > "$(DEBSTAGE)/DEBIAN/conffiles"
+	@# dpkg-deb only *warns* about a control file with no Maintainer, and then builds the
+	@# package anyway -- which is how the previous version of this target shipped a control
+	@# file whose Maintainer had been appended onto the last line of the description: the
+	@# template had no final newline and `>>` concatenates. Assert it here instead of
+	@# trusting the warning, and assert the thing that warning was about.
+	@grep -q '^Maintainer: .* <.*>$$' "$(DEBSTAGE)/DEBIAN/control" || { \
+	    echo "esidx: no Maintainer line in the generated control file -- refusing to build." >&2; \
+	    exit 1; }
+	@# Maintainer scripts go in with their CRs stripped. A CRLF in postinst is not a style
+	@# question: dpkg runs it with /bin/sh, and a stray CR lands in the middle of a command.
+	@# The tree is developed on a filesystem where this happens silently, so it is done here
+	@# rather than trusted (AGENTS.md 6.2).
+	@for s in postinst prerm postrm; do \
+	    sed 's/\r$$//' "packaging/$$s" > "$(DEBSTAGE)/DEBIAN/$$s"; \
+	    chmod 0755 "$(DEBSTAGE)/DEBIAN/$$s"; \
+	done
+	@echo "== build the package (--root-owner-group: dpkg must not record this user's uid)"
+	@dpkg-deb --build --root-owner-group "$(DEBSTAGE)" "$(DEB)" >/dev/null
+	@rm -rf "$(DEBSTAGE)"
+
+# A package that cannot be read is not a package, and the two ways this goes wrong are both
+# invisible in a successful `dpkg-deb --build`: an empty DEBIAN directory, and a binary that
+# was staged from somewhere else. So this unpacks it and *runs what came out* -- builds a
+# snapshot with the packaged server and probes with the packaged proxy -- rather than checking
+# that dpkg-deb exited 0. The units are parsed too, because a unit that does not parse fails
+# at boot, on someone else's machine, with the install long since reported as successful.
+deb-verify: deb
+	@rm -rf /tmp/.esidx-debcheck /tmp/.esidx-debcheck-fixture
+	@mkdir -p /tmp/.esidx-debcheck /tmp/.esidx-debcheck-fixture/sub
+	@printf 'alpha\n' > /tmp/.esidx-debcheck-fixture/alpha.txt
+	@printf 'beta\n'  > /tmp/.esidx-debcheck-fixture/sub/beta.conf
+	@dpkg-deb --extract "$(DEB)" /tmp/.esidx-debcheck
+	@# -x takes the data archive only; the control files come out with -e. Asking for
+	@# DEBIAN/conffiles under -x finds nothing, and reads like a package that declared no
+	@# conffile -- which is a different (and wrong) conclusion.
+	@dpkg-deb --control "$(DEB)" /tmp/.esidx-debcheck/DEBIAN
+	@echo "== contents"
+	@dpkg-deb --contents "$(DEB)" | awk '{print "   " $$NF}' | sort | sed 's|/tmp/.esidx-debcheck||'
+	@# The unit is one file now, and the check that it is *the* unit the package ships is the
+	@# one that would catch a rename nobody propagated: the old pair must not be in the package
+	@# at all, because a leftover proxy unit would start a second watcher beside the embedded
+	@# one and answer from a socket the server no longer reads.
+	@for f in usr/bin/esidx usr/bin/sfa-server \
+	          usr/lib/systemd/system/esidx.service \
+	          etc/default/esidx DEBIAN/conffiles; do \
+	    test -e "/tmp/.esidx-debcheck/$$f" \
+	        || { echo "   MISSING: $$f"; exit 1; }; \
+	done
+	@for f in usr/lib/systemd/system/esidx-proxy.service \
+	          usr/lib/systemd/system/esidx-index.service; do \
+	    test -e "/tmp/.esidx-debcheck/$$f" \
+	        && { echo "   STALE: $$f is still in the package"; exit 1; }; \
+	done; true
+	@test -x /tmp/.esidx-debcheck/usr/bin/esidx \
+	    || { echo "   usr/bin/esidx is not executable"; exit 1; }
+	@grep -q '^/etc/default/esidx$$' /tmp/.esidx-debcheck/DEBIAN/conffiles \
+	    || { echo "   /etc/default/esidx is not a conffile, so an upgrade may overwrite it"; exit 1; }
+	@# Counted with tr rather than grepped for $'\r': make runs recipes with /bin/sh, which on
+	@# Debian is dash, and dash has no ANSI-C quoting -- so `$'\r'` reaches grep as the
+	@# literal characters and the pattern matches the file that has no CR in it at all. The
+	@# first version of this check passed on a clean script and failed on a clean script.
+	@for s in postinst prerm postrm; do \
+	    cr=$$(tr -cd '\r' < "/tmp/.esidx-debcheck/DEBIAN/$$s" | wc -c); \
+	    if [ "$$cr" != 0 ]; then \
+	        echo "   DEBIAN/$$s has CRLF line endings -- dpkg would run it with stray CRs"; \
+	        exit 1; \
+	    fi; \
+	done
+	@echo "== the packaged server builds a snapshot (proves it runs and the SDK is linked in)"
+	@/tmp/.esidx-debcheck/usr/bin/esidx build /tmp/.esidx-debcheck-fixture \
+	    -o /tmp/.esidx-debcheck/t.idx 2>&1 | tail -2 | sed 's/^/   /'
+	@test -s /tmp/.esidx-debcheck/t.idx || { echo "   no snapshot was written"; exit 1; }
+	@echo "== the packaged proxy probes fanotify"
+	@/tmp/.esidx-debcheck/usr/bin/sfa-server --probe / 2>&1 | head -3 | sed 's/^/   /'
+	@echo "== the units name binaries this package actually ships"
+	@# systemd-analyze verify resolves ExecStart against the real filesystem root, and the
+	@# units are being checked outside their install prefix, so it reports every command as
+	@# missing -- and `--root` is not an option for `verify` before systemd 252. So the
+	@# joining is checked here instead, which is the half that can actually be wrong: a unit
+	@# naming /usr/local/bin/esidx while the package installs /usr/bin/esidx is a valid unit
+	@# and a broken deployment, and nothing else in this target would notice.
+	@for u in esidx; do \
+	    unit="/tmp/.esidx-debcheck/usr/lib/systemd/system/$$u.service"; \
+	    cmd=$$(sed -n 's/^ExecStart=//p' "$$unit" | head -1 | awk '{print $$1}'); \
+	    case "$$cmd" in /*) ;; *) echo "   $$u: ExecStart does not start with a path: $$cmd"; \
+	        exit 1 ;; esac; \
+	    if [ ! -x "/tmp/.esidx-debcheck$$cmd" ]; then \
+	        echo "   $$u: ExecStart runs $$cmd, which this package does not install" >&2; \
+	        exit 1; \
+	    fi; \
+	    echo "   $$u -> $$cmd"; \
+	done
+	@echo "== the unit parse"
+	@# Anything systemd complains about beyond the missing-command lines is a real defect,
+	@# so those are the only lines filtered out. An unrelated unit on the host (snapd) is not
+	@# this package's business and is left out of the judgement entirely.
+	@if command -v systemd-analyze >/dev/null 2>&1; then \
+	    out=$$(systemd-analyze verify \
+	            /tmp/.esidx-debcheck/usr/lib/systemd/system/esidx.service 2>&1 || true); \
+	    bad=$$(printf '%s\n' "$$out" | grep 'esidx' | grep -v 'is not executable' || true); \
+	    if [ -n "$$bad" ]; then \
+	        printf '%s\n' "$$bad" | sed 's/^/   /'; \
+	        echo "   the packaged unit produced diagnostics -- see above"; exit 1; \
+	    fi; \
+	    echo "   the unit parses"; \
+	else echo "   (systemd-analyze not present; skipped)"; fi
+	@rm -rf /tmp/.esidx-debcheck /tmp/.esidx-debcheck-fixture
+	@echo "deb-verify: readable, runs, snapshot builds, proxy probes, the unit parses"
+
 distclean: clean
-	rm -rf $(DISTDIR) /tmp/.esidx-stage-esidx-* /tmp/.dv-*
+	rm -rf $(DISTDIR) /tmp/.esidx-stage-esidx-* /tmp/.esidx-deb-* /tmp/.esidx-debcheck* /tmp/.dv-*
 
 # `make DEBUG=1` means nothing here and is gone on purpose; `make opt`, `make dbg` and
 # `make check` are the spellings.
@@ -297,4 +488,4 @@ distclean: clean
 clean:
 	rm -f $(OBJS) $(DBG_OBJS) esidx esidx-dbg etp-probe etp-probe-dbg order-ref order-ref-dbg
 
-.PHONY: require-sfa all opt dbg sfa-proxy check test test-etp test-all install uninstall clean dist dist-verify distclean
+.PHONY: require-sfa all opt dbg sfa-proxy check test test-etp test-all install uninstall clean dist dist-verify deb deb-verify distclean

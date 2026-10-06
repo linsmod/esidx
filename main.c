@@ -36,8 +36,9 @@ static void usage(void)
         "  esidx [-v N] query <dbfile> [expr ...] [--no-index[=LIST]]\n"
         "  esidx [-v N] serve <dbfile> [-p port] [--bind addr]\n"
         "                             [-u user [-w pass]] [--no-download] [--once]\n"
-        "                             [--refresh=SECS] [--save=SECS] [--watch[=SOCK]]\n"
-        "                             [--sweep=SECS]\n"
+"                             [--refresh=SECS] [--save=SECS] [--watch[=SOCK]]\n"
+"                             [--watch-embed=ROOT --drop-to=USER[:GROUP]]\n"
+"                             [--sweep=SECS]\n"
         "                             [--no-index[=LIST]]\n"
         "  esidx options <dbfile> [--no-index[=LIST]]\n"
         "\n"
@@ -60,10 +61,22 @@ static void usage(void)
         "        kernel filesystem events into absolute paths over a unix socket, and\n"
         "        marks the directory each change happened in. Name changes become visible\n"
         "        within one event batch instead of one --refresh interval; size and mtime\n"
-        "        are unchanged, because listing a directory cannot see them. SOCK defaults\n"
-        "        to /run/sfa.sock. esidx itself needs no privilege -- the proxy does, which\n"
-        "        is why it is not part of this binary.\n"
-        "\n"
+"        are unchanged, because listing a directory cannot see them. SOCK defaults\n"
+         "        to /run/sfa.sock. esidx itself needs no privilege -- the proxy does, which\n"
+         "        is why it is not part of this binary.\n"
+         "\n"
+         "serve --watch-embed=ROOT --drop-to=USER[:GROUP] is the single-process form: this\n"
+         "        process opens the fanotify group itself instead of subscribing to a proxy,\n"
+         "        which removes the second daemon and the socket between them. fanotify needs\n"
+         "        CAP_SYS_ADMIN, so the process starts as root and gives the privilege back at\n"
+         "        once the group is open; --drop-to is not optional and ROOT must be the\n"
+         "        snapshot's own root. What survives the drop is CAP_DAC_READ_SEARCH and\n"
+         "        nothing else -- sfa resolves an event's directory with open_by_handle_at(),\n"
+         "        which needs exactly that capability, so a process that dropped it would see\n"
+         "        every event as unattributable and ask for a full pass after every batch. Use\n"
+         "        this when one unit is worth more than an index process that holds no\n"
+         "        capability at all; keep --watch where that separation is the point.\n"
+         "\n"
         "        --sweep=SECS compares the mtime of EVERY indexed directory rather than\n"
         "        the ones a walk reaches, which is the only thing that finds a change below\n"
         "        a directory whose ancestors never moved. It costs one stat per directory\n"
@@ -510,6 +523,32 @@ static int cmd_serve(int argc, char **argv)
             o.watch_sock = a[7] == '=' ? a + 8 : "";
             continue;
         }
+        /* Embedded mode is a separate flag rather than another --watch value, so that the
+         * two forms cannot be confused for one another at the call site: --watch=SOMETHING
+         * is always a socket to connect to, and only --watch-embed means "this process
+         * holds the fanotify group". */
+        if (!strncmp(a, "--watch-embed=", 14)) {
+            if (!a[14]) { fprintf(stderr, "serve: --watch-embed needs the tree to mark\n"); return 1; }
+            o.watch_embed = a + 14;
+            continue;
+        }
+        if (!strcmp(a, "--watch-embed")) {
+            fprintf(stderr, "serve: --watch-embed needs the tree to mark, "
+                            "e.g. --watch-embed=/work\n");
+            return 1;
+        }
+        if (!strncmp(a, "--drop-to=", 10)) {
+            o.drop_to = a + 10;
+            continue;
+        }
+        if (!strcmp(a, "--drop-to")) {
+            fprintf(stderr, "serve: --drop-to needs a user, e.g. --drop-to=esidx\n");
+            return 1;
+        }
+        if (!strncmp(a, "--watch-group=", 14)) {
+            o.watch_group = a + 14;
+            continue;
+        }
         if (!strncmp(a, "--sweep=", 8)) {
             int v = secs_arg(a, "--sweep");
             if (v < 0) return 1;
@@ -532,7 +571,27 @@ static int cmd_serve(int argc, char **argv)
                 "                    [--sweep=SECS]\n");
         return 1;
     }
-    if (o.save_secs > 0 && o.refresh_secs == 0 && !o.watch_sock && !o.sweep_secs) {
+    /* Checked here rather than in watch.c, because both of these are spelling mistakes a
+     * reader makes long before a service is deployed: --drop-to with the two-process form
+     * says nothing, and --watch-embed without --drop-to would start a root process and
+     * discover the omission at the point where the only fix is to stop. */
+    if (o.drop_to && !o.watch_embed) {
+        fprintf(stderr, "serve: --drop-to only means something with --watch-embed; without it "
+                        "this process never gains privilege to give back\n");
+        return 1;
+    }
+    if (o.watch_embed && !o.drop_to) {
+        fprintf(stderr, "serve: --watch-embed without --drop-to would leave this process "
+                        "running as root with CAP_SYS_ADMIN. Name the user to become, e.g. "
+                        "--drop-to=esidx (see esidx(1))\n");
+        return 1;
+    }
+    if (o.watch_embed && o.watch_sock) {
+        fprintf(stderr, "serve: --watch-embed and --watch=SOCK are two different sources of "
+                        "events; pass one or the other\n");
+        return 1;
+    }
+    if (o.save_secs > 0 && o.refresh_secs == 0 && !o.watch_sock && !o.watch_embed && !o.sweep_secs) {
         /* Refused rather than ignored: with nothing to reconcile, the epoch never moves
          * and every tick would find the snapshot already current. */
         fprintf(stderr, "serve: --save=%d needs --refresh, --watch or --sweep; there is "

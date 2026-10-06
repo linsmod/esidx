@@ -1,0 +1,50 @@
+# Configuration for the unit this package installs (esidx.service).
+#
+# systemd reads this as an environment file, not as shell: one KEY=value per line, no
+# command substitution, no quoting unless a value needs it. A change here needs
+# `systemctl restart esidx` to take effect.
+#
+# One process reads all of it. That is the whole shape now: the server opens the fanotify
+# group itself, gives the privilege back before it opens the listener, and answers ETP from
+# the same process -- so "the privileged half and the unprivileged half were configured into
+# looking at different trees" stopped being a failure this file can cause. The two-process
+# form still exists (run sfa-server separately and pass --watch=SOCK), and then ESIDX_ROOT has
+# to be named in both places; see README, "Deployment".
+
+# The tree to index. It is marked for events and the snapshot covers it, and the two are
+# compared at startup: a --watch-embed that names a tree the snapshot does not have is
+# refused rather than served, because that shape answers questions about files it never
+# indexed and reads exactly like "nothing is changing".
+ESIDX_ROOT=/work
+
+# The snapshot. Nothing builds this for you at install time -- the first one is a full scan,
+# which does not belong in a maintainer script -- so it is usually absent until you run:
+#     sudo -u esidx esidx build "$ESIDX_ROOT" -o "$ESIDX_DB"
+# The server refuses to start without it: a search service answering from no snapshot would
+# answer from nothing. The snapshot must stay readable (and writable, for --save) by
+# ESIDX_USER, which is why the state directory is owned by it.
+#
+# Keep this path off /tmp. The unit sets PrivateTmp=yes, so its /tmp is a private mount and
+# the host's /tmp is not visible inside it -- put the snapshot there and the unit dies at
+# startup with status=226/NAMESPACE, which is a namespace error and not a hint about /tmp.
+# (That is not hypothetical: it is what happened when the unit was first tested.)
+ESIDX_DB=/var/lib/esidx/root.idx
+
+# ETP over TCP. 127.0.0.1 keeps it to this machine; see the note in esidx.service before
+# widening it -- the index is the whole directory listing.
+ESIDX_PORT=2121
+ESIDX_BIND=127.0.0.1
+
+# The user the server becomes once the fanotify group is open. It starts as root because
+# CAP_SYS_ADMIN is needed to open the group, and it keeps exactly one capability afterwards
+# (CAP_DAC_READ_SEARCH, for turning an event into a path); everything else is dropped, and
+# test_watch.sh asserts both halves of that from outside the process.
+#
+# The user has to exist and has to be able to read ESIDX_ROOT and ESIDX_DB. The package
+# creates it (postinst, as "esidx"); change this only to a user that owns the snapshot.
+ESIDX_USER=esidx
+
+# How often to walk the directory stamps and reconcile anything the events could not carry:
+# a file edited in place moves nothing its parent's mtime can see, and an event the proxy
+# could not resolve is announced rather than described. 3600 is an hour. 0 disables it.
+ESIDX_SWEEP=3600

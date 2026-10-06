@@ -1,0 +1,43 @@
+#!/bin/sh
+# postrm -- tidy up on purge, and reload systemd on the way out either way.
+#
+# The state directory and the user are the package's own, so `dpkg -P` takes them away. That
+# is the semantics of a purge, but it is worth being deliberate about: the snapshot is not
+# recoverable from the package and re-building it is a full scan, so this says so on stdout
+# where the person running the purge will see it. An ordinary `remove` keeps both, which is
+# what someone who is upgrading wants.
+
+set -e
+
+VARLIB=/var/lib/esidx
+SYSUSER=esidx
+SYSGROUP=esidx
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+case "$1" in
+    purge)
+        if [ -f "$VARLIB/root.idx" ]; then
+            cat <<EOF
+esidx: removing $VARLIB, which holds the index snapshot.
+       It is not recoverable from this package: rebuilding it scans the tree again.
+       An ordinary "apt remove esidx" keeps it.
+EOF
+        fi
+        rm -rf "$VARLIB"
+        # Only on purge, and only if nothing else is using them -- a group named esidx that
+        # the admin created for their own purposes is not ours to delete.
+        if getent passwd "$SYSUSER" >/dev/null 2>&1; then
+            deluser --system "$SYSUSER" >/dev/null 2>&1 || true
+        fi
+        if getent group "$SYSGROUP" >/dev/null 2>&1; then
+            delgroup --system --only-if-empty "$SYSGROUP" >/dev/null 2>&1 || true
+        fi
+        ;;
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+esac
+
+exit 0

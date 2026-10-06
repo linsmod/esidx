@@ -1,0 +1,25 @@
+#!/bin/sh
+# prerm -- stop the unit when the package is going away. Not on upgrade: on upgrade dpkg
+# calls this with "upgrade" and the packaged unit is replaced in place, so stopping there
+# would drop a working index for no reason. The postinst of the new version reloads systemd.
+#
+# Every systemctl call is guarded, because this script also runs where there is no systemd
+# (a chroot, a container image, `dpkg -i` from a live image) and a maintainer script that
+# fails there turns "no init" into "the package is broken".
+
+set -e
+
+case "$1" in
+    remove|purge|deconfigure)
+        if [ -d /run/systemd/system ]; then
+            systemctl stop esidx.service >/dev/null 2>&1 || true
+        fi
+        ;;
+    upgrade|failed-upgrade)
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+
+exit 0
