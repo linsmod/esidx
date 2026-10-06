@@ -29,7 +29,13 @@ goes stale while a server runs. Freshness can also be *immediate*:
 `esidx serve --watch` subscribes to `sfa`, a separate small privileged proxy that
 holds the fanotify group and rebroadcasts events as absolute paths, so a name
 change is visible within one event batch instead of one `--refresh` interval — and
-esidx itself needs no privilege, because the proxy is where that lives.
+esidx itself needs no privilege, because the proxy is where that lives. The same
+watcher can run *inside* this server instead (`--watch-embed=ROOT --drop-to=USER`),
+which opens the group itself and gives the privilege back before it answers
+anything; one process, one fd, no socket in between. Both forms deliver the same
+events through the same code, and the choice is about deployment, not semantics:
+the split keeps the privilege in a process that answers nothing, the embedded form
+keeps the tree and the index in one place to operate.
 
 What is still missing is *attribute* immediacy: size and mtime still follow
 `--deep`, because listing a directory cannot see them. And the proxy is not the
@@ -74,6 +80,8 @@ does not say so. `make clean` still works without it — nothing that compiles n
 ```sh
 make dist            # dist/esidx-<version>.tar.gz + .sha256
 make dist-verify     # unpack it elsewhere, check it against both commits, build, run the suite
+make deb             # dist/esidx_<version>_<arch>.deb -- binaries, systemd units, /etc/default
+make deb-verify      # unpack the .deb and run what came out of it
 ```
 
 `make dist` is the whole deployment in one file: esidx's sources, the **sfa submodule's
@@ -90,20 +98,55 @@ sources** (which a gitlink cannot carry — that is the reason the target exists
   tailing its output, which is not a detail — the first version of it printed "passes" over a
   suite that had died with `Permission denied`.
 
+`make deb` is the other deployment story: a package of **binaries** rather than sources, so
+the target needs `dpkg` and not a compiler. It installs what `install.sh` installs by calling
+the same two Makefile install targets — a file list written out a second time in a Makefile
+would be one that eventually differs from the one in `install.sh` — and adds the two things a
+tarball cannot carry:
+
+- the **systemd unit**, which is now in the tree (`packaging/systemd/esidx.service`) rather
+  than written on the machine it runs on. It starts the server as root with
+  `--watch-embed --drop-to`, which is the single-process form: the fanotify group is opened
+  and the privilege is handed back before the listener opens. `User=` is deliberately absent —
+  it would either start the process unprivileged (and it cannot open a marked group) or leave
+  it root for its whole life, which is the two-process answer and not this one. The unit is
+  also where the capability ceiling is stated, narrower than "root", and
+- the **maintainer scripts**, which create the `esidx` system user, its group, and
+  `/var/lib/esidx`, retire the two units an earlier package installed, and enable this one.
+
+It deliberately does not start it: the server refuses to run without a snapshot
+(`main.c:247`), and building the first one is a full scan of `ESIDX_ROOT`, which does not
+belong in a maintainer script. So `postinst` prints the two commands.
+
+Two things the package decides, both in `/etc/default/esidx` rather than in the unit: the
+bind address defaults to `127.0.0.1`, and `RETR` — which returns file *contents* — is refused
+by the unit, so the default is a search service and not an anonymous file server. One process
+reads the whole file, and the tree it marks is compared against the snapshot's root at
+startup, so a tree that was not indexed is refused rather than served.
+
+`make deb-verify` unpacks the package and **runs what came out of it**: the packaged server
+builds a snapshot, the packaged proxy probes fanotify, the unit's `ExecStart` names a binary
+the package actually installs (a unit pointing at `/usr/local/bin` while the package installs
+`/usr/bin` is a valid unit and a broken deployment), and `systemd-analyze` has nothing to say
+about it beyond the missing-command lines it necessarily reports outside the install prefix.
+
 On the target:
 
 ```sh
 tar xzf esidx-<version>.tar.gz && cd esidx-<version>
-./install.sh --start --root /work              # build, install, and run both halves
+./install.sh --start --root /work              # build, install, and run the two-process pair
 ./install.sh --start --root /work --prefix ~/.local    # same, no root for the install
 ./install.sh --stop
 ```
 
-`install.sh` handles the three things that made doing it by hand annoying: the submodule is
-already inside the package, the proxy's socket is chgrp'ed to a group you name (`--group`,
-default: your own) so the *unprivileged* index server can connect to the *privileged* proxy,
-and it refuses to continue rather than half-installing. Without `--start` it installs and
-prints the three commands. Logs land in `--logdir` (default `/tmp/esidx-logs`).
+`install.sh` builds from sources and is still the **two-process** deployment: the proxy runs
+as root, the index server as your user, and the socket between them is chgrp'ed to a group you
+name (`--group`, default: your own). The package above ships the one-process form instead;
+`esidx serve --watch-embed` is the same code path either way, and `--watch=SOCK` stays
+available for anyone who wants the split. `install.sh` handles the three things that made
+doing it by hand annoying: the submodule is already inside the package, the socket's group is
+arranged for you, and it refuses to continue rather than half-installing. Without `--start` it
+installs and prints the commands. Logs land in `--logdir` (default `/tmp/esidx-logs`).
 
 One `make` leaves the tree ready for everything, and it always builds both
 flavours: the gate needs both, and a selector that could point it at one of them
@@ -212,6 +255,12 @@ sudo ./sfa/sfa-server /                       # the privileged half, once
 #   esidx: watching /etc via /run/sfa.sock -- name changes become visible within one
 #          batch; size/mtime still follow --refresh/--deep; an event the proxy cannot
 #          place costs a full pass
+
+# ...or with no proxy at all: this process opens the fanotify group and becomes esidx
+sudo ./esidx serve /etc.idx -p 2121 --watch-embed=/etc --drop-to=esidx --sweep=3600
+#   watch: dropped to esidx (uid 998 gid 998); kept CAP_DAC_READ_SEARCH for event path
+#          resolution, dropped the rest
+#   esidx: watching /etc via the embedded fanotify group (this process) [(embedded)]
 ```
 
 `update` is the same walk in two modes. Without `--deep` it stats one directory
