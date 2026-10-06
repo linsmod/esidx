@@ -12,12 +12,18 @@ Description: ext4 search index engine with an Everything (ETP) server
  protocol, and reconciles that snapshot from kernel filesystem events so it stays current
  without a periodic rescan.
  .
- The event source is a separate privileged process (sfa-server): it holds CAP_SYS_ADMIN
- because fanotify does, and hands absolute paths over a group-owned socket to an index
- server that holds no capabilities at all. The split is enforced by the systemd units this
- package installs, not by a promise in a comment.
+ The event source is fanotify, which needs CAP_SYS_ADMIN. In this deployment one process
+ holds it: the unit starts esidx as root, the binary opens the fanotify group, gives the
+ capability back before it opens the listener, and keeps only CAP_DAC_READ_SEARCH -- the
+ one thing that turns an event into a path. What the process is allowed to hold is stated
+ in the unit's CapabilityBoundingSet, so the ceiling is a property of the install rather
+ than a promise in a comment.
  .
- This package installs two systemd units and the configuration they read
- (/etc/default/esidx). It enables them but does not start them: the index server needs a
- snapshot, and building the first one scans the tree, which does not belong in a package
+ The two-process form is still shipped: sfa-server is installed as well, a root proxy that
+ hands absolute paths over a group-owned socket to an unprivileged esidx. Upgrading from a
+ package that ran it retires the two units it used.
+ .
+ This package installs one systemd unit, esidx.service, and the configuration it reads
+ (/etc/default/esidx). It enables the unit but does not start it: the server needs a
+ snapshot, and building the first one scans the tree, which does not belong in a
  maintainer script. The install output says the two commands.

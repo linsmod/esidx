@@ -29,10 +29,16 @@ ESIDX_ROOT=/work
 # (That is not hypothetical: it is what happened when the unit was first tested.)
 ESIDX_DB=/var/lib/esidx/root.idx
 
-# ETP over TCP. 127.0.0.1 keeps it to this machine; see the note in esidx.service before
-# widening it -- the index is the whole directory listing.
+# ETP over TCP. 0.0.0.0 listens on every interface, which is the default because a service whose
+# whole job is to answer searches from other machines cannot only answer on its own; what keeps
+# that safe is IPAddressAllow= in esidx.service (loopback + the private ranges, enforced by the
+# kernel per unit). Set 127.0.0.1 to take it off the network entirely instead.
+#
+# Read that line before widening the allow list: ETP clients here authenticate anonymously, so
+# the address list is the only access control, and anything it admits can enumerate every
+# filename under ESIDX_ROOT.
 ESIDX_PORT=2121
-ESIDX_BIND=127.0.0.1
+ESIDX_BIND=0.0.0.0
 
 # The user the server becomes once the fanotify group is open. It starts as root because
 # CAP_SYS_ADMIN is needed to open the group, and it keeps exactly one capability afterwards

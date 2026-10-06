@@ -40,15 +40,19 @@ PrivateTmp=yes
 # and it lives under /var/lib/esidx, which ProtectSystem=strict would otherwise make read-only.
 ReadWritePaths=/var/lib/esidx
 
-# Default is loopback. Before widening ESIDX_BIND in /etc/default/esidx, read what the bind
-# address decides: with downloads refused the exposure is "anyone who reaches the port can
-# enumerate every filename under ESIDX_ROOT" -- the index, not the files, but on a shared
-# network that is still the whole directory listing. systemd can hold it to the local network
-# with no firewall at all, and these two lines cost nothing while ESIDX_BIND is 127.0.0.1.
-# They are commented out only because a package must not encode one site's topology: adjust
-# the netmask, uncomment, daemon-reload.
-#IPAddressDeny=any
-#IPAddressAllow=localhost 127.0.0.0/8 192.168.0.0/16
+# ESIDX_BIND decides the exposure, and what it decides is not small: with downloads refused it
+# is still "anyone who reaches the port can enumerate every filename under ESIDX_ROOT" -- the
+# index rather than the files, but on a shared network that is the whole directory listing. The
+# packaged default is 0.0.0.0, because a search service that only answers on its own host is not
+# the deployment anyone wants, and these two lines are what makes that safe without a firewall:
+# deny everything, allow loopback and the private ranges. It is enforced by the kernel per unit
+# (cgroup BPF), not by the bind address, so it holds no matter what ESIDX_BIND says.
+#
+# Narrow the list to one subnet if that is the intent -- and note what the list *is*: the only
+# access control here. ETP clients authenticate anonymously (`anonymous auth, downloads refused`
+# in the journal), so anything the address list admits can enumerate the tree.
+IPAddressDeny=any
+IPAddressAllow=localhost 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
 
 StandardOutput=journal
 StandardError=journal

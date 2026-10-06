@@ -119,10 +119,27 @@ It deliberately does not start it: the server refuses to run without a snapshot
 belong in a maintainer script. So `postinst` prints the two commands.
 
 Two things the package decides, both in `/etc/default/esidx` rather than in the unit: the
-bind address defaults to `127.0.0.1`, and `RETR` — which returns file *contents* — is refused
-by the unit, so the default is a search service and not an anonymous file server. One process
-reads the whole file, and the tree it marks is compared against the snapshot's root at
-startup, so a tree that was not indexed is refused rather than served.
+bind address, and `RETR` — which returns file *contents* — is refused by the unit, so the
+default is a search service and not an anonymous file server. The bind default is `0.0.0.0`,
+because a service whose job is to answer searches from other machines cannot only answer on
+its own host — and that is safe because the access control travels with the unit
+(`IPAddressDeny=any` plus loopback and the private ranges, enforced by the kernel per unit)
+rather than being left to a firewall someone has to remember. ETP clients here authenticate
+anonymously, so that address list is the only control there is; set `ESIDX_BIND=127.0.0.1` to
+take the service off the network instead. One process reads the whole file, and the tree it
+marks comes from the snapshot itself (`--watch-embed`, no argument), so there is no second
+tree to disagree with it.
+
+**Updating** is `dpkg -i` (or `apt install ./esidx_*.deb`) over the installed package. The
+unit and the binaries are replaced, `postinst` notices the service is running and restarts it
+onto the new binary, and the snapshot is kept — an upgrade never rescans the tree, which is
+what makes this the cheap operation rather than the install. The price is the restart itself:
+the index is served from memory, so nothing answers while the snapshot loads (8.8 s for
+`/work`'s 5 476 485 entries, measured on `r7000`). Without that restart an update would
+install cleanly and the old process would keep answering — `Restart=always` is about the
+process exiting, not about the file changing. A local edit to `/etc/default/esidx` is a
+conffile edit, so dpkg asks what to do (non-interactively it keeps yours and leaves a
+`.dpkg-dist` beside it).
 
 `make deb-verify` unpacks the package and **runs what came out of it**: the packaged server
 builds a snapshot, the packaged proxy probes fanotify, the unit's `ExecStart` names a binary

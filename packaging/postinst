@@ -94,6 +94,13 @@ case "$1" in
                 out=$(systemd-analyze verify "$UNITDIR/esidx.service" 2>&1) || true
                 [ -z "$out" ] || echo "$out" | sed 's/^/esidx: /' >&2
             fi
+            # An upgrade replaces the binary *under a running service*, and systemd does not
+            # restart it for that: Restart=always is about the process exiting, not about the
+            # file changing. So without this an update installs cleanly and the old process
+            # keeps answering -- an update that silently did not happen, which is the one
+            # outcome an operator cannot see. try-restart is a no-op when the unit is not
+            # running, which is the first-install case (no snapshot yet).
+            systemctl try-restart esidx.service >/dev/null 2>&1 || true
         else
             echo "esidx: systemd is not running here; the unit was installed but not enabled." >&2
         fi
@@ -103,12 +110,28 @@ case "$1" in
         db=$(read_kv ESIDX_DB)
         root=$(read_kv ESIDX_ROOT)
         port=$(read_kv ESIDX_PORT)
+        bind=$(read_kv ESIDX_BIND)
         [ -n "$db" ] || db=$VARLIB/root.idx
         [ -n "$root" ] || root=/
         [ -n "$port" ] || port=2121
+        [ -n "$bind" ] || bind=127.0.0.1
         [ -d "$root" ] || echo "esidx: warning: ESIDX_ROOT=$root does not exist; the server will not start." >&2
 
-        cat <<EOF
+        if systemctl is-active --quiet esidx.service 2>/dev/null; then
+            # An upgrade over a running deployment: no instructions to give, but the two
+            # things an operator wants confirmed are that it is on the new binary and that
+            # the snapshot survived -- the state directory is not touched by an upgrade.
+            cat <<EOF
+
+esidx $2 installed over a running service. It was restarted onto the new binary and the
+snapshot at $db was kept (an upgrade never rebuilds it). Configuration is $DEFAULTCFG.
+
+  systemctl status esidx
+  journalctl -u esidx -f
+
+EOF
+        else
+            cat <<EOF
 
 esidx $2 installed. One service is enabled and it is not running yet, because the server
 needs a snapshot and building the first one scans $root:
@@ -116,12 +139,13 @@ needs a snapshot and building the first one scans $root:
   1. sudo -u $SYSUSER esidx build $root -o $db
   2. sudo systemctl start esidx
 
-then an ETP client (Everything) can connect to 127.0.0.1:$port. Configuration is
+then an ETP client (Everything) can connect to $bind:$port. Configuration is
 $DEFAULTCFG; logs are in the journal:
 
   journalctl -u esidx -f
 
 EOF
+        fi
         ;;
     abort-upgrade|abort-remove|abort-deconfigure)
         ;;
