@@ -133,17 +133,19 @@ static uint64_t to_filetime(int64_t unix_sec)
     return ((uint64_t)unix_sec + 11644473600ULL) * 10000000ULL;
 }
 
-/* Our paths use '/'; the ETP wire is Windows-flavoured because the client joins
- * `path + "\\" + name`, so emitting '\' keeps a path that
- * makes the round trip byte-identical, and query.c's normalise_path() accepts
- * either separator on the way back in. */
-static void wire_path(const char *in, char *out, size_t outsz)
-{
-    size_t o = 0;
-    for (const char *p = in; *p && o + 2 < outsz; p++)
-        out[o++] = (*p == '/') ? '\\' : *p;
-    out[o] = '\0';
-}
+/* The ETP wire carries paths with POSIX separators. The reference spells them Windows-style
+ * (`C:\Users\x`) because it indexes NTFS and its client joins `path + "\\" + name`; the tree
+ * here is POSIX and this is the server, so `/` is the spelling that matches what was indexed --
+ * a deliberate deviation, recorded in AGENTS.md §5.2.
+ *
+ * What it costs is paid on the way *in* rather than out: a client that joins with '\' composes
+ * `/work\sub`, so `parent:` and `path:` values arrive in either spelling and are normalised
+ * (query.c's normalise_path(), plus backslash_form()'s retry). What it buys is that the path a
+ * client echoes back is the path on disk, which is the one a reader can check.
+ *
+ * Kept as a comment where the conversion used to be, because the reverse -- turning every '/'
+ * into '\' here -- is the first thing a reader who knows the reference will try.
+ */
 
 /* ------------------------------------------------------------- client state */
 
@@ -284,7 +286,7 @@ static void send_query_results(const esidx_t *db, client_t *c, const qset_t *set
     obuf_t b = {0};
     uint32_t off = c->offset;
     uint32_t show = c->count;
-    char path[65536], wpath[65536];
+    char path[65536];
 
     obuf_puts(&b, "200-Query results\r\n");
     obuf_printf(&b, " RESULT_COUNT %zu\r\n", (size_t)set->n);
@@ -296,8 +298,7 @@ static void send_query_results(const esidx_t *db, client_t *c, const qset_t *set
 
         if (c->col_path) {
             parent_path_of(db, id, path, sizeof(path));
-            wire_path(path, wpath, sizeof(wpath));
-            obuf_printf(&b, " PATH %s\r\n", wpath);
+            obuf_printf(&b, " PATH %s\r\n", path);
         }
         if (c->col_attributes)
             obuf_printf(&b, " ATTRIBUTES %u\r\n", esidx_win_attributes(db, id));
@@ -317,8 +318,7 @@ static void send_query_results(const esidx_t *db, client_t *c, const qset_t *set
                        (unsigned long long)to_filetime(db->et.ctime[id]));
         if (c->col_file_list_filename) {
             path_of(db, id, path, sizeof(path));
-            wire_path(path, wpath, sizeof(wpath));
-            obuf_printf(&b, " FILE_LIST_FILENAME %s\r\n", wpath);
+            obuf_printf(&b, " FILE_LIST_FILENAME %s\r\n", path);
         }
         if (c->col_date_recently_changed)
             obuf_printf(&b, " DATE_RECENTLY_CHANGED %llu\r\n",
@@ -1013,9 +1013,10 @@ static void handle_command(const etp_opts_t *o, const esidx_t *db, client_t *c,
 
     /* --- working directory --- */
     if (!strcasecmp(verb, "PWD") || !strcasecmp(verb, "XPWD")) {
-        char w[8192];
-        wire_path(c->cwd, w, sizeof(w));
-        c_reply(c, "257 \"%s\" is the current directory.\r\n", w);
+        /* The cwd is echoed as it is, POSIX like every other path here (AGENTS.md §5.2): an
+         * ordinary FTP client feeds this string back to CWD, and a Windows-spelled answer would
+         * be a directory this server has never heard of. */
+        c_reply(c, "257 \"%s\" is the current directory.\r\n", c->cwd);
         return;
     }
     if (!strcasecmp(verb, "CWD") || !strcasecmp(verb, "CDUP")) {
@@ -1032,12 +1033,10 @@ static void handle_command(const etp_opts_t *o, const esidx_t *db, client_t *c,
          * snprintf does anyway, so say so once rather than let the compiler
          * guess */
         snprintf(c->cwd, sizeof(c->cwd), "%.*s", (int)sizeof(c->cwd) - 1, path);
-        char w[8192];
-        wire_path(c->cwd, w, sizeof(w));
         if (!strcasecmp(verb, "CDUP"))
-            c_reply(c, "250 CDUP successful. \"%s\" is current directory.\r\n", w);
+            c_reply(c, "250 CDUP successful. \"%s\" is current directory.\r\n", c->cwd);
         else
-            c_reply(c, "250 CWD successful. \"%s\" is current directory.\r\n", w);
+            c_reply(c, "250 CWD successful. \"%s\" is current directory.\r\n", c->cwd);
         return;
     }
 

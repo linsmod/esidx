@@ -396,15 +396,15 @@ static void normalise(const char *s, char *out, size_t outsz, unsigned mode)
     out[o] = '\0';
 }
 
-/* Materialise the entry's path with backslash separators -- the spelling the ETP
- * PATH column carries and the only one the client has ever seen -- into the
- * shared scratch buffer. Returns false if it could not be allocated.
+/* Materialise the entry's path with backslash separators into the shared scratch buffer.
+ * Returns false if it could not be allocated.
  *
- * Text leaves retry against this when the POSIX spelling misses, because the
- * client composes its `path:regex:` patterns out of the paths it was handed. A
- * pattern written for `C:\Users\x` cannot match `/home/x`, and the client will
- * keep sending the former. */
-static bool wire_form(const esidx_t *db, eid_t id, scratch_t *sc)
+ * This is no longer how the wire spells a path -- the PATH column is POSIX (etp.c, AGENTS.md
+ * §5.2) -- but it is still how some clients *send* one: the reference's client joins
+ * `path + "\" + name`, so a path handed out as `/work/sub` comes back as `/work\sub`, and a
+ * user typing on Windows spells it with '\' as well. Text leaves retry against this form when
+ * the POSIX one misses, rather than refusing a term that names a file we have. */
+static bool backslash_form(const esidx_t *db, eid_t id, scratch_t *sc)
 {
     if (!sc->buf) { sc->buf = malloc(65536); sc->cap = 65536; }
     if (!sc->buf) return false;
@@ -467,12 +467,13 @@ static int text_match(const esidx_t *db, eid_t id, const ast_t *t,
      * same directory. So the separator is the switch, MOD_PATH is that switch said
      * out loud, and both of them select the same subject.
      *
-     * The wire_form() retry that follows belongs to the same half of the rule. The
-     * client builds its patterns out of the paths it was handed, and the paths it
-     * was handed are the backslash-separated ones the ETP PATH column carries, so
-     * a pattern written for `C:\Users\x` cannot match `/home/x` (round trip
-     * observed, AGENTS.md 5.1). Running that retry for a *name* is what turned
-     * `name:sub1` and a bare `sub1` into "the directory and both things in it". */
+     * The backslash_form() retry that follows belongs to the same half of the rule. A client
+     * that joins `path + "\" + name` builds its patterns out of the paths it was handed, and
+     * it joins with '\' however the wire spelled them -- the PATH column is POSIX now, so what
+     * comes back for `/work/sub` is `/work\sub` -- so a term written for a Windows-shaped path
+     * cannot match `/home/x` and the client will keep sending it. Running that retry for a
+     * *name* is what turned `name:sub1` and a bare `sub1` into "the directory and both things
+     * in it". */
     const int path_scope = (m & MOD_PATH) || strpbrk(pat, "/\\") != NULL;
 
     const char *subj;
@@ -504,7 +505,7 @@ static int text_match(const esidx_t *db, eid_t id, const ast_t *t,
         int hit = re_match(re, subj);
         /* The retry has to happen BEFORE the free -- using `re` afterwards is a
          * use-after-free that -O2 hides. */
-        if (!hit && path_scope) hit = wire_form(db, id, sc) ? re_match(re, sc->buf) : 0;
+        if (!hit && path_scope) hit = backslash_form(db, id, sc) ? re_match(re, sc->buf) : 0;
         re_free(re);
         return hit;
     }
@@ -518,7 +519,7 @@ static int text_match(const esidx_t *db, eid_t id, const ast_t *t,
         normalise(subj, nb, sizeof(nb), nm);
         if (!pb[0]) return 1;                    /* the term reduced to nothing */
         if (strcasestr(nb, pb)) return 1;
-        if (path_scope && wire_form(db, id, sc)) {
+        if (path_scope && backslash_form(db, id, sc)) {
             normalise(sc->buf, nb, sizeof(nb), nm);
             return strcasestr(nb, pb) != NULL;
         }
@@ -633,7 +634,7 @@ static int text_match(const esidx_t *db, eid_t id, const ast_t *t,
 
     if (!*pat) return 1;
     if (strcasestr(subj, pat)) return 1;
-    if (path_scope && wire_form(db, id, sc)) return strcasestr(sc->buf, pat) != NULL;
+    if (path_scope && backslash_form(db, id, sc)) return strcasestr(sc->buf, pat) != NULL;
     return 0;
 }
 

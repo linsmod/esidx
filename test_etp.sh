@@ -121,15 +121,17 @@ printf 'q'                   >"$TREE/gamma/inner/three.txt"
 : >"$TREE/gamma/.dotfile"
 N_TREE=$(find "$TREE" | wc -l)
 TREE_NAME=$(basename "$TREE")
-# the spelling the PATH column must use: the client joins `path + "\" + name`
-TREE_BS=${TREE//\//\\}
+# The PATH column's spelling: POSIX, like the tree and like the index. The reference spells
+# paths Windows-style because it indexes NTFS; this is the server and the tree is POSIX, so the
+# wire is too -- a deliberate deviation, AGENTS.md §5.2. The assertions below are what pins it.
+TREE_WIRE=$TREE
 # The indexed root's own parent. It is a directory that exists but is *not* in the
 # index, so it is what the root row's PATH column has to be -- and its name is a word
 # that occurs in the root's path and in no entry's name, which is what makes the two
 # assertions in 3b able to fail.
 PARENT_DIR=${TREE%/*}
 PARENT_NAME=$(basename "$PARENT_DIR")
-PARENT_BS=${PARENT_DIR//\//\\}
+PARENT_WIRE=$PARENT_DIR
 
 echo "   fixture: $N_TREE entries under $TREE"
 
@@ -359,8 +361,8 @@ expect "  RESULT_COUNT is the total match count" "$(pcount)" "3"
 expect "  three rows returned"                   "$(prows)" "3"
 expect "  name_ascending order -- the wire carries the bare name" \
     "$(pnames)" "b.conf c.conf one.conf "
-echo "     and the client joins it onto PATH itself,"
-echo "     which is why PATH must round-trip through the parent's own spelling"
+echo "     and a client joins it onto PATH itself -- which is why PATH carries the parent's own"
+echo "     spelling, POSIX on this side (AGENTS.md §5.2)"
 
 say "3. column lines precede their row, and are complete (criteria 6, 8)"
 
@@ -381,8 +383,13 @@ else
     bad "  DATE_MODIFIED decodes to a sane year" "got $yr from '$ft'"
 fi
 
-expect "  PATH is the parent directory, backslash-separated" \
-    "$(pfield 0 path)" "$TREE_BS"
+expect "  PATH is the parent directory, POSIX-separated" \
+    "$(pfield 0 path)" "$TREE_WIRE"
+
+# Nothing on the wire is Windows-spelled. This is the assertion that would fail if a conversion
+# like the old wire_path() came back, and it reads the raw lines rather than a decoded field, so
+# it covers every column at once -- PATH, FILE_LIST_FILENAME, and whatever is added next.
+expect "  no backslash in any wire line" "$(grep -c '\\' "$OUT")" "0"
 
 say "3b. the indexed root is a row like any other: basename, and a parent path"
 
@@ -391,7 +398,9 @@ say "3b. the indexed root is a row like any other: basename, and a parent path"
 #   ROW 0    FOLDER C:        path=
 #   ROW 854  FOLDER ShareToPC  path=C:\Users\linswin\AndroidStudioProjects
 #
-# One rule produces both: the name is the last component of the entry's own path and
+# The spelling there is the reference's, and only because it indexes NTFS: our PATH column is
+# POSIX (AGENTS.md §5.2). What is being pinned below is the *rule*, which is the same on both
+# sides -- the name is the last component of the entry's own path and
 # PATH is everything before the last separator in it. Neither shape mentions a root.
 # We stored the root's name as the absolute path it was indexed from -- which
 # path_of() and di_lookup() both need -- and printed that whole path as the name with
@@ -410,7 +419,7 @@ query
 EOF
 expect "  exactly one row, and it is the indexed root" "$(prows)" "1"
 expect "  its name is the basename, not the path"      "$(pnames)" "$TREE_NAME "
-expect "  its PATH is the directory containing it"     "$(pfield 0 path)" "$PARENT_BS"
+expect "  its PATH is the directory containing it"     "$(pfield 0 path)" "$PARENT_WIRE"
 
 etp "a name: term naming the parent matches nothing" "$SRV_PORT" <<EOF
 send USER anonymous

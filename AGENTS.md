@@ -690,7 +690,7 @@ deliberately:
 |---|---|---|
 | spells the extension `SITE EVERYTHING`; others send it bare | trace from the official client | both spellings route to one dispatcher |
 | never opens a data connection | same trace | browsing is `parent:` + `folder:`, so `parent:` must be O(1) |
-| joins `path + "\" + name` | observed round trip: a path we emit comes back mixed-separator | the PATH column uses backslash separators; `normalise_path()` accepts either on the way in |
+| joins `path + "\" + name` | observed round trip: a path we emit comes back mixed-separator | no longer followed for the *outgoing* spelling — the PATH column is POSIX (§5.2); what the client sends on the way back is still joined with `\`, and normalised on the way in |
 | swallows an overflowing SIZE | the sentinel shows no size at all | the unknown-size sentinel is what we want |
 | `RESULT_COUNT` is the total, not the page | observed: a page of 3 out of 8 reported 8 | the executor returns the full sorted set and the protocol layer slices |
 | sends `OPTS UTF8 ON` first, and stops there unless it gets `200` | trace, after a `501` | see below |
@@ -731,7 +731,8 @@ the same place a future reader will look. The two that are left:
 
 | Deviation | Why | Consequence |
 |---|---|---|
-| a top-level index root's PATH column is `/` | the reference's is `C:` — it indexes the drive root, we have no drive | POSIX's spelling of "the directory above `/etc`". A client joining `path + "\" + name` gets `\/etc`, which is the mixed-separator form §5.1 says it round-trips; an empty PATH instead would lose the leading `/` outright. Design §12.12 |
+| the PATH and FILE_LIST_FILENAME columns are POSIX (`/work/sub`), where the reference spells them `C:\Users\x` | the tree is POSIX and this is the server: `\` is a separator this filesystem does not have, and a path handed out should be the path on disk — the one a shell, a log line or a reader can check. The reference's spelling exists because it indexes NTFS | a client that joins `path + "\" + name` composes `/work\sub`, so `parent:` and `path:` values arrive in either spelling: `normalise_path()` accepts both, and `query.c`'s `backslash_form()` retries `path:` terms against the Windows spelling. `test_etp.sh` pins both halves (the PATH column is the POSIX fixture path; no wire line contains a backslash). The observation the old spelling rested on — a path we emit coming back mixed-separator — is the §5.1 row above, and it has no raw trace in the tree |
+| a top-level index root's PATH column is `/` | the reference's is `C:` — it indexes the drive root, we have no drive | POSIX's spelling of "the directory above `/etc`". A client joining `path + "\" + name` gets `//etc`: the separator it inserts is its own, ours is what we sent, and `//` resolves to `/` everywhere — so the leading `/` survives, where an empty PATH would lose it outright. Design §12.12 |
 | a control line longer than 8 KB is refused, with a log line, rather than parsed | ours has one control buffer; the reference reallocs the search per `SEARCH` (`etp_server.c:4025`) and its only limit is its own line reader, which was not measured past 4 950 characters | Everything's search box takes tens of thousands of characters, so a client *can* send more than we take. The reference was asked with 4 950 and answered; we answer the same at 4 950 and refuse beyond 8 KB. Everything above the buffer — the parser's term value, the search itself, the acknowledgement — now holds anything that fits, so the limit is one number, in one place, and it is logged |
 
 ### 5.3 A parse error must yield no results, never everything

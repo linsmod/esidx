@@ -501,10 +501,14 @@ the performance comes from, the last two are where the interoperability risk was
   index-backed one seeds the candidate bitmap, and every other leaf filters *that*
   rather than the table (design §6.2). A browse request therefore costs one
   directory listing, not a table scan. Measured below; the choice is logged.
-- **The PATH column uses backslash separators** even though the index is POSIX.
-  The client joins `path + "\" + name`, so a `/`-separated PATH would come back to
-  us spelled differently and no longer hash to the same directory. Separators are
-  normalised on the way in, which is what makes `parent:` a hit rather than a miss.
+- **The PATH and FILE_LIST_FILENAME columns are POSIX**, like the index and like the
+  tree. The reference spells them `C:\Users\x` because it indexes NTFS, and its client
+  joins `path + "\" + name`; this is the server and the tree is POSIX, so what goes on
+  the wire is the path on disk — the one a shell, a log line or a reader can check.
+  The cost lands on the way *in*: a client that joins with `\` sends `/work\sub` back,
+  so separators are normalised on the way in (which is what makes `parent:` a hit
+  rather than a miss) and a `path:` term spelled the Windows way still matches.
+  AGENTS.md §5.2 records the deviation; `test_etp.sh` pins both halves of it.
 - **A directory's SIZE is the sentinel `18446744073709551615`**, not the real
   4096. Everything does not index folder sizes by default; a client parses that
   into a signed 64-bit field, overflows, swallows the exception, and shows

@@ -1978,11 +1978,12 @@ the depth-1 case kept beside it as the control that has to keep working.
 9. **Two text-matching bugs, both pre-existing and both found while writing the
    incremental tests** — both fixed now, and both pinned against the reference
    rather than against our reading of the code:
-   - `text_match()` retried every plain substring against the *backslash* path
-     form (`wire_form()`), so `name:nm` matched every row under `/tmp/nm`: a term
+   - `text_match()` retried every plain substring against the *Windows* path form
+     (`backslash_form()`), so `name:nm` matched every row under `/tmp/nm`: a term
      that names a file also matched every file below a directory of that name. The
-     retry is right for `path:` (the client does send backslashes) and wrong for
-     `name:`. It is now scoped to the terms that read a path, which is what
+     retry is right for `path:` (clients do send backslashes — the reference's client
+     joins `path + "\" + name`, and spelling the PATH column POSIX does not change
+     what it sends back) and wrong for `name:`. It is now scoped to the terms that
      Everything does — measured on one directory against voidtools' own server on
      :21: `esidx` answers 3 there, the three entries *named* esidx, where reading
      the path as well would answer 280.
