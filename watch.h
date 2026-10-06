@@ -31,12 +31,14 @@
  * subscription is not optional: the proxy filters the signal on the subscriber's mask like
  * any other event, so a client that leaves those bits out is never told what it missed.
  *
- * The answer to a loss signal is a mark of the root, and that answer is narrower than the
- * signal deserves: a root mark is a pass that descends into a directory only when that
- * directory's stamp moved, so it reaches a change whose ancestors' stamps moved and does not
- * reach one buried under unchanged directories -- the same limit the offline names pass has
- * (test.sh, "changes below an unchanged directory"), and the reason a periodic pass is still
- * worth having. Widening it is the sweep pass, which does not exist yet.
+ * The answer to a loss signal is a sweep -- esidx_sweep_dirs(), which compares every
+ * directory's stamp instead of only the ones a walk reaches. That is what it takes,
+ * because the obvious alternative is narrower than the signal: a mark of the root is a
+ * pass that descends into a directory only when that directory's stamp moved, so it
+ * repairs a bulk change (every directory on the way to it moved) and not a change buried
+ * under directories that never did. The watcher asks for the sweep with
+ * esidx_watch_wants_sweep() and the serve loop runs it in its apply step, because it is
+ * the expensive half and belongs beside the reconcile it feeds.
  *
  * Attribute freshness remains a --refresh/--deep question, unchanged by any of this.
  */
@@ -92,6 +94,18 @@ int esidx_watch_fd(const esidx_watch_t *w);
  * the difference between an index that is current and one that has quietly stopped being
  * current is exactly this return value (esidx_watch_drain peeks to tell them apart). */
 int esidx_watch_drain(esidx_watch_t *w, esidx_t *db);
+
+/* Has the proxy told us it lost events since the last time this was cleared? A loss is the
+ * one thing an event cannot describe, so the answer to it cannot be an event: the dirty set
+ * has to be rebuilt from the filesystem, which is esidx_sweep_dirs(). Kept as a flag
+ * rather than acted on here because the sweep costs one stat per directory (measured on
+ * r7000: 94 ms for /usr's 34 811, 1941 ms for /work's 651 894) and belongs in the serve
+ * loop's apply step with the other expensive thing, not inside a poll turn. */
+int esidx_watch_wants_sweep(const esidx_watch_t *w);
+
+/* Clear it. Called by whoever runs the sweep, so a sweep that fails to start is not
+ * mistaken for one that has already happened. */
+void esidx_watch_clear_sweep(esidx_watch_t *w);
 
 const watch_stats_t *esidx_watch_stats(const esidx_watch_t *w);
 

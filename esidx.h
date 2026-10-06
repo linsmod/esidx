@@ -439,6 +439,17 @@ typedef struct {
     uint64_t us;
 } update_stats_t;
 
+/* What one sweep did. Separate from update_stats_t because a sweep is not a pass: it
+ * reconciles nothing, it only decides which directories a pass should look at, and the
+ * numbers that matter for it are the ones a pass cannot report -- how much was compared,
+ * and how much of it moved. */
+typedef struct {
+    uint32_t dirs_examined;  /* live directories whose stamp was actually compared */
+    uint32_t dirs_marked;    /* of those, whose stamp differed: handed to the dirty set */
+    uint32_t stat_fail;      /* could not be stat'ed, or raced a tombstone */
+    uint64_t us;
+} sweep_stats_t;
+
 typedef struct {
     strpool_t     names;
     /* The intern table for `names`: open addressing on the name, slot value = pool
@@ -614,7 +625,18 @@ int  esidx_scan(esidx_t *db, const char *root);
  * unrelated ids. The offline `esidx update` still compacts, so the id space is
  * reclaimed on the next cron pass rather than never. */
 #define EU_NOCOMPACT 0x2u
+/* Compare every directory's stamp before walking, instead of only the ones the walk
+ * reaches -- the reach of the stamp-pruned pass is depth 1 for an isolated change
+ * (design §7 "Sweep", §12 risk 8). Costs one stat per directory, so it is a flag rather
+ * than the default: measured warm on r7000, 94 ms for /usr's 34 811 directories and
+ * 1941 ms for /work's 651 894, against 0.4-1.1 ms for the pruned pass it sits next to. */
+#define EU_SWEEP 0x4u
 int  esidx_update(esidx_t *db, const char *root, unsigned flags, update_stats_t *st);
+/* Mark every directory whose stored stamp differs from the filesystem's, and nothing
+ * else. Fills the dirty set for esidx_refresh_dirs(); on its own it changes no row, which
+ * is why every caller pairs it with one. Cost is one path-based stat per live directory
+ * and no getdents, so a subtree nobody touched is a stat and nothing more. */
+int  esidx_sweep_dirs(esidx_t *db, sweep_stats_t *st);
 /* Mark one indexed directory as needing a reconcile. Returns 0, or -1 if the id is not a
  * live directory. Appends, and does not de-duplicate: a mark is cheap because a watcher may
  * make thousands between two applies, and the apply sorts and uniques once.

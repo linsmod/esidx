@@ -48,6 +48,13 @@ typedef struct {
      * either one makes the startup repair pass necessary, because a change between the
      * snapshot on disk and the subscription is invisible to the subscription. */
     const char *watch_sock;
+    /* Seconds between sweeps, or 0 for none. A sweep compares every directory's stamp
+     * rather than the ones a walk reaches, which is the only thing that finds a change
+     * below a directory whose ancestors never moved (design §7 "Sweep"); it costs one stat
+     * per directory, so it is a separate coarse knob from --refresh rather than part of
+     * it. Independent of --watch: a deployment with no proxy can still close this hole, and
+     * one with a proxy may still want the belt to the braces. */
+    int         sweep_secs;
     /* Which derived indexes to leave unbuilt, already resolved by main.c: serve owns
      * its own esidx_t, so the flag cannot be re-read here without a second place that
      * decides. `no_index` is only read when `have_no_index` is set. */

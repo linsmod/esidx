@@ -37,6 +37,7 @@ static void usage(void)
         "  esidx [-v N] serve <dbfile> [-p port] [--bind addr]\n"
         "                             [-u user [-w pass]] [--no-download] [--once]\n"
         "                             [--refresh=SECS] [--save=SECS] [--watch[=SOCK]]\n"
+        "                             [--sweep=SECS]\n"
         "                             [--no-index[=LIST]]\n"
         "  esidx options <dbfile> [--no-index[=LIST]]\n"
         "\n"
@@ -62,6 +63,14 @@ static void usage(void)
         "        are unchanged, because listing a directory cannot see them. SOCK defaults\n"
         "        to /run/sfa.sock. esidx itself needs no privilege -- the proxy does, which\n"
         "        is why it is not part of this binary.\n"
+        "\n"
+        "        --sweep=SECS compares the mtime of EVERY indexed directory rather than\n"
+        "        the ones a walk reaches, which is the only thing that finds a change below\n"
+        "        a directory whose ancestors never moved. It costs one stat per directory\n"
+        "        (94 ms for /usr's 34 811, 1.9 s for /work's 651 894, measured warm on\n"
+        "        r7000), so it is a separate coarse knob: it also runs once at startup,\n"
+        "        where it is what makes 'the server is up to date' true, and whenever the\n"
+        "        event proxy reports that it lost events.\n"
         "\n"
         "derived indexes (design D4: none of them are in the snapshot, so this is a\n"
         "choice about this process and the same file serves both settings):\n"
@@ -202,6 +211,7 @@ static int cmd_update(int argc, char **argv)
     for (int i = 0; i < argc; i++) {
         const char *a = argv[i];
         if (!strcmp(a, "--deep")) { flags |= EU_DEEP; continue; }
+        if (!strcmp(a, "--sweep")) { flags |= EU_SWEEP; continue; }
         if (!strcmp(a, "--dir") && i + 1 < argc) {
             if (ndirs == (int)(sizeof(dirs) / sizeof(dirs[0]))) {
                 fprintf(stderr, "update: too many --dir arguments (max %d)\n", ndirs);
@@ -217,7 +227,8 @@ static int cmd_update(int argc, char **argv)
         return 1;
     }
     if (!dbfile) {
-        fprintf(stderr, "usage: esidx update <dbfile> [root] [--deep] [--dir PATH]...\n");
+        fprintf(stderr, "usage: esidx update <dbfile> [root] [--deep] [--sweep] "
+                        "[--dir PATH]...\n");
         return 1;
     }
     if (ndirs && root) {
@@ -499,6 +510,12 @@ static int cmd_serve(int argc, char **argv)
             o.watch_sock = a[7] == '=' ? a + 8 : "";
             continue;
         }
+        if (!strncmp(a, "--sweep=", 8)) {
+            int v = secs_arg(a, "--sweep");
+            if (v < 0) return 1;
+            o.sweep_secs = v;
+            continue;
+        }
         if (a[0] == '-') {
             fprintf(stderr, "serve: unknown option %s\n", a);
             return 1;
@@ -511,14 +528,15 @@ static int cmd_serve(int argc, char **argv)
         fprintf(stderr,
                 "usage: esidx serve <snapshot> [-p port] [--bind addr]\n"
                 "                    [-u user [-w pass]] [--no-download] [--once]\n"
-                "                    [--refresh=SECS] [--save=SECS] [--watch[=SOCK]]\n");
+                "                    [--refresh=SECS] [--save=SECS] [--watch[=SOCK]]\n"
+                "                    [--sweep=SECS]\n");
         return 1;
     }
-    if (o.save_secs > 0 && o.refresh_secs == 0 && !o.watch_sock) {
+    if (o.save_secs > 0 && o.refresh_secs == 0 && !o.watch_sock && !o.sweep_secs) {
         /* Refused rather than ignored: with nothing to reconcile, the epoch never moves
          * and every tick would find the snapshot already current. */
-        fprintf(stderr, "serve: --save=%d needs --refresh or --watch; there is nothing "
-                        "to save\n", o.save_secs);
+        fprintf(stderr, "serve: --save=%d needs --refresh, --watch or --sweep; there is "
+                        "nothing to save\n", o.save_secs);
         return 1;
     }
     o.dbfile = dbfile;

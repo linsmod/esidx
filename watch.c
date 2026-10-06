@@ -51,6 +51,7 @@ struct esidx_watch {
     size_t      rootlen;
     watch_stats_t st;
     int         gone;        /* the proxy closed the connection */
+    int         want_sweep;  /* the proxy lost events: the dirty set cannot be trusted */
 };
 
 esidx_watch_t *esidx_watch_open(const char *sock_path, const char *root,
@@ -180,11 +181,12 @@ int esidx_watch_drain(esidx_watch_t *w, esidx_t *db)
 
         if (ev.mask & SFA_EV_OVERFLOW) {
             /* The kernel queue overflowed: there are events we will never see, so the
-             * dirty set cannot be trusted to name what changed. A mark of the root is the
-             * widest pass this layer can ask for -- the same answer esidx_update() gives,
-             * and with the same reach: it follows moved stamps down from the root, so it
-             * covers a change whose ancestors moved and not one under a quiet tree. */
+             * dirty set cannot be trusted to name what changed. A sweep is the answer --
+             * it compares every directory's stamp rather than the ones a walk reaches --
+             * and a mark of the root goes in beside it so this batch is applied even if the
+             * sweep is declined or fails, which is the weaker but non-empty answer. */
             w->st.overflow++;
+            w->want_sweep = 1;
             if (esidx_mark_dirty(db, db->root_eid) == 0) { w->st.marked++; made++; }
             continue;
         }
@@ -196,20 +198,17 @@ int esidx_watch_drain(esidx_watch_t *w, esidx_t *db)
              * events because this client was not draining fast enough. Both arrive with an
              * empty path on purpose, and both are answered the same way: guess which
              * directory an unnamed event belonged to and an index goes quietly stale in a
-             * way nobody can distinguish from "nothing happened".
+* way nobody can distinguish from "nothing happened".
              *
-             * The answer is a mark of the root, and it is worth being exact about how far
-             * that reaches: reconcile_dir() descends into a child only when the child's own
-             * stamp moved, so this pass re-lists the root and follows moved stamps from
-             * there. It repairs a bulk change -- every directory on the way to it moved --
-             * and it does not repair a change buried under directories that never moved,
-             * which is a single rename deep in a quiet tree. That limit is the names pass's
-             * own (test.sh, "changes below an unchanged directory"), not something this
-             * branch introduces; the sweep pass is what widens it, and until it exists the
-             * log line below is the honest report of what was and was not covered. */
+             * The answer is a sweep (esidx_watch_wants_sweep), because the alternative is
+             * narrower than the signal: marking the root asks a pass that descends only
+             * into directories whose stamp moved, which repairs a bulk change and not one
+             * buried under a quiet tree. The root mark stays as the fallback and as what
+             * makes this batch get applied at all. */
             w->st.unresolved++;
+            w->want_sweep = 1;
             LOGW("watch: %llu event batch(es) the proxy could not attribute to a path; "
-                 "marking the root", (unsigned long long)w->st.unresolved);
+                 "asking for a sweep", (unsigned long long)w->st.unresolved);
             if (esidx_mark_dirty(db, db->root_eid) == 0) { w->st.marked++; made++; }
             continue;
         }
@@ -220,6 +219,16 @@ int esidx_watch_drain(esidx_watch_t *w, esidx_t *db)
     }
     if (made) w->st.batches++;
     return made;
+}
+
+int esidx_watch_wants_sweep(const esidx_watch_t *w)
+{
+    return w ? w->want_sweep : 0;
+}
+
+void esidx_watch_clear_sweep(esidx_watch_t *w)
+{
+    if (w) w->want_sweep = 0;
 }
 
 const watch_stats_t *esidx_watch_stats(const esidx_watch_t *w)
@@ -248,7 +257,9 @@ esidx_watch_t *esidx_watch_open(const char *sock_path, const char *root,
              "(clone the submodule, or run `git submodule update --init`)");
     return NULL;
 }
-int  esidx_watch_fd(const esidx_watch_t *w) { (void)w; return -1; }
+int esidx_watch_fd(const esidx_watch_t *w) { return w ? w->fd : -1; }
+int  esidx_watch_wants_sweep(const esidx_watch_t *w) { (void)w; return 0; }
+void esidx_watch_clear_sweep(esidx_watch_t *w) { (void)w; }
 int  esidx_watch_drain(esidx_watch_t *w, esidx_t *db) { (void)w; (void)db; return -1; }
 const watch_stats_t *esidx_watch_stats(const esidx_watch_t *w) { (void)w; return NULL; }
 void esidx_watch_close(esidx_watch_t *w) { (void)w; }

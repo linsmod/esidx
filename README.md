@@ -25,14 +25,23 @@ Under active development. The index engine, the query language and the ETP serve
 are all built and tested; **a client can connect and search today.** An index can
 also be brought back in line with the filesystem without a rebuild, and a server
 can do it to itself while it answers (`esidx serve --refresh=5`), so it no longer
-goes stale while a server runs. What is still missing is *immediacy*: freshness
-comes from a periodic pass rather than from filesystem events.
+goes stale while a server runs. Freshness can also be *immediate*:
+`esidx serve --watch` subscribes to `sfa`, a separate small privileged proxy that
+holds the fanotify group and rebroadcasts events as absolute paths, so a name
+change is visible within one event batch instead of one `--refresh` interval — and
+esidx itself needs no privilege, because the proxy is where that lives.
+
+What is still missing is *attribute* immediacy: size and mtime still follow
+`--deep`, because listing a directory cannot see them. And the proxy is not the
+whole answer on its own — it drops events it cannot turn back into a path, so a
+sweep that compares every directory's stamp (`serve --sweep=SECS`, and once at
+startup) is what makes "up to date" true rather than nearly true.
 
 | Phase | Scope | State |
 |---|---|---|
 | P0 | columnar store, directory tree, L0/L1 capability, sort, paging | done |
 | P1 | FTP + `SITE EVERYTHING`, 32 subcommands, result cache | done |
-| P2 | incremental collection: directory-mtime skip, fanotify | reconcile + mutation core done (`esidx update`, 0.1 ms idle on `/usr`), and the serving process can now reconcile in place (`serve --refresh`); fanotify not started |
+| P2 | incremental collection: directory-mtime skip, fanotify | reconcile + mutation core done (`esidx update`, 0.1 ms idle on `/usr`), the serving process reconciles in place (`serve --refresh`), events arrive through the `sfa` proxy (`serve --watch`), and `serve --sweep=SECS` closes what a stamp-pruned pass cannot reach; attribute freshness still needs `--deep` |
 | P3 | full query-language parser: 40+ functions, 12 comparisons, modifiers, constants, macros | done |
 | P4 | name/path trigram index, prefix/suffix search, CRoaring, query optimiser | name trigram index done (`trigram.c`, byte trigrams over the display name); driver selection done; path half, name-sorted/reversed arrays and CRoaring not started |
 | P5 | content inverted index, sparse media metadata, `dupe:` | not started |
@@ -152,6 +161,13 @@ inside a `mktemp` directory, leaving the source tree clean.
 # ...and keep that index current while serving it
 ./esidx serve /etc.idx -p 2121 --refresh=5 --save=300
 #   esidx: reconciling in place every 5 s, snapshot written every 300 s
+
+# ...or react to filesystem events as they happen
+sudo ./sfa/sfa-server /                       # the privileged half, once
+./esidx serve /etc.idx -p 2121 --watch --sweep=3600
+#   esidx: watching /etc via /run/sfa.sock -- name changes become visible within one
+#          batch; size/mtime still follow --refresh/--deep; an event the proxy cannot
+#          place costs a full pass
 ```
 
 `update` is the same walk in two modes. Without `--deep` it stats one directory
@@ -160,6 +176,17 @@ per changed subtree and notices name changes; on an unchanged `/usr` that is
 file whose *content* changed — that moves the file's own mtime and nothing its
 parent can see — and costs 4.2 s on `/usr`. Both are safe to run repeatedly: a
 pass that finds nothing writes nothing to any index.
+
+**And one more mode, because the cheap pass has a reach worth knowing.** The names pass
+descends into a directory only when that directory's own mtime moved, and it reaches a
+directory only through its parent — so a file created or renamed at depth ≥ 2 moves the
+stamp of the directory holding the name and nothing above it, and the pass never looks.
+`--sweep` compares the stamp of *every* indexed directory instead, which is the only way
+to ask that question, and costs one stat per directory: 77 ms on `/usr`, 1.6 s on `/work`
+(both measured on real hardware). So it runs in exactly three places — once at startup,
+whenever the event proxy reports that it lost events, and on `--sweep=SECS` if you ask for
+it — and never as the default, because it would turn a 0.1 ms timer into a 1.6 s one to
+fix a case that only a stopped daemon or a lossy proxy produces.
 
 `serve --refresh=SECS` is that same names pass, run by the serving process: once
 before the listener, then every SECS. The interval is a policy choice about
@@ -450,6 +477,8 @@ Staying current costs this, measured on the same tree:
 | `serve --refresh=SECS`, idle | **0.2-0.9 ms** (`/work`: 5.5 M entries, 48 dirs skipped) | one getdents of the root's own listing | proportional to the root's fanout, not to the tree |
 | `serve --refresh=SECS`, adding ~2000 rows | — | **0.40 s** on `/work` (389 ms one-time name-intern rebuild + 12 ms of work); 2.38 s before the two overlays | the O(n) rebuilds are drained on a threshold, not skipped |
 | `serve --save=SECS` | nothing written when nothing changed | 538-563 ms for a 313 MB snapshot | the whole file; no derived structure is persisted |
+| `serve --watch` (event proxy) | one `poll()` wake per event, ~50 ms coalescing window | 1017 events → 932 marks → **6 directory listings, ~6 ms** for 1000 files written at once | one stat per directory the events named, de-duplicated per batch |
+| `--sweep` (every directory's stamp) | 77 ms `/usr`, **1.6 s** `/work` (`r7000`, 651 896 dirs, 2.45 µs each) | same — it is linear in directories and nothing else | the price of knowing about a change at depth ≥ 2, which the pruned pass cannot reach |
 
 A pass that finds nothing writes nothing to any index and does not move the index
 epoch, so it is invisible to a connected client — the query costs above are the

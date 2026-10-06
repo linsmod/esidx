@@ -308,14 +308,12 @@ fi
 #     that subscribed to it, because the proxy filters it on the mask like any other event.
 #     Take the bit out of SFA_WATCH_MASK and this fails.
 #
-#     What the signal buys today is the *report*, not the repair: the response is a mark of
-#     the root, and a root mark is a pass that descends only into directories whose stamp
-#     moved. dst.dat therefore does NOT become visible here, and asserting that it does
-#     would be asserting a repair this layer does not do yet -- the stamp gate cannot reach
-#     a change whose ancestors' stamps never moved, which is the same reason the offline
-#     names pass misses an isolated change at depth >= 2 (test.sh, "changes below an
-#     unchanged directory"). The convergence assertion lands with the sweep pass that fixes
-#     it; until then this pins the half that is true: we are told, and we say so.
+#     What the signal buys is the repair, and this is the assertion that says so: a rename
+#     the proxy could not deliver has no event at all, so if the loss did not turn into a
+#     sweep then dst.dat could not appear by any route -- with --watch and no --refresh
+#     there is no periodic pass to find it later either. Before the sweep existed this
+#     failed, because the answer to a loss signal was a mark of the root and the root's pass
+#     only descends into directories whose stamp moved.
 DEEP="$ROOT/deep"
 mkdir -p "$DEEP"
 SEG=$(printf 'd%.0s' $(seq 1 60))
@@ -330,17 +328,23 @@ else
     bad "the deep fixture is indexed" "src.dat at ${#DEEP} characters never appeared"
 fi
 mv "$DEEP/src.dat" "$DEEP/dst.dat"
-sleep 1.5
+N=$(await_name dst.dat)
+if [ "$N" != "-1" ] && await_absent src.dat; then
+    ok "a rename the proxy cannot resolve still converges (after ${N} poll interval(s))"
+else
+    bad "a rename the proxy cannot resolve still converges" \
+        "dst.dat never appeared, or src.dat still answers -- the loss did not become a sweep"
+fi
 if grep -q 'could not attribute to a path' "$TMP/serve.log"; then
-    ok "a rename the proxy cannot resolve is reported, not absorbed"
+    ok "the loss is reported, not absorbed"
 else
     bad "the loss is reported" \
         "no 'could not attribute to a path' line -- is SFA_EV_UNRESOLVED still subscribed?"
 fi
-if grep -qE '[1-9][0-9]* event batch\(es\) the proxy could not attribute' "$TMP/serve.log"; then
-    ok "the loss is counted as a batch, and answered with a pass over the root"
+if grep -qE 'sweep: [0-9]+ director\(ies\) compared, [1-9][0-9]* moved' "$TMP/serve.log"; then
+    ok "the loss is answered with a sweep, and the sweep found the directory"
 else
-    bad "the loss is counted" "no counted batch line in the log"
+    bad "the loss is answered with a sweep" "no sweep line reporting a moved directory"
 fi
 
 # 12. the proxy going away must be reported. This is the assertion that keeps a dead

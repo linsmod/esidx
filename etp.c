@@ -1365,13 +1365,25 @@ static int serve_watch(esidx_t *db, esidx_watch_t **w)
 
 /* Apply whatever the watcher has marked. This is the expensive half, and the log line is
  * the only place its cost is visible, so it says which of the two mechanisms asked for it:
- * `from` is "the watcher" or "the timer", because a line that did not distinguish them
- * would hide which one is doing the work in a configuration that has both. */
-static void serve_apply_watch(esidx_t *db, esidx_watch_t *w, int *pending, const char *from)
+ * `from` is "a batch of events", "the timer" or "a sweep timer", because a line that did
+ * not distinguish them would hide which one is doing the work in a configuration that has
+ * all three. `sweep` is the one thing this function does that the watcher cannot ask for
+ * directly: a full comparison of every directory's stamp, because the proxy said it lost
+ * events and the dirty set cannot be trusted to name what changed (design §7 "Sweep"). */
+static void serve_apply_watch(esidx_t *db, esidx_watch_t *w, int *pending,
+                              const char *from, bool sweep)
 {
+    int sweep_wanted = sweep || esidx_watch_wants_sweep(w);
     int marks = *pending;
     *pending = 0;
-    if (!marks) return;
+    if (!marks && !sweep_wanted) return;
+
+    if (sweep_wanted) {
+        esidx_watch_clear_sweep(w);
+        sweep_stats_t sst;
+        if (esidx_sweep_dirs(db, &sst) != 0)
+            LOGW("watch: the sweep failed; reconciling only what was marked");
+    }
 
     update_stats_t st;
     uint64_t t0 = ts_us();
@@ -1466,10 +1478,25 @@ int etp_serve(const etp_opts_t *opts)
             return -1;
         }
     }
-    if (opts->refresh_secs > 0 || watch) {
+    if (opts->refresh_secs > 0 || watch || opts->sweep_secs > 0) {
+        /* The startup pass sweeps, where --refresh on its own did not, and the reason is
+         * what this pass is for. "Whatever happened while the server was down" is only
+         * covered if every directory is compared, because a change at depth >= 2 moves the
+         * stamp of the directory holding the name and nothing above it (design §7 "Sweep",
+         * §12 risk 8) -- so the pruned pass that costs 0.5 ms finds the top of the tree and
+         * stops. The price is one stat per directory, paid once before the listener opens
+         * where nobody is waiting on a query yet: measured on r7000, 94 ms for /usr's
+         * 34 811 directories, 1941 ms for /work's 651 894. Both numbers are in the log
+         * line below, because "the server started" and "the server is up to date" must not
+         * be the same claim. */
         uint64_t r0 = ts_us();
+        sweep_stats_t sst;
+        if (esidx_sweep_dirs(&db, &sst) != 0)
+            LOGW("serve: the startup sweep failed; falling back to a names pass");
         serve_refresh(&db);
-        LOGI("serve: startup repair pass in %.1f ms", (double)(ts_us() - r0) / 1000.0);
+        LOGI("serve: startup repair pass in %.1f ms (sweep compared %u director(ies), "
+             "%u moved)", (double)(ts_us() - r0) / 1000.0, sst.dirs_examined,
+             sst.dirs_marked);
     }
 
     const char *bindaddr = (opts->bind_addr && *opts->bind_addr) ? opts->bind_addr
@@ -1554,13 +1581,16 @@ int etp_serve(const etp_opts_t *opts)
                               ? (uint64_t)opts->refresh_secs * 1000000ULL : 0;
     const uint64_t save_us = opts->save_secs > 0
                           ? (uint64_t)opts->save_secs * 1000000ULL : 0;
+    const uint64_t sweep_us = opts->sweep_secs > 0
+                          ? (uint64_t)opts->sweep_secs * 1000000ULL : 0;
     uint64_t next_refresh = ts_us() + refresh_us;
     uint64_t next_save    = ts_us() + save_us;
+    uint64_t next_sweep   = ts_us() + sweep_us;
 
     /* Either mechanism can change the index, and a server that changed it and exits without
      * writing is a day of work thrown away -- so the clean-exit save is keyed on this, not
      * on the refresh timer alone. */
-    const int mutating = opts->refresh_secs > 0 || watch != NULL;
+    const int mutating = opts->refresh_secs > 0 || watch != NULL || opts->sweep_secs > 0;
 
     /* Marks the watcher has made and not yet applied, and the moment this batch has been
      * quiet long enough to be worth a reconcile. `next_watch == 0` means nothing pending. */
@@ -1586,11 +1616,28 @@ int etp_serve(const etp_opts_t *opts)
         }
         /* Apply the watcher's batch once it has stopped growing, or immediately if it grew
          * past the cap. Checked here, with the other deadlines, for the reason the comment
-         * above this loop gives: poll() returning 0 is how the loop wakes up at all. */
-        if (pending_marks &&
-            (next_watch == 0 || ts_us() >= next_watch)) {
-            serve_apply_watch(&db, watch, &pending_marks, "a batch of events");
+         * above this loop gives: poll() returning 0 is how the loop wakes up at all.
+         *
+         * The sweep timer lands in the same place rather than getting its own call, because
+         * a sweep's output is marks and the marks are applied here -- and it goes through
+         * the pending_marks test so a sweep cannot be silently skipped by a coalescing
+         * window that is not due yet. */
+        bool sweep_due = sweep_us && ts_us() >= next_sweep;
+        if (sweep_due) {
+            serve_apply_watch(&db, watch, &pending_marks, "a sweep timer", true);
+            next_sweep = ts_us() + sweep_us;
+        } else if (pending_marks &&
+                   (next_watch == 0 || ts_us() >= next_watch)) {
+            serve_apply_watch(&db, watch, &pending_marks, "a batch of events", false);
             next_watch = 0;
+        } else if (pending_marks && esidx_watch_wants_sweep(watch) &&
+                   next_watch > ts_us()) {
+            /* A loss signal wants a sweep, but this batch is still inside its coalescing
+             * window. Bringing the deadline forward rather than waiting it out is the
+             * point of the flag: the events that were lost have no other route into the
+             * index, so every millisecond of the window is a millisecond the index is
+             * knowingly wrong. */
+            next_watch = ts_us();
         }
 
         struct pollfd pfd[MAX_CLIENTS + 2];
@@ -1626,6 +1673,15 @@ int etp_serve(const etp_opts_t *opts)
         }
         if (save_us && next_save > now) {
             int64_t ms = (int64_t)((next_save - now) / 1000);
+            if (ms < tmo) tmo = (int)ms;
+        }
+        /* And for the sweep, which is the longest of the three intervals by design -- it is
+         * a stat per directory, so anything under a minute would cost more than it can
+         * plausibly find. It still has to be in the timeout computation, or the loop would
+         * quantise it to the 1000 ms poll tick and the flag would be a lie about its own
+         * resolution. */
+        if (sweep_us && next_sweep > now) {
+            int64_t ms = (int64_t)((next_sweep - now) / 1000);
             if (ms < tmo) tmo = (int)ms;
         }
         /* Same for the coalescing deadline, or a pending batch would wait for the poll
@@ -1701,7 +1757,7 @@ done:
     /* A batch that was still inside its coalescing window when the server was asked to
      * stop is applied rather than dropped: with --once that window is the whole lifetime
      * of a change made while the one client was connected. */
-    if (pending_marks) serve_apply_watch(&db, watch, &pending_marks, "the last batch");
+    if (pending_marks) serve_apply_watch(&db, watch, &pending_marks, "the last batch", false);
     for (size_t i = 0; i < MAX_CLIENTS; i++) client_free(&clients[i]);
     close(s);
     g_listen_fd = -1;

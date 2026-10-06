@@ -631,6 +631,65 @@ int esidx_mark_dirty(esidx_t *db, eid_t dir)
     return 0;
 }
 
+/* Compare every directory's stamp with the stored one, and mark the ones that moved.
+ *
+ * This exists because of what the reconcile above cannot reach (design §7 "Sweep", §12
+ * risk 8). reconcile_dir() decides to descend by comparing a child's stamp, and a
+ * directory is reached only through its parent -- while a directory's stamp moves when
+ * its OWN entries move. So an isolated change at depth >= 2 moves the stamp of the
+ * directory holding the name, and that directory is reached through a parent whose stamp
+ * did not move. Measured on root/a/b/, with no watcher involved: `esidx update` does not
+ * see a create of a/b/new.txt and does not see a rename inside a/b, and a deep pass sees
+ * both.
+ *
+ * So the fix is to stop asking the walk which directories to compare and ask the columns
+ * instead: every live directory is stat'ed, and the ones whose stamp differs are marked
+ * like any other dirty directory. The walk then reconciles exactly those, so a subtree
+ * nobody touched costs one stat and no getdents -- which is why this is affordable where a
+ * full pass is not.
+ *
+ * What it costs is one path-based stat per directory. Measured warm on r7000 (ext4 NVMe,
+ * hpet clocksource, and note that path-syscalls there are 2.7-3.0 us against 69 us on the
+ * WSL2 this was developed on, so a WSL2 number would be 25x pessimistic and unusable):
+ * /usr 34 811 dirs in 94 ms, /work 651 894 dirs in 1941 ms. Against that, the pass it
+ * complements is 0.4-1.1 ms idle on the same trees precisely because it skips. Hence
+ * on demand, never as the default: a startup repair, a proxy loss signal, or a slow timer.
+ *
+ * lstat, not stat, and the reason is not symmetry: a directory replaced by a symlink has
+ * the symlink's mtime under lstat and the target's under stat, and only the first notices.
+ * A directory that cannot be stat'ed at all (removed between the walk and here) is counted
+ * and not marked -- its parent moved, which is what removes it.
+ */
+int esidx_sweep_dirs(esidx_t *db, sweep_stats_t *st)
+{
+    memset(st, 0, sizeof(*st));
+    if (!db || !db->built) { LOGE("sweep: the index has not been finalized"); return -1; }
+
+    uint64_t t0 = ts_us();
+    char path[PATH_MAX];
+
+    for (uint32_t i = bs_next(&db->type.dirs, 0); i < db->et.count;
+         i = bs_next(&db->type.dirs, i + 1)) {
+        if (i == db->root_eid) continue;      /* always reconciled anyway */
+        if (!bs_test(&db->live, i)) continue; /* a tombstone keeps its bits until killed */
+        if (db->et.stamp[i] == 0) continue;   /* never stat'ed, so nothing to compare */
+
+        path_of(db, i, path, sizeof(path));
+        struct stat sb;
+        if (lstat(path, &sb) < 0) { st->stat_fail++; continue; }
+        st->dirs_examined++;
+
+        if (stamp_of(&sb) == db->et.stamp[i]) continue;
+        if (esidx_mark_dirty(db, i) == 0) st->dirs_marked++;
+        else st->stat_fail++;                  /* raced a tombstone */
+    }
+
+    st->us = ts_us() - t0;
+    LOGI("sweep: %u director(ies) compared, %u moved, %u unreadable, in %.1f ms",
+         st->dirs_examined, st->dirs_marked, st->stat_fail, (double)st->us / 1000.0);
+    return 0;
+}
+
 static int cmp_eid(const void *a, const void *b)
 {
     eid_t x = *(const eid_t *)a, y = *(const eid_t *)b;
@@ -756,7 +815,12 @@ int esidx_refresh_dirs(esidx_t *db, unsigned flags, update_stats_t *st)
 /* The whole-index pass: mark the root and apply. It is not a different reconcile from a
  * partial one -- the root's reconcile descends into every subdirectory whose stamp moved,
  * which is what "full" has always meant here, and whatever a watcher missed is exactly what
- * the next one of these is for. */
+ * the next one of these is for.
+ *
+ * That sentence is also the reach, and EU_SWEEP is how a caller buys past it: descending
+ * into "every subdirectory whose stamp moved" only finds the ones above the change. With
+ * the sweep the dirty set holds every directory that moved anywhere, so the apply below
+ * reconciles all of them and the root's own descent becomes redundant rather than wrong. */
 int esidx_update(esidx_t *db, const char *root, unsigned flags, update_stats_t *st)
 {
     memset(st, 0, sizeof(*st));
@@ -777,6 +841,14 @@ int esidx_update(esidx_t *db, const char *root, unsigned flags, update_stats_t *
         }
     }
     if (esidx_mark_dirty(db, rid) != 0) return -1;
+    /* After the root, not before it: the sweep's marks are for directories the root's own
+     * descent cannot reach, and marking the root first keeps the set sorted into a shape
+     * the apply already handles (parent before child), so a new subdirectory is listed
+     * before the sweep's own mark of it is considered. */
+    if (flags & EU_SWEEP) {
+        sweep_stats_t sst;
+        if (esidx_sweep_dirs(db, &sst) != 0) return -1;
+    }
     return esidx_refresh_dirs(db, flags, st);
 }
 

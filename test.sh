@@ -1033,7 +1033,10 @@ inc_sync() {
 DB="$INC_DB"
 
 # 1. nothing changed. The pass must cost one stat per directory and stop.
-u() { "$BIN" update "$INC_DB" "$@" >/dev/null 2>>"$DIAG"; }
+#    `u` refreshes $DB, not $INC_DB: a section that builds its own fixture sets DB, and a
+#    helper that hardcoded the first fixture's file would quietly refresh the wrong index
+#    (which is exactly what the depth-2 case below did until this line was read).
+u() { "$BIN" update "$DB" "$@" >/dev/null 2>>"$DIAG"; }
 if u; then ok "update with no changes succeeds"; else bad "update with no changes"; fi
 q ""
 expect "no-op refresh keeps every entry" "$(n "$LAST")" "$(inc_find)"
@@ -1180,7 +1183,46 @@ expect "child-count: reflects the removals" "$(n "$LAST")" \
 q "parent:$INC/a folder:"
 expect "a/ holds exactly its two remaining children" "$(n "$LAST")" "2"
 
-# 12. a refresh against a tree that is not this index must refuse rather than
+# 12. a change below an UNCHANGED directory. This is the reach of the stamp-pruned pass,
+#     and the fixture above could not have found it: every change it makes sits at depth 1,
+#     where the directory holding the name is a direct child of the root and is therefore
+#     always listed. One level down, the directory holding the name is reached through a
+#     parent whose own stamp did not move -- a directory's stamp moves when its own entries
+#     move -- so the pruned pass never looks. The create and the rename are both there
+#     because they fail differently: the create leaves the total short by one, the rename
+#     leaves a row that answers for a name that no longer exists.
+INC2="$TMP/inc2"
+mkdir -p "$INC2/a/b"
+printf 'p%.0s' $(seq 1 10) >"$INC2/a/b/f1.txt"
+printf 'q%.0s' $(seq 1 20) >"$INC2/a/b/f2.txt"
+printf 'r%.0s' $(seq 1 30) >"$INC2/a/shallow.txt"
+INC2_DB="$TMP/inc2.idx"
+build "$INC2" "$INC2_DB"
+DB="$INC2_DB"
+find_oracle() { find "$INC2" | wc -l; }
+
+printf 's%.0s' $(seq 1 40) >"$INC2/a/b/deep-new.txt"
+mv "$INC2/a/b/f1.txt" "$INC2/a/b/f1-renamed.txt"
+u
+expect "the pruned pass cannot see a create at depth 2" \
+    "$(q '' >/dev/null; n "$LAST")" "$(( $(find_oracle) - 1 ))"
+q "name:f1-renamed.txt"
+expect "the pruned pass cannot see a rename at depth 2 either" "$(n "$LAST")" "0"
+q "name:f1.txt"
+expect "so the old name still answers" "$(n "$LAST")" "1"
+
+u --sweep
+expect "--sweep reaches the create at depth 2" "$(q '' >/dev/null; n "$LAST")" \
+    "$(find_oracle)"
+q "name:f1-renamed.txt"
+expect "--sweep reaches the rename at depth 2" "$(n "$LAST")" "1"
+q "name:f1.txt"
+expect "--sweep retires the old name" "$(n "$LAST")" "0"
+expect "the depth-1 case --sweep also has, with nothing to do" \
+    "$(u --sweep >/dev/null 2>&1; q '' >/dev/null; n "$LAST")" "$(find_oracle)"
+DB="$INC_DB"
+
+# 13. a refresh against a tree that is not this index must refuse rather than
 #     delete every row it cannot find
 if "$BIN" update "$INC_DB" "$TREE" >/dev/null 2>"$TMP/err"; then
     bad "update refuses a root that is not this index"
@@ -1191,7 +1233,7 @@ else
 fi
 inc_sync "after the refused update"
 
-# 13. the answers survive the snapshot round trip, tombstones and all
+# 14. the answers survive the snapshot round trip, tombstones and all
 cp "$INC_DB" "$TMP/inc-copy.idx"
 if u; then ok "a second refresh is still a no-op"; else bad "second refresh"; fi
 DB="$INC_DB"
@@ -1237,14 +1279,14 @@ expect "two refreshes leave the snapshot the same size" "$s2" "$s1"
 
 DB="$INC_DB"
 
-# 14. an unbuilt index is not refreshable
+# 15. an unbuilt index is not refreshable
 if "$BIN" update "$TMP/junk.idx" >/dev/null 2>&1; then
     bad "update rejects a non-snapshot"
 else
     ok "update rejects a non-snapshot"
 fi
 
-# 15. many directories at the same depth. The reconcile keeps one claim table per
+# 16. many directories at the same depth. The reconcile keeps one claim table per
 #     depth and reuses the slots, so a directory whose table is not fully reset
 #     makes its own children look new -- a duplicate row each, and no removal at
 #     all. The fixture above is small enough that the slots never collide, which

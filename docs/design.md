@@ -753,11 +753,52 @@ never (`test_watch.sh`, "a rename the proxy cannot resolve is reported").
 But a mark of the root is **a pass that follows moved stamps down from the root**, and
 that is the whole of its reach: it repairs a bulk change, where every directory on the way
 to it moved, and it does not repair a change buried under directories that never moved.
-That is not a property of the watcher — it is the names pass's own limit, and it is sharp
-(§12 risk 8). The watcher is immune on the common path, because it marks the directory the
-event *names* rather than the root; the loss-signal path is the one that inherits the
-limit. Widening it means comparing every directory's stamp rather than only the ones a
-walk reaches, and that — a **sweep** — is not built.
+That is not a property of the watcher — it is the names pass's own limit (§12 risk 8).
+
+### Sweep
+
+So the loss signal, the startup repair pass and `--sweep=SECS` all answer with a **sweep**
+instead: `esidx_sweep_dirs()` compares the stamp of **every** live directory against the
+column, and marks the ones that differ. The walk then reconciles exactly those, so a
+subtree nobody touched costs one stat and no `getdents` — which is what makes this
+affordable where a full pass is not.
+
+It is a comparison rather than a walk because that is the only way to ask the question. The
+directory that holds a changed name is only *reached* through its parent, and its parent's
+stamp did not move, so no amount of descending finds it; asking each directory directly is
+the same question with the tree's shape taken out of the loop.
+
+Cost, measured with this code on `r7000` (ext4 NVMe, `hpet`), warm, on an idle tree — the
+number that decided the placement:
+
+| Tree | Directories | Sweep | Pruned pass | Ratio |
+|---|---|---|---|---|
+| `/usr` | 34 810 | **76.6-77.1 ms** | 0.1 ms | ~770x |
+| `/work` | 651 896 | **1593-1608 ms** | 0.2 ms | ~8000x |
+
+Two things fall out of that table. The sweep is *linear in directories and nothing else*
+(2.2-2.5 µs per directory on both trees), so it predicts rather than surprises: 1.6 s on
+`/work` is what 651 896 directories cost, not a bad day. And the pruned pass is cheap
+**because** it does not know, which is why the sweep cannot be the default — it would turn
+a 0.2 ms timer into a 1.6 s one for every deployment, to fix a case that only a stopped
+daemon or a lossy proxy produces. Hence the three places it runs, and no others:
+
+- **once at startup**, before the listener opens, where nobody is waiting on a query yet.
+  This is what makes "the server is up to date" true rather than approximately true, and it
+  is the one place the cost is unconditionally worth paying.
+- **after a proxy loss signal**, which is the only event that means "I do not know what
+  changed". The coalescing wait is short-circuited for it: the lost events have no other
+  route into the index.
+- **`--sweep=SECS`**, for a deployment that wants the hole closed on a timer instead of at
+  startup. Off unless asked for, and coarse by design — anything under a minute costs more
+  than it can plausibly find on a tree this size.
+
+Not built, and named because it is the obvious next question: a sweep that **yields** to
+the serve loop instead of blocking it. 1.6 s is a 1.6 s stall in which no client is
+answered, which is acceptable at startup and on a loss signal and is *not* what one wants
+from a timer. The shape is known — the dirty set is already a set, so the sweep could mark
+a bounded number of directories per poll turn and resume where it left off — and it is not
+built because no configuration needs it yet.
 
 **In place.** `esidx serve --refresh=SECS` runs the names pass inside the serving
 process, once before the listener and then every SECS, so a long-running server
@@ -975,7 +1016,7 @@ Each row: source → what was taken → how it lands here → why it changed.
 | 6.3 | execution: candidates → bitmaps → matchers → sort → slice | `query.c` | **done**, including the second-stage FILTER_* pass. The text matcher implements Everything's rule for *what a term reads* — the filename, or the path once the value carries a separator or says `path:` — verified shape by shape against voidtools' server; §12.10 has the table and the two shapes still open. An `ext:` term's id list is sized by the term, not by a fixed 256 (§6.3, and the reason is in the code): a longer list used to be cut with no complaint |
 | 6.4 | result cache | `etp.c` | **done** — the full sorted set is kept and re-sliced, and invalidated by the index epoch |
 | 7 | full scan | `scan.c` | done; concurrency (D6) not started |
-| 7 | incremental | `scan.c`, `watch.c` | **done** — the two reconcile passes and the mutation core; `esidx update <db> [--deep]`, `esidx serve --refresh=SECS` (names pass in the serving process), and `esidx serve --watch[=SOCK]`, which subscribes to the `sfa` submodule's privileged fanotify proxy and marks the directory each event names (§7 "Events"). Two limits worth naming here rather than in §12 only: a stamp-pruned pass reaches a change at depth ≥ 2 only if some directory above it also moved (§12 risk 8), and the proxy's own losses arrive as `SFA_EV_OVERFLOW`/`SFA_EV_UNRESOLVED`, whose answer — a mark of the root — inherits that same reach. The **sweep** that would compare every directory's stamp is **not built**. The inotify fallback (B8) is **not** built and is not needed: a proxy means esidx needs no privilege, so there is no second backend to fall back to |
+| 7 | incremental | `scan.c`, `watch.c` | **done** — the two reconcile passes and the mutation core; `esidx update <db> [--deep] [--sweep]`, `esidx serve --refresh=SECS` (names pass in the serving process), `esidx serve --sweep=SECS`, and `esidx serve --watch[=SOCK]`, which subscribes to the `sfa` submodule's privileged fanotify proxy and marks the directory each event names (§7 "Events"). One limit is named rather than papered over: a stamp-pruned pass reaches a change at depth ≥ 2 only if some directory above it also moved (§12 risk 8), which is what the **sweep** (§7 "Sweep") is for — 77 ms on `/usr`, 1.6 s on `/work`, measured on `r7000`, and therefore on demand at startup / after a proxy loss signal / on `--sweep`. The inotify fallback (B8) is **not** built and is not needed: a proxy means esidx needs no privilege, so there is no second backend to fall back to |
 | 1-3 | FTP + `SITE EVERYTHING` | `etp.c` | **done** — all 32 subcommands, 22 sort names, the data channel for other FTP clients |
 
 **Two things in §6.2 deliberately not built**, with the reasoning recorded
@@ -1910,12 +1951,19 @@ answer anyway.
    their stamp) rather than its cost when something changed. It is also inherited by the
    startup repair pass and by the watcher's loss-signal response (§7 "Events").
 
-   Two ways out, neither built: a **sweep** that compares every directory's stamp instead
-   of only the ones a walk reaches (correct, and costs one stat per directory — 630 472 of
-   them on `/work` — every time it runs), or the watcher, which sidesteps the question by
-   marking the directory the event names. What is *not* an option is leaving the claim
-   as it stood: it was in §7's pass table, and it was in every test fixture, which is
-   exactly why 349 index assertions had never asked the question (see AGENTS.md §3.4).
+Two ways out. One is the **sweep** (§7), which compares every directory's stamp instead of
+only the ones a walk reaches: it closes this for the startup repair pass, for a proxy loss
+signal and for `--sweep=SECS`, and it is the reason the claim above is now bounded by depth
+rather than by nothing. The other is the watcher, which sidesteps the question entirely by
+marking the directory the event *names* — so a deployment with `--watch` and a recent
+`--sweep` does not have this hole at all, and one with neither still does.
+
+What the table's numbers have to be read with: they are a **fixture**, and the fixture is
+why the answer was missed rather than why it is right. Every change it makes sits at depth
+1, where the directory holding the name is a direct child of the root and is therefore
+always listed — the one place where the two spellings of "reachable" cannot differ. The
+sweep's own assertions are the same fixture plus a second directory one level down, with
+the depth-1 case kept beside it as the control that has to keep working.
 9. **Two text-matching bugs, both pre-existing and both found while writing the
    incremental tests** — both fixed now, and both pinned against the reference
    rather than against our reading of the code:
