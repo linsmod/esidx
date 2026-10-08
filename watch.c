@@ -352,11 +352,27 @@ static int drop_privilege(const char *spec, char *err, size_t errlen)
         return -1;
     }
 
-    /* 3. Change identity. Supplementary groups first: setgid() would otherwise leave the
-     *    ones we were given, which is how a process ends up still able to read a directory
-     *    it was only supposed to reach through the new group. */
-    if (setgroups(1, &gid) < 0 && geteuid() != 0) {
-        snprintf(err, errlen, "setgroups: %s", strerror(errno));
+    /* 3. Change identity. Supplementary groups first, and they are the *target user's*
+     *    groups rather than an empty set: what this process becomes has to be the account
+     *    the operator configured, and an account is its group memberships, not just its
+     *    primary gid.
+     *
+     *    Narrowing them to the single gid (which is what this did) is the bug measured on
+     *    r7000: esidx belongs to `wahaha`, /home/wahaha is 0750 wahaha:wahaha, and
+     *    `sudo -u esidx find /home/wahaha` walks 3 323 560 entries -- while the serving
+     *    process, with Groups: 144 and nothing else, saw the directory and not one file in
+     *    it. The index then came back short by three million entries with no error, which
+     *    is exactly the failure "the index is a view of what that identity may read" is
+     *    supposed to make impossible: the identity it was a view of was not the one anyone
+     *    configured. `sudo -u`, `su -` and systemd's User= all resolve the same list from
+     *    /etc/group, so this is what makes those three agree with what gets indexed.
+     *
+     *    It is not a widening of what the process was *given*: initgroups() replaces the
+     *    inherited set (root's, which is empty, plus whatever the unit's Group= added)
+     *    with the user's own, so no group the process was not entitled to survives -- which
+     *    is the property the old comment was protecting. */
+    if (initgroups(user, gid) < 0) {
+        snprintf(err, errlen, "initgroups(%s): %s", user, strerror(errno));
         return -1;
     }
     if (setgid(gid) < 0) {

@@ -22,10 +22,12 @@
 # still has to keep two things in step; see README, "Deployment".
 
 # The snapshot. Nothing builds this for you at install time -- the first one is a full scan,
-# which does not belong in a maintainer script -- so it is usually absent until you run:
-#     sudo -u esidx esidx build --roots-file=/etc/esidx/roots -o "$ESIDX_DB"
-# The server refuses to start without it: a search service answering from no snapshot would
-# answer from nothing. The snapshot must stay readable by ESIDX_USER, and writable by it if
+# which does not belong in a maintainer script -- and nothing has to: the server starts
+# without it and builds it itself, as ESIDX_USER, the first time it finds that /etc/esidx/
+# roots and the snapshot disagree (design D11), which on a fresh install they do. It is
+# therefore usually absent for the first minute of the service's life and present after it.
+#
+# The snapshot must stay readable by ESIDX_USER, and writable by it if
 # --save is on. That is arranged with the group rather than with ownership: the directory is
 # owned by the dedicated user and shared with the dedicated group (2775, postinst), and
 # ESIDX_USER is put in that group. Three identities write here -- the unit's process before it

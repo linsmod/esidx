@@ -4,12 +4,14 @@
 # postinst -- create the system user the server becomes, the state directory, and enable the
 # unit.
 #
-# It deliberately does not start it. The server refuses to run without a snapshot
-# (main.c, "load failed"), and the first snapshot is a full scan of everything named in
-# /etc/esidx/roots -- 60s on a workstation's /work, a minute and a half on /usr -- which
-# does not belong in a maintainer script: no tty, dpkg's own timeouts, and a failed install
-# halfway through a scan. So this enables and prints the two commands, because a service that
-# is "running" and cannot answer anything is worse than one that is plainly not started yet.
+# It starts the service, but it does not build the index. The server no longer needs a
+# snapshot to run (design D11): it comes up on whatever the snapshot holds, or on an empty
+# index when there is none, and compares /etc/esidx/roots with the locations that covers --
+# rebuilding in a child process, as the identity it drops to, whenever the two disagree. So
+# the first scan is not this script's job, and it must not be: 60s on a workstation's /work,
+# a minute and a half on /usr, with no tty, dpkg's own timeouts and a failed install halfway
+# through a scan. The service answers from an empty index while that runs, which is a state
+# it can report, unlike a half-configured install.
 
 set -e
 
@@ -156,13 +158,24 @@ case "$1" in
                     | grep -F "esidx.service" \
                     | sed 's/^/esidx: /' >&2 || true
             fi
-            # An upgrade replaces the binary *under a running service*, and systemd does not
-            # restart it for that: Restart=always is about the process exiting, not about the
-            # file changing. So without this an update installs cleanly and the old process
-            # keeps answering -- an update that silently did not happen, which is the one
-            # outcome an operator cannot see. try-restart is a no-op when the unit is not
-            # running, which is the first-install case (no snapshot yet).
-            systemctl try-restart esidx.service >/dev/null 2>&1 || true
+            # Start it, and on an upgrade restart it: an upgrade replaces the binary *under
+            # a running service*, and systemd does not restart it for that -- Restart=always
+            # is about the process exiting, not about the file changing -- so without this an
+            # update installs cleanly and the old process keeps answering, which is the one
+            # outcome an operator cannot see.
+            #
+            # Starting a first install is the other half, and it is safe now that the server
+            # builds its own index (design D11): it comes up on whatever the snapshot holds,
+            # or on an empty index when there is none, and reconciles the locations from
+            # $ROOTSF in a child process. It used to be refused -- "the server needs a
+            # snapshot" -- which is what made this script print a build command and leave the
+            # service down until somebody ran it.
+            if systemctl is-active --quiet esidx.service 2>/dev/null; then
+                systemctl restart esidx.service >/dev/null 2>&1 || true
+            else
+                systemctl start esidx.service >/dev/null 2>&1 \
+                    || echo "esidx: could not start the unit; start it by hand." >&2
+            fi
         else
             echo "esidx: systemd is not running here; the unit was installed but not enabled." >&2
         fi
@@ -177,12 +190,14 @@ case "$1" in
         # about to be scanned and the reader cannot tell which from a path.
         nroots=$(read_roots | wc -l)
         roots=$(read_roots | tr '\n' ' ')
-        # The build has to run as the user that will *serve* the snapshot, not as the user this
-        # package created: the index is a view of what that identity may read, and building it
-        # as anyone else quietly produces a smaller one -- the service then answers as if the
-        # files were not there. Measured on r7000: 5 372 563 entries as the service account
-        # against 5 476 485 as the deploying user, 1 407 directories the difference. That is why
-        # the command below is printed with $svc (read in step 1b).
+        # The index is built by the service, as the user that serves it ($svc, read in step
+        # 1b) -- not as root, and not as the user this package created. That is the whole
+        # reason nothing here builds one: the index is a view of what that identity may read,
+        # and building it as anyone else quietly produces a smaller one, which the service
+        # then answers as if the files were not there. Measured on r7000: 5 372 563 entries
+        # as the service account against 5 476 485 as the deploying user, 1 407 directories
+        # the difference. So a location that comes back emptier than expected is a question
+        # about that account's permissions, not about this package.
         [ -n "$db" ] || db=$VARLIB/root.idx
         [ -n "$port" ] || port=2121
         [ -n "$bind" ] || bind=127.0.0.1
@@ -202,26 +217,31 @@ case "$1" in
             [ -d "$r" ] || echo "esidx: warning: $ROOTSF names $r, which does not exist;" \
                               "the build below will fail on it" >&2
         done
-        [ "$nroots" -gt 0 ] || echo "esidx: warning: $ROOTSF names no locations; edit it before" \
-                              "building the first snapshot" >&2
+        # Not an error, and not worth refusing over: the service starts anyway and serves an
+        # empty index until this file names something, which is the state a fresh install is
+        # in before anybody has edited it.
+        [ "$nroots" -gt 0 ] || echo "esidx: warning: $ROOTSF names no locations; the service" \
+                              "will start with an empty index until it does" >&2
 
         if systemctl is-active --quiet esidx.service 2>/dev/null; then
-            # An upgrade over a running deployment: no instructions to give, but the two
-            # things an operator wants confirmed are that it is on the new binary and that
-            # the snapshot survived -- the state directory is not touched by an upgrade.
-            #
-            # The roots file is named even here, because this is the message an operator reads
-            # when they expected their new location to be indexed and it is not: an upgrade
-            # restarts the service, and the reload watch seeds from the file at startup -- so
-            # a change made while it was stopped is never "seen", and they still have to build.
+            # Nothing to run afterwards, and saying so is the point of this message: the
+            # deployment used to end with a build command the operator had to type, and an
+            # install that ends with instructions is an install that is half done. What the
+            # operator still has to know is *where* the locations are named -- that file is
+            # the whole of the configuration they will ever touch -- and that the scan is
+            # happening now, in the background, as $svc.
             cat <<EOF
 
-esidx $newver installed over a running service. It was restarted onto the new binary and the
-snapshot at $db was kept, covering the $nroots location(s) it was built from. From here on,
-editing $ROOTSF while the service runs is enough: it is picked up within seconds and the index
-is rebuilt and swapped in without a restart. (A change made while it was stopped still needs
-the build command above, and newly added locations are sweep-repaired until a restart.)
-Configuration is $DEFAULTCFG.
+esidx $newver installed and running. The locations are $ROOTSF -- $nroots of them right now:
+$roots
+
+The index is built by the service itself, as $svc, in a child process: it has compared that
+file with what the snapshot covers and is rebuilding wherever they disagree, and it will do
+the same again every time you edit the file. There is no build command, before an install or
+after one, and a client is answered throughout.
+
+An ETP client (Everything) can connect to $bind:$port. The rest of the configuration is
+$DEFAULTCFG, and unlike the locations file a change there needs a restart:
 
   systemctl status esidx
   journalctl -u esidx -f
@@ -230,16 +250,15 @@ EOF
         else
             cat <<EOF
 
-esidx $newver installed. One service is enabled and it is not running yet, because the server
-needs a snapshot and building the first one scans $nroots location(s): $roots
+esidx $newver installed. The unit is enabled but it is not running: this script could not
+start it (see the message above). Start it, and it will build the index itself from the
+$nroots location(s) in $ROOTSF: $roots
 
-  1. sudo -u $svc esidx build --roots-file=$ROOTSF -o $db
-  2. sudo systemctl start esidx
+  sudo systemctl start esidx
 
-then an ETP client (Everything) can connect to $bind:$port. The locations are $ROOTSF -- once
-the service is running, editing that file adds or removes a location without a restart (the
-rebuild runs in a child process and the server keeps answering). The rest of the configuration
-is $DEFAULTCFG; logs are in the journal:
+then an ETP client (Everything) can connect to $bind:$port. Editing $ROOTSF adds or removes
+a location without a restart -- the rebuild runs in a child process and the server keeps
+answering. The rest of the configuration is $DEFAULTCFG; logs are in the journal:
 
   journalctl -u esidx -f
 

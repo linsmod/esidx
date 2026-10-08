@@ -486,6 +486,24 @@ if [ -n "$PORT" ] && [ -r "/proc/$EMB_PID/status" ]; then
         bad "the capability set is one capability" \
             "CapEff: $CAP, expected 0000000000000004 (CAP_DAC_READ_SEARCH)"
     fi
+    # The supplementary groups, pinned because getting them wrong is invisible: the process
+    # has to carry the target user's groups, not just its primary gid. Narrowed to the one
+    # gid, it is an identity no `sudo -u` produces and it silently reads *less* -- measured
+    # on r7000, where /home/wahaha is 0750 wahaha:wahaha and esidx belongs to wahaha: the
+    # serving process saw the directory and not one file in it, and the index came back
+    # 3.3M entries short with no error anywhere. `id -G` is the same list initgroups()
+    # resolves from /etc/group, so it is the expectation rather than a copy of the answer.
+    if [ -n "$WANT_UID" ]; then
+        WANT_GROUPS=$(id -G "$DROP_USER" 2>/dev/null | tr ' ' '\n' | sort -n | tr '\n' ' ')
+        GROUPS_NOW=$(awk '/^Groups:/{ for (i = 2; i <= NF; i++) print $i }' \
+                      "/proc/$EMB_PID/status" | sort -n | tr '\n' ' ')
+        if [ -n "$WANT_GROUPS" ] && [ "$GROUPS_NOW" = "$WANT_GROUPS" ]; then
+            ok "it carries $DROP_USER's groups ($GROUPS_NOW), so the index is that account's view"
+        else
+            bad "the drop carries the target user's supplementary groups" \
+                "Groups: ${GROUPS_NOW:-none}, expected $WANT_GROUPS"
+        fi
+    fi
     # The user is part of the banner on purpose: the line that reports the drop is at INFO,
     # and a default run shows no INFO -- so a banner without it leaves "which identity is
     # this service now" unanswerable at the level the service actually logs at.
@@ -640,7 +658,7 @@ if [ -n "$PORT" ]; then
 
             # The banner must say how many roots it is marking. A server that marked one and
             # said nothing would be the old refusal by another name.
-            if grep -q '2 roots to mark' "$TMP/mr.log"; then
+            if grep -q '2 locations to mark' "$TMP/mr.log"; then
                 ok "the banner says how many roots are being marked"
             else
                 bad "the banner says how many roots are being marked" \

@@ -42,13 +42,20 @@ Group=esidx
 # --reload-config is the one setting this unit reads *live*: /etc/esidx/roots is stat'ed
 # every 5 s, and an edit there rebuilds the index in a child process and swaps it in without
 # a restart -- the serve loop keeps answering while it runs. The path is not an ESIDX_ knob
-# on purpose: postinst, the docs and the first-build command all spell it this one way, and
-# a second spelling of where the locations live would be a second place for them to be wrong.
-# One limit, stated so it is not discovered the hard way: an edit made while the service is
-# STOPPED is not noticed (the watch seeds from the file at startup), so the first build, or
-# one after such an edit, is still the command postinst printed. And because the watcher
-# rebuild happens after the privilege drop, the newly added locations are sweep-repaired
-# until a restart -- the journal says so, at ERROR, when it happens.
+# on purpose: postinst, the docs and the file itself all spell it this one way, and a second
+# spelling of where the locations live would be a second place for them to be wrong.
+#
+# The comparison is also made at startup (design D11), against the locations the snapshot
+# covers, so there is no first-build command anywhere in this deployment: a fresh install
+# starts with an empty index and builds it, and an edit made while the service was stopped
+# is picked up when it comes back.
+#
+# The watcher is where the privilege drop still shows: the marks are placed at startup, and
+# after a swap they can only be moved by a process that still has CAP_SYS_ADMIN, which this
+# one is not. So when a swap lands on locations the marks do not cover, the server asks
+# systemd to restart it (Restart=always) -- it comes back, marks the new set before it drops,
+# and the index is event-driven from then on. That is the one restart in the design, it is
+# logged at ERROR with the reason, and it does not happen on a start that merely rebuilt.
 ExecStart=/usr/bin/esidx -v 3 serve ${ESIDX_DB} -p ${ESIDX_PORT} --bind ${ESIDX_BIND} --no-download --watch-embed --drop-to=${ESIDX_USER} --sweep=${ESIDX_SWEEP} --reload-config=/etc/esidx/roots
 Restart=always
 RestartSec=2

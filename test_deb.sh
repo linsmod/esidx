@@ -94,9 +94,10 @@ stat -c '        /var/lib/esidx: %U:%G %a' /var/lib/esidx 2>/dev/null || bad "/v
 [ -f /etc/default/esidx ] && ok "configuration /etc/default/esidx" || bad "no /etc/default/esidx"
 [ -f /etc/esidx/roots ] && ok "locations /etc/esidx/roots" || bad "no /etc/esidx/roots"
 [ -f /usr/lib/systemd/system/esidx.service ] && ok "unit" || bad "no unit"
-# Both are conffiles, so an upgrade leaves an edited copy alone. The unit does not read the
-# locations file at startup (--watch-embed takes them from the snapshot), but a dpkg upgrade
-# that overwrote it would silently discard a deployment's configuration.
+# Both are conffiles, so an upgrade leaves an edited copy alone. The unit reads the locations
+# file at startup as well as every 5 s (--reload-config), and compares it with what the
+# snapshot covers -- but a dpkg upgrade that overwrote it would still silently discard a
+# deployment's configuration.
 for c in /etc/default/esidx /etc/esidx/roots; do
     if grep -qx "$c" /var/lib/dpkg/info/esidx.conffiles 2>/dev/null; then
         ok "$c is a conffile"
@@ -112,17 +113,40 @@ grep -q 'esidx: warning: .*esidx/roots names' "$TMP/install.log" 2>/dev/null \
     && ok "postinst warns about a location that does not exist here" \
     || bad "postinst did not warn about /etc/esidx/roots naming a missing path"
 
-stage "4. the first snapshot, as the service user"
-# Built from this machine's tree rather than from the packaged roots file, because the
-# packaged one names /work. The *spelling* is the one postinst printed, which is the thing
-# under test: --roots-file= is how a deployment's list reaches esidx.
+stage "4. the first snapshot -- built by the service, not by this script"
+# No build command is run here, and that is the assertion: writing the locations file and
+# (re)starting the unit is the whole of a deployment now (design D11). The server compares
+# /etc/esidx/roots with what its snapshot covers at startup, and on a fresh install there is
+# no snapshot at all -- which is a disagreement, so it builds one, in a child process, as the
+# user it drops to. That identity is the point: the index is a view of what *it* may read,
+# and a build run by this script as root would quietly produce a different one.
 printf '%s\n' "$TREE" > /etc/esidx/roots
-sudo -u esidx /usr/bin/esidx build --roots-file=/etc/esidx/roots -o "$DB" 2>&1 | tail -2 | sed 's/^/   /'
-[ -f "$DB" ] && ok "snapshot: $(stat -c '%U:%G %s bytes' "$DB")" || bad "no snapshot"
+note "locations: $(tr '\n' ' ' < /etc/esidx/roots)"
+systemctl restart esidx
+n=0
+while [ "$n" -lt 60 ]; do
+    [ -f "$DB" ] && break
+    n=$((n + 1)); sleep 1
+done
+if [ -f "$DB" ]; then
+    ok "the service built it in ${n}s: $(stat -c '%U:%G %s bytes' "$DB")"
+else
+    bad "no snapshot after ${n}s -- the service did not build one"
+    journalctl -u esidx --no-pager -n 20 | sed 's/^/   /'
+fi
 
-stage "5. systemctl start"
-systemctl start esidx
+stage "4b. a restart that has nothing to do"
+# The other half of the same rule: after the swap the snapshot carries the locations it was
+# built from, so a start that finds the two in agreement must not scan anything again. The
+# file's size and mtime are the observable -- a rebuild would rewrite it.
+before=$(stat -c '%Y %s' "$DB" 2>/dev/null)
+systemctl restart esidx
 sleep 3
+after=$(stat -c '%Y %s' "$DB" 2>/dev/null)
+[ "$before" = "$after" ] && ok "no rebuild: file and snapshot already agree" \
+                         || bad "the snapshot changed on a restart that had nothing to do"
+
+stage "5. the running service"
 [ "$(systemctl is-active esidx)" = active ] && ok "active" || bad "state: $(systemctl is-active esidx)"
 journalctl -u esidx --no-pager -n 10 | sed 's/^/   /'
 pid=$(pgrep -x esidx | head -1)
@@ -213,20 +237,39 @@ if [ "$HAVE_PROBE" = 1 ]; then
                 else
                     bad "a location added to /etc/esidx/roots was never served"
                 fi
+                # D11: the marks are placed before the privilege drop and cannot be moved
+                # after it, so a swap onto locations they do not cover costs one automatic
+                # restart -- the process stops itself, systemd brings it back (Restart=always)
+                # and the new process marks the new set before it drops. That is the design
+                # now, so "MainPID unchanged" is not the assertion; the journal line saying
+                # *why* is, together with what the restart buys (below).
                 if [ -n "$pid0" ] && [ "$pid0" = "$pid1" ]; then
-                    ok "without a restart (MainPID $pid1 unchanged)"
+                    ok "in one process (MainPID $pid1 unchanged) -- the marks already covered it"
+                elif journalctl -u esidx --no-pager -n 400 2>/dev/null \
+                        | grep -q 'stopping so systemd restarts this service'; then
+                    ok "restarted on purpose ($pid0 -> $pid1), and the journal says why"
                 else
-                    bad "the service restarted ($pid0 -> $pid1); --reload-config is not wired"
+                    bad "MainPID changed ($pid0 -> $pid1) with no line saying why"
                 fi
-                # The structural degradation of the embedded form, pinned so the line the
-                # operator is told to watch cannot quietly disappear: the watcher cannot be
-                # re-opened after the drop, so the new location is sweep-only and the journal
-                # says so at ERROR.
-                if journalctl -u esidx --no-pager -n 30 2>/dev/null \
-                        | grep -q 'reload-config: the watcher could not be rebuilt'; then
-                    ok "journal says the new location is sweep-only (watcher rebuild post-drop)"
+                # What the restart buys, which is the real assertion: the new location is
+                # event-driven rather than sweep-only. A file created under TREE2 has to be
+                # served in seconds; the sweep is hourly (ESIDX_SWEEP=3600), so anything that
+                # only the sweep could have found would not arrive inside this loop.
+                if [ -w "$TREE2" ]; then
+                    tag="esidx-deb-tree2-$$"
+                    touch "$TREE2/$tag"
+                    e1=0
+                    for i in $(seq 1 10); do
+                        sleep 2
+                        e1=$(probe "$tag" | grep -c '^ROW ' || true)
+                        [ "$e1" -gt 0 ] && break
+                    done
+                    rm -f "$TREE2/$tag"
+                    [ "$e1" -gt 0 ] \
+                        && ok "and it is event-driven: a file under the new location appears without a sweep" \
+                        || bad "a file created under $TREE2 never appeared -- the new location is sweep-only"
                 else
-                    bad "no ERROR line about the watcher rebuild -- is the unit not --watch-embed?"
+                    note "SKIPPED: $TREE2 is not writable here"
                 fi
             fi
         fi

@@ -1643,6 +1643,52 @@ static int reload_swap(esidx_t *db, const char *live, const char *tmp)
     return 0;
 }
 
+/* The locations the watcher was opened for. Kept because the marks are the one thing in
+ * this process that cannot be corrected later: moving them needs CAP_SYS_ADMIN, which is
+ * gone once the process has dropped it, so after a swap "do the marks still cover the
+ * index I am serving" can only be answered from a record of what was marked (D11). */
+static char    *g_watch_roots[ESIDX_MAX_ROOTS];
+static uint32_t g_nwatch_roots = 0;
+
+static void watch_roots_remember(char *const *roots, uint32_t n)
+{
+    esidx_roots_free(g_watch_roots, g_nwatch_roots);
+    g_nwatch_roots = 0;
+    for (uint32_t i = 0; i < n && i < ESIDX_MAX_ROOTS; i++) {
+        g_watch_roots[i] = strdup(roots[i]);
+        if (g_watch_roots[i]) g_nwatch_roots++;
+    }
+}
+
+/* One location named two ways: a '/' at the end of either is not a difference. The
+ * locations file is the request and the snapshot is the record, and neither a trailing
+ * slash nor the order they were typed in says anything about what was asked for. */
+static bool path_same(const char *a, const char *b)
+{
+    size_t la = strlen(a), lb = strlen(b);
+    while (la > 1 && a[la - 1] == '/') la--;
+    while (lb > 1 && b[lb - 1] == '/') lb--;
+    return la == lb && !strncmp(a, b, la);
+}
+
+/* Does this index cover exactly these locations? Order-insensitive, because the snapshot
+ * records them in scan order and a file whose two lines changed places has not asked for
+ * anything it did not ask for before. */
+static bool roots_match(const esidx_t *db, char *const *want, uint32_t n)
+{
+    if (esidx_nroots(db) != n) return false;
+    char have[PATH_MAX];
+    for (uint32_t i = 0; i < n; i++) {
+        bool found = false;
+        for (uint32_t j = 0; j < n && !found; j++) {
+            path_of(db, esidx_root(db, j), have, sizeof(have));
+            found = path_same(want[i], have);
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
 /* The in-flight rebuild, if any. pid 0 means none is running. */
 typedef struct { pid_t pid; char tmp[PATH_MAX]; } reload_t;
 
@@ -1673,9 +1719,12 @@ static void reload_reap(esidx_t *db, const etp_opts_t *opts, esidx_watch_t **wat
     }
     if (reload_swap(db, opts->dbfile, rl->tmp) != 0) { unlink(rl->tmp); return; }
 
-    /* The marks are per mount and per prefix, and both just changed: a location on a
-     * filesystem that was not marked before produces no events at all until it is. So the
-     * watcher is rebuilt rather than reused.
+    /* The marks are per mount and per prefix, and both may have just changed: a location
+     * on a filesystem that was not marked before produces no events at all until it is.
+     * So the watcher is rebuilt rather than reused -- but only when the set it was opened
+     * for is no longer the set this index covers. A start that marked the locations it was
+     * about to index (D11) lands here with the two already equal, and reopening would be
+     * an EPERM reported as a failure for a watcher that is in fact correct.
      *
      * The new one is opened *before* the old one is closed, because in the embedded form
      * the rebuild structurally cannot succeed: fanotify_init needs CAP_SYS_ADMIN, this
@@ -1688,7 +1737,7 @@ static void reload_reap(esidx_t *db, const etp_opts_t *opts, esidx_watch_t **wat
      * A rebuild that fails is still logged at ERROR and says which half is broken --
      * because the alternative reading, "the index is fine", is what a frozen index looks
      * like from the outside. */
-    if (*watch) {
+    if (*watch && !roots_match(db, g_watch_roots, g_nwatch_roots)) {
         char err[256];
         char roots_buf[ESIDX_MAX_ROOTS][PATH_MAX];
         char *roots[ESIDX_MAX_ROOTS];
@@ -1707,13 +1756,25 @@ static void reload_reap(esidx_t *db, const etp_opts_t *opts, esidx_watch_t **wat
         if (nw) {
             esidx_watch_close(*watch);
             *watch = nw;
+            watch_roots_remember(roots, n);
             *pending_marks = 0;
             LOGI("reload-config: watcher rebuilt for %u location%s", n, n == 1 ? "" : "s");
         } else {
             LOGE("reload-config: the watcher could not be rebuilt for the new locations "
                  "(%s) -- the OLD one is kept and changes under the locations this index "
                  "already held keep arriving; the new ones are repaired only by the sweep "
-                 "or --refresh. Restart to make the new locations event-driven.", err);
+                 "or --refresh.", err);
+            /* A restart fixes this completely and is the one thing this process cannot do
+             * for itself from here (D10: the embedded form cannot reopen the group after
+             * the drop). Under systemd, take it -- an index whose events are missing is
+             * the failure that looks like a frozen server. Under anything else, stay up:
+             * a process nobody will restart must not stop, and the line above is what a
+             * human acts on. */
+            if (opts->watch_embed && getenv("INVOCATION_ID")) {
+                LOGE("reload-config: stopping so systemd restarts this service with the "
+                     "marks the index it is now serving needs");
+                g_stop = 1;
+            }
         }
     }
     /* The snapshot on disk is now the one in memory, so a --save timer must not consider
@@ -1781,12 +1842,40 @@ int etp_serve(const etp_opts_t *opts)
         esidx_index_apply(&db, mask, src);
     }
     uint64_t t0 = ts_us();
-    if (esidx_load(&db, opts->dbfile) != 0) {
+    /* D11: a snapshot that is not there is a state, not an error -- "nothing has been
+     * indexed yet" is something this server can serve while the locations are built, and
+     * the build is the child below, running as the identity this process becomes (--drop-to),
+     * which is where an index gets its view of what may be read. A snapshot that *is* there
+     * and does not load is still refused: that file is not an index, and starting empty over
+     * it would hide a corrupt file or a wrong path behind a service that looks healthy. */
+    struct stat dbsb;
+    bool have_snapshot = stat(opts->dbfile, &dbsb) == 0;
+    if (have_snapshot && esidx_load(&db, opts->dbfile) != 0) {
         fprintf(stderr, "cannot load %s\n", opts->dbfile);
         esidx_free(&db);
         return -1;
     }
+    if (!have_snapshot)
+        LOGI("no snapshot at %s yet; starting with an empty index", opts->dbfile);
     double lms = (double)(ts_us() - t0) / 1000.0;
+
+    /* --- what the locations file asks for, against what the snapshot covers --- (D11)
+     * The snapshot is the record of what the last build covered; the file is the request.
+     * Comparing them is what makes a first install and an edit made while the service was
+     * stopped the same event as an edit made while it runs -- neither needs a command run
+     * by hand, and after the swap the snapshot carries the new list, so the next start
+     * finds them equal and builds nothing. */
+    char    *want[ESIDX_MAX_ROOTS];
+    uint32_t nwant = 0;
+    bool     build_now = false;
+    for (uint32_t i = 0; i < ESIDX_MAX_ROOTS; i++) want[i] = NULL;
+    if (opts->reload_config) {
+        /* A file that cannot be read is not fatal here: the server serves the snapshot it
+         * has, and the 5 s tick reports the same thing from its own side, once. */
+        if (esidx_roots_read_file(opts->reload_config, want, ESIDX_MAX_ROOTS, &nwant) != 0)
+            nwant = 0;
+        build_now = nwant > 0 && !roots_match(&db, want, nwant);
+    }
 
     /* The epoch the snapshot on disk corresponds to. Read before the repair pass, so a
      * repair that changed something is a change this process is responsible for saving
@@ -1813,22 +1902,30 @@ int etp_serve(const etp_opts_t *opts)
     if (opts->watch_sock || opts->watch_embed) {
         char roots_buf[ESIDX_MAX_ROOTS][PATH_MAX];
         char *roots[ESIDX_MAX_ROOTS];
-        uint32_t nroots = esidx_nroots(&db);
+        /* D11: the set to mark is the set the index is about to cover -- the wanted one
+         * when a build is starting, even though the snapshot may still be empty. Marks
+         * need CAP_SYS_ADMIN, so this point, before the drop, is the only one at which
+         * they can be placed; marking the snapshot's list here is what would leave a
+         * freshly built index with no events until something restarted the service. */
+        uint32_t nroots = build_now ? nwant : esidx_nroots(&db);
         if (nroots > ESIDX_MAX_ROOTS) {
             fprintf(stderr, "watch: the snapshot names %u roots, past the %u this frame holds\n",
                     nroots, (unsigned)ESIDX_MAX_ROOTS);
+            esidx_roots_free(want, nwant);
             esidx_free(&db);
             return -1;
         }
         for (uint32_t i = 0; i < nroots; i++) {
+            if (build_now) { roots[i] = want[i]; continue; }
             path_of(&db, esidx_root(&db, i), roots_buf[i], PATH_MAX);
             roots[i] = roots_buf[i];
         }
         char err[256];
         /* How many locations there are, before anything opens: a watcher that silently
          * covered some of them is the failure this whole layer is about. */
-        LOGI("watch: %u root%s to mark, from the snapshot: %s%s", nroots,
-             nroots == 1 ? "" : "s", roots[0], nroots > 1 ? " ..." : "");
+        LOGI("watch: %u location%s to mark, %s: %s%s", nroots, nroots == 1 ? "" : "s",
+             build_now ? "the ones about to be indexed" : "from the snapshot",
+             nroots ? roots[0] : "(none)", nroots > 1 ? " ..." : "");
         if (opts->watch_embed) {
             /* Bare --watch-embed marks the snapshot's own roots: the trees whose events make
              * this index current are the trees that were indexed, so there is no second opinion
@@ -1847,7 +1944,8 @@ int etp_serve(const etp_opts_t *opts)
             if (rl && !named) {
                 fprintf(stderr, "watch: --watch-embed=%s is not one of the snapshot's %u root%s "
                                 "(%s)\n", opts->watch_embed, nroots, nroots == 1 ? "" : "s",
-                        roots[0]);
+                        nroots ? roots[0] : "none");
+                esidx_roots_free(want, nwant);
                 esidx_free(&db);
                 return -1;
             }
@@ -1869,6 +1967,7 @@ int etp_serve(const etp_opts_t *opts)
                 if (!pw || !pw->pw_name) {
                     fprintf(stderr, "watch: cannot tell who owns %s; pass --drop-to=USER\n",
                             opts->dbfile);
+                    esidx_roots_free(want, nwant);
                     esidx_free(&db);
                     return -1;
                 }
@@ -1889,11 +1988,39 @@ int etp_serve(const etp_opts_t *opts)
              * server that answers from a frozen index and logs nothing, which is the
              * failure mode this layer exists to remove. */
             fprintf(stderr, "watch: %s\n", err);
+            esidx_roots_free(want, nwant);
             esidx_free(&db);
             return -1;
         }
+        watch_roots_remember(roots, nroots);
     }
-    if (opts->refresh_secs > 0 || watch || opts->sweep_secs > 0) {
+
+    /* --- a start whose locations file disagrees with the snapshot --- (D11)
+     * Forked here rather than before the watcher opened, because the child has to run as
+     * the identity this process has just become: the index is a view of what *that* user
+     * may read, and a build forked before the drop would hand a root child to a deployment
+     * whose whole point is that nothing here is root. The serve loop answers while it
+     * runs -- from the snapshot it has, or from an empty index when there is none. */
+    reload_t rl = { .pid = 0 };
+    if (build_now) {
+        snprintf(rl.tmp, sizeof(rl.tmp), "%s.reload", opts->dbfile);
+        unlink(rl.tmp);   /* a previous attempt's leftovers, if any */
+        LOGI("locations: %s names %u location%s, the snapshot covers %u; building %s in a "
+             "child (this server answers from %s while it runs)",
+             opts->reload_config, nwant, nwant == 1 ? "" : "s", esidx_nroots(&db), rl.tmp,
+             have_snapshot ? "the index it has" : "an empty index");
+        rl.pid = spawn_build(opts->reload_config, rl.tmp);
+    }
+    /* The wanted list has done its work: the watcher has its own copy and the child was
+     * handed the file, not the array. */
+    esidx_roots_free(want, nwant);
+    /* An index with no locations has nothing to sweep and has never been finalized, so
+     * asking costs an ERROR from esidx_sweep_dirs ("the index has not been finalized")
+     * that means nothing -- measured on r7000's first start under D11, where the server
+     * comes up empty and the build is already running in a child. An error line that
+     * carries no information is worse than none: it is the first thing an operator looks
+     * at, and it points at a failure that is not one. */
+    if ((opts->refresh_secs > 0 || watch || opts->sweep_secs > 0) && esidx_nroots(&db) > 0) {
         /* The startup pass sweeps, where --refresh on its own did not, and the reason is
          * what this pass is for. "Whatever happened while the server was down" is only
          * covered if every directory is compared, because a change at depth >= 2 moves the
@@ -1976,8 +2103,11 @@ int etp_serve(const etp_opts_t *opts)
         char root[PATH_MAX];
         /* The first root, named in the banner because it is the one an operator will
          * recognise; how many there are, and which mounts are marked, are their own lines
-         * below. A banner that listed all of them would be unreadable at 64. */
-        path_of(&db, esidx_root(&db, 0), root, sizeof(root));
+         * below. A banner that listed all of them would be unreadable at 64.
+         * "no locations yet" is the D11 state -- a start with nothing indexed -- and the
+         * banner has to be able to say so rather than read a root that is not there. */
+        if (esidx_nroots(&db) == 0) snprintf(root, sizeof(root), "(no locations yet)");
+        else path_of(&db, esidx_root(&db, 0), root, sizeof(root));
         /* Saying what the subscription does *not* cover is part of the banner: names
          * become current, attributes do not (§12 risk 8), and an operator reading only
          * the first line would otherwise assume otherwise. The middle clause is the other
@@ -2024,9 +2154,9 @@ int etp_serve(const etp_opts_t *opts)
     cfgid_t cfg_last = opts->reload_config ? cfg_stat(opts->reload_config) : (cfgid_t){ 0 };
     bool    cfg_missing = false;
     uint64_t next_cfg   = ts_us() + CONFIG_POLL_US;
-    /* The in-flight rebuild, its reap and this tick's stat being separate calls is what
-     * keeps the serve loop answering while a build runs. */
-    reload_t rl = { .pid = 0 };
+    /* `rl` holds the in-flight rebuild -- including one this start began (D11) -- and its
+     * reap and this tick's stat being separate calls is what keeps the serve loop
+     * answering while a build runs. */
 
     /* Either mechanism can change the index, and a server that changed it and exits without
      * writing is a day of work thrown away -- so the clean-exit save is keyed on this, not

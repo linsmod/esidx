@@ -658,6 +658,17 @@ eid_t    esidx_root(const esidx_t *db, uint32_t i);
  * test, the watcher's overflow mark -- this walks a list of a handful of entries,
  * which is cheaper than the hash lookup that would answer the same question. */
 bool     esidx_is_root(const esidx_t *db, eid_t id);
+/* Read a locations file: one absolute path per line, '#' comments and blank lines
+ * ignored, into `out` (caller-allocated, `cap` slots; each filled slot is a strdup the
+ * caller frees with esidx_roots_free()). `*nout` is appended to, so a caller that already
+ * has roots on a command line composes the two. Returns 0, or -1 after reporting the
+ * line that could not be used.
+ *
+ * Shared -- `build`, `update` and the server's own reload all read this shape -- because
+ * a list that means one thing has to be spelled one way: two readers is how the packaged
+ * unit and the command an operator is told to run drift apart (design D11). */
+int  esidx_roots_read_file(const char *path, char **out, uint32_t cap, uint32_t *nout);
+void esidx_roots_free(char **v, uint32_t n);
 /* Bring a built index back in line with the filesystem (design §7). */
 #define EU_DEEP 0x1u   /* stat every entry, not just directories whose stamp moved */
 /* Do not compact, even past the tombstone threshold below. A batch caller wants the

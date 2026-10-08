@@ -2023,6 +2023,65 @@ silently does nothing is worse than none" rule and break the requirement this de
 exists to satisfy; a service that is up, correct-as-of-now and event-driven about everything
 but the newest location is the better of the two provided the log line is there.
 
+### D11 — The snapshot records what was indexed; the locations file states what is wanted
+
+**Decision**: at startup, with `--reload-config=PATH`, `serve` reads `PATH` and compares its
+locations against the locations the snapshot covers (`esidx_nroots()`/`esidx_root()`, trailing
+slashes stripped, order-insensitive). If they disagree — **including the case where there is no
+snapshot at all** — it starts the same child-process build D10 uses, immediately, and goes on
+answering. A missing snapshot is therefore no longer fatal: the server starts with an empty
+index. A snapshot that exists and cannot be loaded still is.
+
+**Reason**: the deployment requirement is *install the package and be done; nothing to run
+afterwards*. D10 delivered half of it: an edit made while the service runs is applied. The two
+moments it left out are exactly the two an operator cannot be asked to cover by hand:
+
+- **first install** — there is no snapshot, and the server used to refuse to start at all, so
+  `postinst` had to print a `sudo -u esidx esidx build ...` line;
+- **an edit made while the service was stopped** — D10 seeds the file's identity at startup
+  ("so that starting a server does not immediately look like an edit"), so such a change is
+  invisible for as long as the server lives, and that is the reason the same printed line had a
+  second paragraph of caveats.
+
+Both are one fact seen from two ends: **the snapshot is the record of what the last build
+covered, and the file is the request.** Comparing them is one rule instead of two exceptions,
+and it is self-clearing — after the swap the snapshot carries the new list, so the next start
+finds them equal and builds nothing.
+
+Five details are decisions:
+
+- **No snapshot is an empty index, not a refusal.** The index is built by the service's own
+  child, as the identity the service became (`--drop-to`), which is where "the index is a view
+  of what that identity may read" comes from; a human running `build` by hand can only get that
+  wrong. What the first minute looks like from a client is an honest "nothing here yet" rather
+  than a connection refused, and the swap lands without anyone being told.
+- **A snapshot that exists and does not load stays fatal.** The two cases are separated by a
+  `stat` first, because they are not the same event: a missing file is "nothing has been
+  indexed", a file that will not parse is "this is not an index", and starting empty over the
+  second would hide a corrupt or wrong path behind a service that looks healthy.
+- **The watcher marks the set the index is about to cover, not the set it covers now.** Marks
+  need CAP_SYS_ADMIN, so the only moment they can be placed is before the drop, and at that
+  moment the snapshot may still be empty. Marking the *wanted* set is what makes a first index
+  event-driven from its own swap instead of from the next restart.
+- **After a swap the watcher is rebuilt only if the set moved**, and when it cannot be — the
+  embedded form, D10 — and systemd is the supervisor (`INVOCATION_ID` in the environment), the
+  server exits so that it is restarted and comes back with the marks the new index needs. Under
+  any other supervisor it does not: a process nobody will restart must not stop, and the
+  existing ERROR line keeps saying what restart would fix.
+- **A locations file that is missing, empty or names nothing means "build nothing".** The server
+  serves the snapshot it has and the 5 s watch stays armed, so writing the first location in
+  later is the same event as adding one.
+
+**Cost**: a start that finds them equal is one file read and a handful of `strcmp`. A start that
+does not is one full scan, in a child, while the server answers — the same cost D10 already
+charges for an edit, now paid at the one moment when nobody has typed anything yet.
+
+**What this does not do**: it does not put the scan in `postinst`. A maintainer script has no
+tty, dpkg has its own timeouts, and a half-installed package is worse than a service that is up
+and empty. The package installs, enables and starts the unit; the scan happens inside the
+service, as the service identity, where its failures are a journal line instead of an aborted
+`dpkg -i`.
+
 ---
 
 

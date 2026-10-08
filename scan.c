@@ -378,6 +378,42 @@ int esidx_scan(esidx_t *db, char *const *roots, uint32_t nroots)
     return 0;
 }
 
+int esidx_roots_read_file(const char *path, char **out, uint32_t cap, uint32_t *nout)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        LOGE("cannot read %s: %s", path, strerror(errno));
+        return -1;
+    }
+    char line[PATH_MAX];
+    while (fgets(line, sizeof(line), f)) {
+        char *s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        size_t len = strlen(s);
+        while (len && (s[len - 1] == '\n' || s[len - 1] == '\r' ||
+                       s[len - 1] == ' '  || s[len - 1] == '\t')) s[--len] = '\0';
+        if (!*s || *s == '#') continue;
+        if (s[0] != '/') {
+            LOGE("%s: %s is not an absolute path", path, s);
+            fclose(f);
+            return -1;
+        }
+        if (*nout >= cap) {
+            LOGE("%s: more than %u locations", path, cap);
+            fclose(f);
+            return -1;
+        }
+        out[(*nout)++] = strdup(s);
+    }
+    fclose(f);
+    return 0;
+}
+
+void esidx_roots_free(char **v, uint32_t n)
+{
+    for (uint32_t i = 0; i < n; i++) free(v[i]);
+}
+
 const scan_stats_t *esidx_scan_stats(const esidx_t *db) { return &db->scan; }
 
 /* ==================================================================== update */

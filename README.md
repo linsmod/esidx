@@ -114,10 +114,11 @@ tarball cannot carry:
 - the **maintainer scripts**, which create the `esidx` system user, its group, and
   `/var/lib/esidx`, retire the two units an earlier package installed, and enable this one.
 
-It deliberately does not start it: the server refuses to run without a snapshot
-(`main.c`), and building the first one is a full scan of everything named in
-`/etc/esidx/roots`, which does not belong in a maintainer script. So `postinst` prints the
-two commands.
+It starts the service, but it does not build the index: the server runs without a snapshot
+(design D11) and builds the first one itself, as the user it drops to, in a child process —
+a full scan of everything named in `/etc/esidx/roots` has no place in a maintainer script,
+with its no-tty, dpkg's own timeouts and a half-installed package if it fails. `postinst`
+therefore ends with nothing for you to run.
 
 **The indexed locations are `/etc/esidx/roots`**, one absolute path per line, and that is
 where you add or remove one — not `/etc/default/esidx`, because a list of paths cannot be a
@@ -128,20 +129,21 @@ as the mount point rather than as the directory behind it. A location may not ap
 or inside another, and `esidx build` refuses such a set *before* walking anything — together
 they would give every file below them two rows, which nothing downstream can undo.
 
-The unit watches the roots file (`--reload-config`): once the service is running, editing
-`/etc/esidx/roots` is enough — it is noticed within seconds (a stat every 5 s), the new
-index is built in a **child process** and swapped in **without a restart**, and the serve
-loop keeps answering while it runs. Two limits, both stated so they are not discovered the
-hard way: an edit made while the service is *stopped* is not noticed (the watch seeds from
-the file at startup), so the first build, or one after such an edit, is still:
+The unit watches the roots file (`--reload-config`), and the server compares it with what
+the snapshot covers **both at startup and every 5 s while it runs** (design D11): the file
+is the request and the snapshot is the record, and whenever the two disagree the index is
+rebuilt in a **child process** and swapped in **without a restart**, the serve loop
+answering throughout. So there is no build command anywhere in this deployment — not before
+the first start, not after an upgrade, and not for an edit made while the service was
+stopped, which the next start picks up. A fresh install starts on an empty index and fills
+it in; the snapshot on disk is rewritten from whatever is swapped in, so a restart comes
+back up on the locations that are there now and finds nothing to do.
 
-```sh
-sudo -u esidx esidx build --roots-file=/etc/esidx/roots -o /var/lib/esidx/root.idx
-```
-
-and because the event watcher cannot be re-opened after the privilege drop, changes
-*under* a newly added location are noticed by the hourly sweep rather than immediately,
-until a restart — the journal says so, at ERROR, when it happens.
+One consequence of the privilege drop, stated so it is not discovered the hard way: the
+event marks are placed before the drop and cannot be moved after it, so when a swap lands
+on locations they do not cover, the server asks systemd to restart it — it comes back,
+marks the new set, and is event-driven from then on. That is the one restart in the design,
+logged at ERROR with the reason, and it does not happen on a start that merely rebuilt.
 
 A snapshot may cover several locations: `parent:""` and `root:` are then the **union** of
 their top levels, which is what a client showing one volume with several trees underneath
