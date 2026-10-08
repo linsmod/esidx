@@ -72,8 +72,13 @@ L3 scans or uses a specialised index.
 |---|---|---|
 | `parent:"P"` | directory tree `dir_id → children[]` plus a `path → dir_id` hash | O(1) |
 | `depth:N` | inline `depth` column | O(1) |
-| `root:` | `parent_id == ROOT` | O(1) |
+| `root:` | the union of every root's children (`parent_id == EID_NONE`) | O(roots) |
 | `child:"X"` | resolve `X` to a candidate set, then take its parent set | depends on L2 |
+
+`parent:""` is `root:`'s twin and answers the same way: Everything reads it as "the top
+of a drive", so with several indexed locations it is their union. Both are O(roots)
+rather than O(1) because a root is an entry with no parent (D9) rather than a constant,
+and for the one-root index that is the same answer it always was.
 
 ### L1 — scalar / enum, via sorted arrays or bitmaps
 
@@ -1898,6 +1903,51 @@ and it is derived from a flag in the column dump, so a snapshot round trip needs
 reconciliation state at all — which is why the snapshot is still a plain dump of
 the columns and only gained the directory stamp.
 
+### D9 — An index has one *or more* roots, and a root is an entry with no parent
+
+**Decision**: `esidx_t` holds `roots[]` rather than one `root_eid`. `esidx_scan()`
+walks every root it is given, in the order given; `esidx_update()` reconciles all of
+them in one pass, or just the ones it is given; `esidx_compact()` rebuilds from all
+of them. A root is not recorded in the snapshot — it is *defined* as an entry whose
+`parent` is `EID_NONE`, so `esidx_load()` collects every such row while it rebuilds the
+children vectors and nothing extra is stored. `parent:""` and `root:` are the union of
+every root's top level, which for one root is the answer they already gave.
+
+**Reason**: the single root was never a decision, it was a field nobody had a reason
+to change — and it made "index two directories" impossible rather than awkward. The
+alternative was bind mounts into a staging tree, which costs the real paths: every
+path in the index, every path the client is shown and every `path:` term is rebuilt from
+the parent chain, so a staging root renames the whole tree as far as the protocol is
+concerned, and a component that reads the index has to know the mapping exists.
+
+Two properties of the shape are what make it cheap rather than a new mechanism:
+
+- **The list is derived, so the snapshot format does not move.** `ESIDX_VERSION` is
+  unchanged, and a snapshot written before this decision loads with `nroots == 1` —
+  the one row that had no parent is still the one row that has none. Measured: a
+  one-root snapshot written by this build and by the one before it is byte-identical,
+  and each reads the other's. The other direction degrades rather than breaks: an
+  *older* binary reading a two-root snapshot sees every row (they are ordinary rows)
+  but answers `parent:""` with one root's children, because it has no list to union.
+  That is a downgrade, not a corruption, and it is the reason nothing here needed a
+  version bump.
+- **A root set is checked before it is walked, not after.** Two roots naming the same
+  directory (dev+ino, so a symlinked second name is caught too) or one root under
+  another would add a second row for every file underneath, and once they are in the
+  index the duplicate is indistinguishable from the original: `path:` answers with two
+  ids, `count:` is twice the truth, and a client shows every file twice. There is no
+  downstream point at which that becomes visible and cheap to undo, so it is refused at
+  the only moment where the answer is still "nothing was built".
+
+**Not in this decision, and deliberately**: the watcher. `sfa` calls `fanotify_mark()`
+once, on one path, and a mark is per *mount* — so several roots on several filesystems
+need one mark each, which is a `watch.c` change and its own commit. Until it lands,
+`serve --watch` **refuses** a snapshot with more than one root rather than watching the
+first and reporting the rest as current, because a server that is up to date about one
+tree and frozen about the others is indistinguishable from one that is current about
+all of them. `serve` without `--watch` answers from a multi-root snapshot correctly;
+only the incremental half is missing.
+
 **Cost, measured**: memory grows with the tombstone ratio, and so does the
 per-query `bs_next` walk over the candidate words. Both are why compaction is
 automatic at 25 % rather than never — but §10 records that a tree whose *names*
@@ -2091,4 +2141,52 @@ the depth-1 case kept beside it as the control that has to keep working.
     servers' whole result sets and diffing the paths, which is now `cmp_ref.sh`'s
     `explain_delta` — it named the row and flagged it `ON DISK`, which is the only
     reason it was noticed rather than guessed at.
+
+13. **Several roots in one index: three consequences that are not bugs.**
+    - **`parent:""` and `root:` are the union of every root's top level.** Everything
+      reads `parent:""` as "the top of a drive", so with more than one indexed location
+      there is more than one top and the honest answer is all of them; for one root it
+      is byte-for-byte the answer they already gave. The client sees one volume whose
+      top level is the concatenation of the roots' children, which is a shape the
+      reference server has no way to produce and one Nothing does not expect — there is
+      no ETP command that reports volumes, so a multi-root index cannot describe
+      itself over the wire. Worth knowing before an operator wonders why their drive
+      list has one entry.
+    - **No reference server can confirm any of it.** `cmp_ref.sh` asks both servers the
+      same question over one directory they both index; a union of several roots has no
+      counterpart on `:21`, which is single-volume. So this capability is pinned
+      against `find(1)` **only** — the two-root fixture in `test.sh` compares the
+      index with `find(1)` over both trees — and every quoted number about it is a
+      fixture number. Nothing in §10 may be re-derived from `:21` for this shape.
+    - **`--watch` refuses more than one root** (until the watcher takes one mark per
+      mount). A server that is current about one tree and frozen about the others is
+      indistinguishable, from the log and from the client, from one that is current
+      about all of them, so it refuses rather than serving a partial answer. See §12.14.
+
+14. **A mark is per mount, and one mount is what the watcher marks.** `sfa` calls
+    `fanotify_mark()` once, on one path, with `FAN_MARK_MOUNT` (or
+    `FAN_MARK_FILESYSTEM` where the kernel refuses it, which covers the whole
+    superblock instead — `sfa/README.md:44-48` says so and `--probe` reports both).
+    That is enough for a single-location index and it has a hole that predates the
+    root list: **an index tree containing any nested mount point receives no events
+    from below it.** A bind mount, another filesystem mounted inside the tree, a
+    tmpfs, anything — `scan_dir()` descends through it (it is an ordinary `DT_DIR`
+    entry), so those files are in the index and are not in the event path. They are
+    repaired by `--sweep=SECS`, i.e. eventually, and until that lands the honest
+    statement for a tree with a mount point inside it is: **names below the mount
+    point lag by one sweep interval** (3600 s in the packaged unit).
+
+    The fix is not "one mark per root" — it is one mark per mount **the index
+    actually reaches**, discovered at startup by asking every indexed directory for
+    its mount id (`statx(STATX_MNT_ID)`, kernel 5.8+) and opening one `sfa` instance
+    per distinct one. `st_dev` is not a substitute: a bind mount shares its source's
+    superblock, so it has the same `st_dev` and a different vfsmount, and
+    `FAN_MARK_MOUNT` is per vfsmount. One scan pass over the directory ids already in
+    the index is enough, and the sweep already measures what one stat per directory
+    costs (94 ms for `/usr`'s 34 811, 1 9xx ms for `/work`'s 651 894 — this is the
+    cost at startup, once, not per interval).
+
+    Note for whoever implements it: grouping must follow the mark mode `sfa` actually
+    negotiated, not the one we would have picked — under `FAN_MARK_FILESYSTEM` one
+    instance per superblock is correct and one per mount id is merely wasteful.
 

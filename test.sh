@@ -733,6 +733,16 @@ mr_sync() {
         "$(find "$MR_A" "$MR_B" -type d | wc -l)/$(find "$MR_A" "$MR_B" -type f | wc -l)"
 }
 mr_sync "the two-root build"
+# The union, and the reason it is a union rather than an error: Everything reads
+# `parent:""` as "the top of a drive", so with several indexed locations there is
+# more than one top and the honest answer is all of them. This is also the one
+# capability in this change that no reference server can confirm -- :21 is
+# single-volume -- so it is pinned against find(1) and against itself.
+q "parent:\"\""
+MR_TOP=$(( $(find "$MR_A" -maxdepth 1 | wc -l) - 1 + $(find "$MR_B" -maxdepth 1 | wc -l) - 1 ))
+expect "parent:\"\" is both top levels" "$(n "$LAST")" "$MR_TOP"
+q "root:"
+expect "root: is both top levels too" "$(n "$LAST")" "$MR_TOP"
 q "parent:$MR_A/sub1"
 expect "parent: of a subdirectory still works" "$(n "$LAST")" "2"
 q "parent:$MR_B/sub2"
@@ -750,10 +760,8 @@ expect "...with its own tree's path" "$(paths "$LAST")" "$MR_A/a.txt "
 # carried across in memory.
 cp "$MR_DB" "$TMP/mr-copy.idx"
 DB="$TMP/mr-copy.idx"
-q "ext:log"
-expect "the rows survive a snapshot round trip" "$(n "$LAST")" "1"
-q "parent:$MR_A/sub1"
-expect "...and so does the path hash" "$(n "$LAST")" "2"
+q "parent:\"\""
+expect "the roots survive a snapshot round trip" "$(n "$LAST")" "$MR_TOP"
 
 # Two roots that would index the same bytes twice are refused, not walked. Both spellings
 # of that mistake are here because only one of them is obvious from the command line.

@@ -876,30 +876,36 @@ static int m_parent(qctx_t *c, const ast_t *t, bitset_t *out)
     char norm[4096];
     normalise_path(t->val ? t->val : "", norm, sizeof(norm));
     eid_t id = di_lookup(c->db, norm);
-    if (id == EID_NONE) {
-        /* Everything treats parent:"" as the top of a drive; we have exactly one
-         * root, so that is our root's children. */
-        if (norm[0] == '\0') id = c->db->root_eid;
-        else {
-            LOGD("parent: no such directory '%s'", norm);
-            bs_clear(out);
-            return 0;
-        }
-    }
     bs_clear(out);
-    children_t cv = di_children(c->db, id);
-    for (uint32_t i = 0, n = di_children_n(cv); i < n; i++) bs_set(out, di_child_at(cv, i));
+    if (id != EID_NONE) {
+        children_t cv = di_children(c->db, id);
+        for (uint32_t i = 0, n = di_children_n(cv); i < n; i++) bs_set(out, di_child_at(cv, i));
+        return 0;
+    }
+    if (norm[0] != '\0') {
+        LOGD("parent: no such directory '%s'", norm);
+        return 0;
+    }
+    /* Everything treats parent:"" as the top of a drive. With several indexed trees there
+     * is more than one top, so it is their union -- which for a one-tree index is exactly
+     * what it always was, and the empty set when there are no roots at all. */
+    for (uint32_t i = 0, n = esidx_nroots(c->db); i < n; i++) {
+        children_t cv = di_children(c->db, esidx_root(c->db, i));
+        for (uint32_t k = 0, m = di_children_n(cv); k < m; k++) bs_set(out, di_child_at(cv, k));
+    }
     return 0;
 }
 
 static int m_root(qctx_t *c, const ast_t *t, bitset_t *out)
 {
     (void)t;
-    eid_t r = c->db->root_eid;
     bs_clear(out);
-    if (r == EID_NONE) return 0;
-    children_t cv = di_children(c->db, r);
-    for (uint32_t i = 0, n = di_children_n(cv); i < n; i++) bs_set(out, di_child_at(cv, i));
+    /* The top level of every indexed tree, in root order. Identical to the one-root
+     * answer by construction: the union of one root's children is that root's children. */
+    for (uint32_t i = 0, n = esidx_nroots(c->db); i < n; i++) {
+        children_t cv = di_children(c->db, esidx_root(c->db, i));
+        for (uint32_t k = 0, m = di_children_n(cv); k < m; k++) bs_set(out, di_child_at(cv, k));
+    }
     return 0;
 }
 
@@ -1441,14 +1447,27 @@ static uint32_t est_leaf(qctx_t *c, const ast_t *t)
     const entry_t *e = find_entry(t->fn);
     if (!e || !e->indexed) return UINT32_MAX;
 
+    /* The cardinality of `parent:""` and `root:` is the *sum* over the roots, because
+     * both matchers return their union -- the estimate has to agree with the answer or
+     * the optimiser costs the wrong plan. One root makes the sum that root's count. */
     if (!strcmp(t->fn, "parent")) {
         char norm[4096];
         normalise_path(t->val ? t->val : "", norm, sizeof(norm));
-        eid_t id = (norm[0] == '\0') ? c->db->root_eid : di_lookup(c->db, norm);
+        if (norm[0] == '\0') {
+            uint32_t sum = 0;
+            for (uint32_t i = 0, n = esidx_nroots(c->db); i < n; i++)
+                sum += di_child_count(c->db, esidx_root(c->db, i));
+            return sum;
+        }
+        eid_t id = di_lookup(c->db, norm);
         return id == EID_NONE ? 0 : di_child_count(c->db, id);
     }
-    if (!strcmp(t->fn, "root"))
-        return c->db->root_eid == EID_NONE ? 0 : di_child_count(c->db, c->db->root_eid);
+    if (!strcmp(t->fn, "root")) {
+        uint32_t sum = 0;
+        for (uint32_t i = 0, n = esidx_nroots(c->db); i < n; i++)
+            sum += di_child_count(c->db, esidx_root(c->db, i));
+        return sum;
+    }
     if (!strcmp(t->fn, "file") || !strcmp(t->fn, "folder") ||
         !strcmp(t->fn, "directory")) {
         /* the function picks the set; only a `!=` / `!` comparison flips it */
