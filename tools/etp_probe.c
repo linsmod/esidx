@@ -45,6 +45,9 @@
  *   send <text>        send a command, read one reply with the client's rules,
  *                      print `REPLY <line>` per reply line received
  *   sendraw <text>     send without reading anything
+ *   burst <text>       several commands in one write, '\n' between them -- what a
+ *                      client that stopped waiting for the previous result looks
+ *                      like on the wire (design D12)
  *   query              read a query block (after a sendraw EVERYTHING QUERY),
  *                      print `COUNT <n>` and one `ROW ...` line per result
  *   rcvbuf <bytes>     shrink this connection's receive buffer, so that a client
@@ -132,6 +135,31 @@ static void send_line(const char *s)
     ssize_t off = 0;
     while (off < n) {
         ssize_t w = write(g_fd, buf + off, (size_t)(n - off));
+        if (w <= 0) break;
+        off += w;
+    }
+}
+
+/* Several commands in ONE write, separated by a literal \n in the script text.
+ *
+ * This is the wire shape of a client that stopped waiting: typing into Everything
+ * sends SEARCH and QUERY per keystroke, and while the server is still answering the
+ * previous keystroke the next pair lands behind it -- so what the server sees in one
+ * recv() is a queue in which everything but the last query is already stale (D12).
+ * `sendraw` four times cannot reproduce that deterministically: four writes are four
+ * chances for the server to read one and start working on it. */
+static void burst_lines(const char *s)
+{
+    char buf[MAX_LINE * 4];
+    size_t n = 0;
+    for (const char *p = s; *p && n + 2 < sizeof(buf); p++) {
+        if (p[0] == '\\' && p[1] == 'n') { buf[n++] = '\r'; buf[n++] = '\n'; p++; continue; }
+        buf[n++] = *p;
+    }
+    if (n + 2 < sizeof(buf)) { buf[n++] = '\r'; buf[n++] = '\n'; }
+    ssize_t off = 0;
+    while (off < (ssize_t)n) {
+        ssize_t w = write(g_fd, buf + off, n - (size_t)off);
         if (w <= 0) break;
         off += w;
     }
@@ -409,6 +437,8 @@ int main(int argc, char **argv)
             snprintf(last_reply, sizeof(last_reply), "%s", g_line);
         } else if (!strcmp(line, "sendraw")) {
             send_line(arg);
+        } else if (!strcmp(line, "burst")) {
+            burst_lines(arg);
         } else if (!strcmp(line, "rcvbuf")) {
             /* A client that stops reading still has a window -- Linux advertises one from its
              * own free receive space -- so on a small tree a non-reading client never stalls the

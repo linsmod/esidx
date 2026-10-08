@@ -192,6 +192,13 @@ typedef struct {
      * act on, since a socket says nothing about a peer that is simply not reading. */
     uint64_t stall_ms;
 
+    /* True while dispatching a command that has another one queued behind it on this
+     * connection -- the client re-queried before the loop reached this one, so the
+     * answer is already stale (D12). Set per line by client_read(), read by do_query().
+     * It is a field rather than an argument because the dispatch path is one
+     * `handle_command()` call shared by all 32 subcommands and only one of them cares. */
+    bool     more_queued;
+
     /* ---- state the 32 subcommands mutate (design §1.1) ---- */
     match_opts_t mo;
     /* CTL_BUF, not 4096, because a value arrives on a control line and a control line
@@ -459,9 +466,59 @@ static void cache_store(const esidx_t *db, client_t *c)
     c->cache_valid = true;
 }
 
+/* Has this client already sent something else? One peek, and it is the whole of
+ * "the client has moved on" (D12): a query is abandoned by its own connection, so
+ * the only question is whether that socket has more to say.
+ *
+ * MSG_PEEK rather than a byte count from FIONREAD: a count says how much is queued,
+ * which includes the tail of a command the loop has not parsed yet -- and a partial
+ * line is not a newer query. Peeking one byte answers the same question and cannot
+ * be confused by a reply of ours that the peer has not drained. */
+static bool client_moved_on(void *arg)
+{
+    client_t *c = arg;
+    if (c->fd < 0) return true;             /* gone: nothing is waiting for this */
+    char b;
+    ssize_t n = recv(c->fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (n > 0) return true;                 /* another command is already queued */
+    if (n == 0) return true;                /* the peer closed */
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return false;
+    return true;                            /* the socket is in trouble; stop */
+}
+
+/* Answer a query that will not be run: a complete, well-formed block with no rows.
+ *
+ * RESULT_COUNT 0 and not "the count it would have had", because the set was never
+ * produced and a count is a claim about a result nobody has. The block still has to
+ * be complete -- a reply that stops mid-sentence is the failure the fixed 1023-byte
+ * reply buffer and the OPTS UTF8 hang in AGENTS.md 1.4 both were: the client waits
+ * for a terminator that never arrives.
+ *
+ * The result cache is *invalidated* rather than filled: an abandoned query stored as
+ * "this search matches nothing" would make the next QUERY for the same text answer
+ * from the cache instead of running. */
+static void answer_empty(const esidx_t *db, client_t *c, const char *why)
+{
+    LOGI("query: '%s' abandoned -- %s; answering with an empty block", c->search, why);
+    qset_free(&c->cache);
+    memset(&c->cache, 0, sizeof(c->cache));
+    c->cache.ids = malloc(1);
+    c->cache_valid = false;
+    send_query_results(db, c, &c->cache);
+}
+
 static void do_query(const esidx_t *db, client_t *c)
 {
     uint64_t t0 = ts_us();
+
+    /* A newer command behind this one means the client re-queried before the loop got
+     * here: typing into Everything sends SEARCH and QUERY per keystroke, so the queue
+     * on a live connection is stale work. This is the same rule as the probe above,
+     * applied before the query starts rather than while it runs. */
+    if (c->more_queued) {
+        answer_empty(db, c, "a newer command was already waiting on this connection");
+        return;
+    }
 
     if (cache_matches(db, c)) {
         LOGI("query: cache hit, '%s' re-sliced at offset %u of %u",
@@ -498,7 +555,13 @@ static void do_query(const esidx_t *db, client_t *c)
     c->mo.filter_search = c->filter_search[0] ? c->filter_search : NULL;
 
     qset_t set;
-    if (qexec(db, ast, &c->mo, sort, &set) != 0) {
+    int rc = qexec(db, ast, &c->mo, sort, &set, client_moved_on, c);
+    if (rc == 1) {                 /* abandoned mid-execution (D12) */
+        ast_free(ast);
+        answer_empty(db, c, "the client sent another command while it ran");
+        return;
+    }
+    if (rc != 0) {
         LOGE("query: execution failed");
         ast_free(ast);
         c_reply(c, "500 Query failed.\r\n");
@@ -1328,7 +1391,12 @@ static void client_read(const etp_opts_t *o, const esidx_t *db, client_t *c)
              * buffers above turned out to be -- one reply line and one search -- and it
              * is worth not looking like a third. */
             memcpy(line, start, strlen(start) + 1);
+            /* Set for this command only: whatever is left in the buffer after this
+             * line belongs to commands the client sent *after* it asked for this one,
+             * which is what makes this one stale (D12). */
+            c->more_queued = (size_t)(nl + 1 - c->rbuf) < c->rlen;
             handle_command(o, db, c, line);
+            c->more_queued = false;
             if (c->fd < 0) return;
             start = nl + 1;
         }

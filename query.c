@@ -2161,8 +2161,9 @@ static uint32_t number_leaves(ast_t *t, uint32_t next)
 }
 
 int qexec(const esidx_t *db, const ast_t *ast_in, const match_opts_t *mo,
-          sort_spec_t sort, qset_t *out)
+          sort_spec_t sort, qset_t *out, qexec_cancel_fn cancel, void *cancel_arg)
 {
+#define ABANDONED() (cancel && cancel(cancel_arg))
     memset(out, 0, sizeof(*out));
     out->driver = UINT32_MAX;
     if (!db || db->et.count == 0) return 0;
@@ -2221,6 +2222,12 @@ int qexec(const esidx_t *db, const ast_t *ast_in, const match_opts_t *mo,
     /* ---- step 4: the FILTER_* second stage ---- */
     if (mo) apply_filter(&c, &set);
 
+    /* D12: the match is done, and everything after here is work done for a client
+     * that may already have typed another character. Asking costs one call into the
+     * caller -- no syscall of its own -- and what it can save is the rest of the
+     * query: on the 8.9M-entry index, 1 778 ms of sorting and the whole reply. */
+    if (ABANDONED()) goto abandoned;
+
     uint32_t total = bs_count(&set);
     uint32_t ndir = 0, nfile = 0;
     for (uint32_t i = bs_next(&set, 0); i < c.n; i = bs_next(&set, i + 1)) {
@@ -2261,6 +2268,10 @@ int qexec(const esidx_t *db, const ast_t *ast_in, const match_opts_t *mo,
     sc.desc = sort.desc;
     if (sc.key == SORT_RECENTLY_CHANGED)
         LOGD("sort: no date_recently_changed column; ordering by mtime instead");
+
+    /* The second check, before the key extraction: with a large matched set that
+     * stage is the other half of what the sort costs. */
+    if (ABANDONED()) { sc_done(&sc); goto abandoned; }
 
     srec_t *rows = malloc((size_t)total * sizeof(srec_t));
     foldarena_t fa;
@@ -2325,6 +2336,17 @@ int qexec(const esidx_t *db, const ast_t *ast_in, const match_opts_t *mo,
     if (unranked) rank_pending(db, rows, total, unranked);
     out->t_key_us = ts_us() - t_key0;
 
+    /* The last check, and the only place it can still pay: qsort_r itself cannot be
+     * interrupted, so if this query is going to be abandoned it has to be abandoned
+     * before it starts. */
+    if (ABANDONED()) {
+        if (key_is_path) for (uint32_t i = 0; i < total; i++) free((char *)rows[i].s);
+        free(rows);
+        fa_done(&fa);
+        sc_done(&sc);
+        goto abandoned;
+    }
+
     if (total > 1) qsort_r(rows, total, sizeof(srec_t), cmp_plain, &sc);
     for (uint32_t i = 0; i < total; i++) ids[i] = rows[i].id;
 
@@ -2353,4 +2375,17 @@ int qexec(const esidx_t *db, const ast_t *ast_in, const match_opts_t *mo,
          out->sort_ncmp ? (double)(out->t_sort_us - out->t_key_us) * 1000.0 /
                           (double)out->sort_ncmp : 0.0);
     return 0;
+
+abandoned:
+    /* D12: the caller stopped waiting, so the honest answer is an empty set rather
+     * than a partial one -- a half-built `out` would be a result set that is missing
+     * rows for no reason the client can see. Everything allocated above is freed
+     * here; `rows`, `fa` and `sc` are freed at the point that jumps, because the
+     * first two checks precede their declaration. */
+    bs_free(&set);
+    qctx_done(&c);
+    qset_free(out);
+    memset(out, 0, sizeof(*out));
+    return 1;
+#undef ABANDONED
 }

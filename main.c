@@ -578,7 +578,9 @@ static int cmd_query(int argc, char **argv)
 
     uint64_t tq = ts_us();
     qset_t set;
-    if (qexec(&db, ast, NULL, sort, &set) != 0) {
+    /* NULL cancel: a batch caller is never "a query the client stopped waiting for",
+     * and there is no socket to ask (D12). */
+    if (qexec(&db, ast, NULL, sort, &set, NULL, NULL) != 0) {
         fprintf(stderr, "query failed\n");
         free(expr);
         ast_free(ast);

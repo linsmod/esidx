@@ -593,6 +593,52 @@ else
     bad "  the result cache served the repeat" "no 'cache hit' in the server log"
 fi
 
+say "5b. a query the client has stopped waiting for (D12)"
+
+# Typing into Everything sends SEARCH and QUERY per keystroke and throws the previous
+# answer away, so the queue on a live connection is mostly work nobody will read -- and
+# being single-threaded, the server delays the query the user *is* waiting for by all of
+# it: 2 776 ms for the slowest query measured on the 8.9M-entry r7000 index.
+#
+# `burst` puts two whole SEARCH/QUERY pairs in ONE write, which is what that queue looks
+# like on the wire. The same search both times is deliberate: it is what catches an
+# abandoned query leaving an empty entry in the result cache, which the second query would
+# then have served.
+hits_before=$(grep -c 'cache hit' "$SRV_ERR")
+etp "two queries pipelined on one connection" "$SRV_PORT" <<'EOF'
+send USER anonymous
+send EVERYTHING COUNT 10
+burst EVERYTHING SEARCH ext:conf\nEVERYTHING QUERY\nEVERYTHING SEARCH ext:conf\nEVERYTHING QUERY
+query
+query
+EOF
+B1=$(sed -nE 's/^BLOCK-END 1 count=([0-9]+).*/\1/p' "$OUT")
+B2=$(sed -nE 's/^BLOCK-END 2 count=([0-9]+).*/\1/p' "$OUT")
+if [ "$B1" = "0" ]; then
+    ok "  the superseded query is answered, with an empty block (count 0)"
+else
+    bad "  the superseded query is answered with an empty block" "block 1 count=$B1"
+fi
+# The block still has to be complete: a reply that stops mid-sentence is the failure the
+# 1023-byte reply buffer and the OPTS UTF8 hang both were, and the probe is a client, so
+# reaching the second block at all is the assertion that the first one ended.
+if [ -n "$B2" ] && [ "$B2" -gt 0 ]; then
+    ok "  the query the client is waiting for still runs (count $B2)"
+else
+    bad "  the query the client is waiting for still runs" "block 2 count=${B2:-none}"
+fi
+if [ "$(grep -c 'cache hit' "$SRV_ERR")" = "$hits_before" ]; then
+    ok "  the abandoned query left nothing in the result cache"
+else
+    bad "  the abandoned query left nothing in the result cache" \
+        "the second query was served from the cache"
+fi
+if grep -q 'abandoned' "$SRV_ERR"; then
+    ok "  and the log says why -- an abandoned query is not silent"
+else
+    bad "  the log says why" "no 'abandoned' line in the server log"
+fi
+
 say "6. all 32 subcommands (criteria 3, 5)"
 
 sub() {  # sub <NAME> <PARAM> <expected regex>

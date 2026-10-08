@@ -2082,6 +2082,53 @@ and empty. The package installs, enables and starts the unit; the scan happens i
 service, as the service identity, where its failures are a journal line instead of an aborted
 `dpkg -i`.
 
+### D12 — A query the client has stopped waiting for is abandoned
+
+**Decision**: `serve` treats a `QUERY` as abandoned when the client has already sent
+another command on the same connection. It is detected in two places: at dispatch, if
+more input is queued behind the command; and during execution, by a probe passed into
+`qexec()` and checked between its phases. An abandoned query is answered with a complete,
+well-formed **empty** block — `RESULT_COUNT 0` and `200 End.` — and whatever it had
+already computed is thrown away.
+
+**Reason**: Everything re-queries on every keystroke and discards the previous answer, so
+the queue on a live connection is mostly work nobody will read. Measured on r7000 against
+the 8 889 790-entry index, the slowest query in the journal cost **2 776.5 ms** (plan 1.3,
+eval 841.4, sort 1 777.8); the next keystroke lands inside that, and because the serve loop
+is single-threaded the query the user *is* waiting for is delayed by the whole of it. This
+is head-of-line blocking on one connection, and everything in front of the line is stale.
+
+Four details are decisions:
+
+- **Only `QUERY` is skippable.** The other 31 subcommands mutate per-connection state, and
+  `SEARCH` in particular is what the *next* query runs against: skipping a superseded
+  SEARCH would silently run the new query against the old search text, which is a wrong
+  answer rather than no answer.
+- **The answer is still a complete block, and its count is 0.** A reply that stops
+  mid-sentence is a failure this project has already recorded twice (the 1023-byte reply
+  buffer, and the `OPTS UTF8` hang in AGENTS.md 1.4): the client waits for a terminator
+  that never comes. `RESULT_COUNT 0` and not the real count, because the set was never
+  produced and a count is a claim about a result nobody has.
+- **The probe is checked between the executor's phases, not inside them.** After the
+  filter pass, before the row/key build, and immediately before `qsort_r` — which cannot
+  be interrupted at all, and is where 1 778 ms of the measured 2 777 ms sat. That is why
+  the check is placed immediately in front of it rather than anywhere else.
+- **Detection is one `recv(MSG_PEEK|MSG_DONTWAIT)` per check.** Not a fanotify mark, not a
+  shared flag with a second thread: a query is abandoned by its *own* connection, so the
+  only thing that has to be asked is whether that socket has more to say.
+
+**What this does not do**: it does not implement `ABOR` (FTP's abort, conventionally sent
+as urgent data). Nothing here sends it and the reference's behaviour towards it is not
+recorded, so it is not assumed — if Everything turns out to send it, the answer is one
+more branch in `handle_command`, not a different design. It does not add a worker thread:
+the query path is the one place the single-thread invariant earns its keep (an index that
+moves under a half-answered query is a wrong answer), and D6's concurrency is about the
+scan, not this.
+
+**Cost**: an rbuf check per command and three `recv` peeks per query. The saving is the
+whole tail of every superseded query — 2.8 s in the worst case measured above, and with it
+2.8 s of latency off the query the user is actually waiting for.
+
 ---
 
 

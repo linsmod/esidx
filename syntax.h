@@ -220,10 +220,23 @@ uint32_t qset_slice(const qset_t *s, uint32_t offset, uint32_t count, eid_t **ou
  *   2. the FILTER_* re-match over that set
  *
  * When `ast` is NULL the whole tree matches, which is what an empty `SEARCH`
- * means. `mo` may be NULL (all defaults). Returns 0 on success, -1 on
- * allocation failure or a leaf the executor cannot honour. */
+ * means. `mo` may be NULL (all defaults). Returns 0 on success, 1 when the
+ * caller abandoned it (below), -1 on allocation failure or a leaf the executor
+ * cannot honour.
+ *
+ * `cancel`, if it is not NULL, is asked between the executor's phases -- after
+ * the match and filter passes, before the sort keys are built, and immediately
+ * before the sort -- and a query it says yes to is *abandoned*: everything
+ * computed so far is freed and `out` comes back empty. It exists because a
+ * client re-queries on every keystroke and discards the previous answer, so by
+ * the time a slow query reaches its sort nobody is waiting for it (design D12).
+ * The comparator's own loop is not interruptible, which is why the last check
+ * is placed in front of it rather than inside: on the 8.9M-entry index the sort
+ * is 1 778 of one query's 2 777 ms. A batch caller passes NULL and is never
+ * abandoned. */
+typedef bool (*qexec_cancel_fn)(void *arg);
 int qexec(const esidx_t *db, const ast_t *ast, const match_opts_t *mo,
-          sort_spec_t sort, qset_t *out);
+          sort_spec_t sort, qset_t *out, qexec_cancel_fn cancel, void *cancel_arg);
 
 /* ------------------------------------------------------------------ regex */
 
