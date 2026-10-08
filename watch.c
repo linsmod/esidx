@@ -25,6 +25,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <sys/types.h>
 #include <sys/prctl.h>
@@ -59,23 +62,32 @@ extern int capset(struct __user_cap_header_struct *hdr,
 
 struct esidx_watch {
     int         fd;
-    char       *root;        /* no trailing slash, so the prefix test is one compare */
-    size_t      rootlen;
+    /* Every indexed location, each without a trailing slash so the prefix test is one
+     * compare per root and a path under the second of three is not mistaken for one
+     * under the first. Owned: the caller hands over argv, which is not ours to keep. */
+    char      **roots;
+    size_t     *rootlens;
+    uint32_t    nroots;
     watch_stats_t st;
     int         gone;        /* the proxy closed the connection */
     int         want_sweep;  /* the proxy lost events: the dirty set cannot be trusted */
     uint32_t    work_mode;   /* SFA_WF_*, as the handshake reported it */
     char        work_str[96];
 
-    /* Embedded mode (one process holds the fanotify group itself): non-NULL when this
-     * watcher *is* the proxy. `db` is needed because in this mode events arrive inside
+    /* Embedded mode (one process holds the fanotify group itself): one entry per mount
+     * this index reaches, because a fanotify mark covers one mount and sfa opens one group
+     * per `sfa_srv_open()`. `db` is needed in this mode because events arrive inside
      * sfa_srv_poll() -- there is no socket to hand them to a drain() call -- so the callback
      * has to reach the index itself, and `made` carries what one poll turn marked back out
-     * to drain()'s caller. */
-    struct sfa_srv *srv;
+     * to drain()'s caller. A socket is still created per instance, because sfa_srv_open()
+     * has no "no socket" option yet and it is a separate project; nothing connects to them
+     * in this mode, so each path only has to be unique and short enough for sockaddr_un,
+     * and they are unlinked on close. */
+    struct sfa_srv **srv;
+    char          **sock_owned;
+    uint32_t        nsrv;
     esidx_t       *db;
     int            made;
-    char          *sock_owned;  /* the socket sfa_srv_open() created for us, to unlink */
 };
 
 uint32_t esidx_watch_work_mode(const esidx_watch_t *w)
@@ -88,10 +100,95 @@ const char *esidx_watch_work_mode_str(const esidx_watch_t *w)
     return w ? w->work_str : "(no proxy)";
 }
 
-esidx_watch_t *esidx_watch_open(const char *sock_path, const char *root,
-                                char *err, size_t errlen)
+/* Take ownership of the root list. "/" is the one root whose trailing slash is part of the
+ * name, so it is kept and everything else loses it; the prefix test below then works for
+ * both without a special case anywhere else. Returns 0 on success. */
+static int watch_take_roots(esidx_watch_t *w, char *const *roots, uint32_t nroots)
 {
-    if (!root || !*root) { snprintf(err, errlen, "no index root"); return NULL; }
+    if (nroots == 0) return -1;
+    w->roots = calloc(nroots, sizeof(*w->roots));
+    w->rootlens = calloc(nroots, sizeof(*w->rootlens));
+    if (!w->roots || !w->rootlens) return -1;
+    for (uint32_t i = 0; i < nroots; i++) {
+        size_t rl = strlen(roots[i]);
+        while (rl > 1 && roots[i][rl - 1] == '/') rl--;
+        w->roots[i] = strndup(roots[i], rl);
+        if (!w->roots[i]) return -1;
+        w->rootlens[i] = rl;
+        w->nroots = i + 1;   /* so a partial failure still frees what was taken */
+    }
+    return 0;
+}
+
+static void watch_free_roots(esidx_watch_t *w)
+{
+    for (uint32_t i = 0; i < w->nroots; i++) free(w->roots[i]);
+    free(w->roots);
+    free(w->rootlens);
+    w->roots = NULL;
+    w->rootlens = NULL;
+    w->nroots = 0;
+}
+
+/* Group the roots by the mount they live on: one fanotify mark per mount, and the mount is
+ * what a mark covers.
+ *
+ * The grouping key is the mount *id*, not `st_dev`, and the difference is not academic: a
+ * bind mount shares its source's superblock, so it has the same st_dev and a different
+ * vfsmount, and FAN_MARK_MOUNT is per vfsmount. Grouping by st_dev would put a bind-mounted
+ * root in the same group as its source and quietly leave it unmarked -- which is the shape
+ * of "a staging tree that watches one mount and indexes several".
+ *
+ * STATX_MNT_ID needs kernel 5.8 and a statx(2) that reports it; where it is unavailable the
+ * fallback is st_dev, which is *wrong for bind mounts and right for everything else*. The
+ * fallback says so in the log rather than being silent about it, because a watcher that
+ * cannot see a bind mount is a deployment that looks fine until someone mounts one.
+ *
+ * `groups` receives, for each root, the group it belongs to; the number of groups is
+ * returned. Groups are numbered in first-appearance order so the log is stable. */
+static uint32_t mnt_id_of(const char *path, bool *ok)
+{
+    *ok = false;
+#ifdef SYS_statx
+    struct statx stx;
+    memset(&stx, 0, sizeof(stx));
+    if (syscall(SYS_statx, AT_FDCWD, path, AT_STATX_SYNC_AS_STAT, STATX_MNT_ID, &stx) == 0 &&
+        (stx.stx_mask & STATX_MNT_ID)) {
+        *ok = true;
+        return (uint32_t)stx.stx_mnt_id;
+    }
+#endif
+    struct stat sb;
+    if (stat(path, &sb) != 0) return 0;
+    *ok = true;
+    /* Fold the device into the high half: the two spaces cannot collide in practice, and a
+     * group that merges two roots wrongly is caught by the test above rather than here. */
+    return ((uint32_t)sb.st_dev << 12) ^ (uint32_t)(sb.st_dev >> 20);
+}
+
+static uint32_t group_roots(char *const *roots, uint32_t nroots, uint32_t *groups,
+                            bool *degraded)
+{
+    uint32_t ngroups = 0;
+    *degraded = false;
+    for (uint32_t i = 0; i < nroots; i++) {
+        bool ok = false;
+        uint32_t id = mnt_id_of(roots[i], &ok);
+        if (!ok) { groups[i] = i; ngroups++; continue; }   /* its own group, loudly */
+        groups[i] = UINT32_MAX;
+        for (uint32_t g = 0; g < ngroups; g++) {
+            bool ok2 = false;
+            if (mnt_id_of(roots[groups[g]], &ok2) == id && ok2) { groups[i] = g; break; }
+        }
+        if (groups[i] == UINT32_MAX) groups[i] = ngroups++;
+    }
+    return ngroups;
+}
+
+esidx_watch_t *esidx_watch_open(const char *sock_path, char *const *roots,
+                                uint32_t nroots, char *err, size_t errlen)
+{
+    if (!roots || nroots == 0) { snprintf(err, errlen, "no index root"); return NULL; }
     /* An empty path is the bare `--watch` spelling and means the default socket; sfa_connect
      * already spells that as NULL, so the distinction never has to leave this function. */
     if (sock_path && !*sock_path) sock_path = NULL;
@@ -121,18 +218,29 @@ esidx_watch_t *esidx_watch_open(const char *sock_path, const char *root,
         return NULL;
     }
     w->fd = fd;
-    /* "/" is the one root whose trailing slash is part of the name, so it is kept and
-     * everything else loses it; the prefix test below then works for both. */
-    size_t rl = strlen(root);
-    while (rl > 1 && root[rl - 1] == '/') rl--;
-    w->root = strndup(root, rl);
-    if (!w->root) {
-        snprintf(err, errlen, "out of memory");
+    if (watch_take_roots(w, roots, nroots) != 0) {
+        snprintf(err, errlen, "out of memory taking %u root%s", nroots, nroots == 1 ? "" : "s");
         close(fd);
+        watch_free_roots(w);
         free(w);
         return NULL;
     }
-    w->rootlen = rl;
+    /* One proxy, one mark, one mount. Several roots are fine when they share a mount --
+     * the mark covers them all and under_root() does the rest -- and refused when they do
+     * not, because the fix is another proxy and that is the operator's decision to make. */
+    uint32_t groups[ESIDX_MAX_ROOTS];
+    bool degraded = false;
+    uint32_t ng = group_roots(roots, nroots, groups, &degraded);
+    if (ng > 1) {
+        snprintf(err, errlen,
+                 "this index covers %u mounts and the proxy holds one mark on one of them; "
+                 "run one sfa-server per mount and pass --watch=SOCK for each, or serve it "
+                 "with --watch-embed", ng);
+        close(fd);
+        watch_free_roots(w);
+        free(w);
+        return NULL;
+    }
     w->work_mode = welcome.flags;
     /* sfa's own formatter, so the names in our banner are the ones the proxy's own log and
      * documentation use; "(未报告)" comes back for a flags == 0 handshake, which is what an
@@ -323,11 +431,14 @@ static void on_srv_log(void *user, const char *msg)
     LOGI("watch: sfa: %s", msg);
 }
 
-esidx_watch_t *esidx_watch_open_embed(const char *root, esidx_t *db,
+esidx_watch_t *esidx_watch_open_embed(char *const *roots, uint32_t nroots, esidx_t *db,
                                       const char *sock_path, const char *group,
                                       const char *drop_to, char *err, size_t errlen)
 {
-    if (!root || !*root) { snprintf(err, errlen, "--watch-embed needs an index root"); return NULL; }
+    if (!roots || nroots == 0) {
+        snprintf(err, errlen, "--watch-embed needs an index root");
+        return NULL;
+    }
     if (!drop_to || !*drop_to) {
         snprintf(err, errlen, "--watch-embed needs --drop-to=USER[:GROUP]: it starts as root "
                               "because fanotify needs CAP_SYS_ADMIN, and leaving it "
@@ -336,84 +447,138 @@ esidx_watch_t *esidx_watch_open_embed(const char *root, esidx_t *db,
     }
     if (!db) { snprintf(err, errlen, "--watch-embed needs an index"); return NULL; }
 
-    /* A socket is still created, because sfa_srv_open() has no "no socket" option yet and it
-     * is a separate project. Nobody connects to it in this mode -- the events arrive through
-     * on_event -- so the path only has to be unique and short enough for sockaddr_un. Per
-     * process, so two servers on one machine cannot collide, and unlinked on close. */
-    char sock[108];
-    if (sock_path && *sock_path) {
-        snprintf(sock, sizeof(sock), "%s", sock_path);
-    } else {
-        snprintf(sock, sizeof(sock), "/tmp/esidx-self-%ld.sock", (long)getpid());
-    }
-    if (strlen(sock) >= sizeof(sock)) {
-        snprintf(err, errlen, "embedded socket path is too long for sockaddr_un: %s", sock);
-        return NULL;
-    }
-
-    size_t rootlen = strlen(root);
-    while (rootlen > 1 && root[rootlen - 1] == '/') rootlen--;   /* no trailing slash */
-
     esidx_watch_t *w = calloc(1, sizeof(*w));
     if (!w) { snprintf(err, errlen, "out of memory"); return NULL; }
     w->fd = -1;
     w->db = db;
-    w->root = strndup(root, rootlen);
-    if (!w->root) { free(w); snprintf(err, errlen, "out of memory"); return NULL; }
-    w->rootlen = rootlen;
-    w->sock_owned = strdup(sock);
-
-    /* The prefix is passed to sfa as well as tested here. The mark covers a whole filesystem,
-     * so an index rooted at /usr is otherwise sent every change made anywhere on it --
-     * measured on a fixture that wrote 100 files inside the root and 100 beside it: 196
-     * events, 96 of them outside. under_root() throws those away either way; this stops them
-     * being produced at all. */
-    const char *prefixes[1] = { w->root };
-    struct sfa_srv_opts opts = {
-        .mount        = w->root,
-        .sock         = sock,
-        .group        = (group && *group) ? group : NULL,
-        .prefix       = prefixes,
-        .nprefix      = 1,
-        .log          = on_srv_log,
-        .on_event     = on_event,
-        .on_event_user = w,
-        /* The same mask the socket client subscribes to, so a loss signal reaches this
-         * watcher too. Not SFA_EV_ALL: subscribing wider would ask for signals this layer
-         * has no answer for, and the answer to a loss signal is the one thing in here that
-         * must not be skipped. */
-        .on_event_mask = SFA_WATCH_MASK,
-    };
-    if (sfa_srv_open(&w->srv, &opts) < 0) {
-        snprintf(err, errlen, "sfa_srv_open(%s): %s", w->root,
-                 w->srv ? sfa_srv_error(w->srv) : "no instance");
-        if (w->srv) sfa_srv_close(w->srv);
-        free(w->sock_owned); free(w->root); free(w);
+    if (watch_take_roots(w, roots, nroots) != 0) {
+        free(w);
+        snprintf(err, errlen, "out of memory taking %u root%s", nroots, nroots == 1 ? "" : "s");
         return NULL;
+    }
+
+    /* Which mount each root is on, and therefore how many fanotify groups this process is
+     * about to hold. One root on one mount -- everything that worked before this change --
+     * is one group, and every line below it takes the path it always took. */
+    uint32_t groups[ESIDX_MAX_ROOTS];
+    bool degraded = false;
+    uint32_t ng = group_roots(roots, nroots, groups, &degraded);
+    w->srv = calloc(ng, sizeof(*w->srv));
+    w->sock_owned = calloc(ng, sizeof(*w->sock_owned));
+    if (!w->srv || !w->sock_owned) {
+        snprintf(err, errlen, "out of memory for %u mount group%s", ng, ng == 1 ? "" : "s");
+        goto fail;
+    }
+    if (degraded)
+        LOGW("watch: this kernel's statx does not report a mount id, so the roots were grouped "
+             "by device: correct unless one of them is a bind mount, which would then be "
+             "unmarked");
+
+    /* Privileged from here to the drop below, and no further: sfa_srv_open() is the only step
+     * that needs CAP_SYS_ADMIN, and once the groups are marked their fds keep delivering
+     * events to a process that has none. */
+    for (uint32_t g = 0; g < ng; g++) {
+        /* A socket per instance, because sfa_srv_open() has no "no socket" option yet and it
+         * is a separate project. Nothing connects to them in this mode -- the events arrive
+         * through on_event -- so a path only has to be unique and short enough for
+         * sockaddr_un. Per process and per group, so two servers and two mounts cannot
+         * collide, and each is unlinked on close. */
+        char sock[108];
+        int n = snprintf(sock, sizeof(sock), "/tmp/esidx-self-%ld-%u.sock",
+                         (long)getpid(), g);
+        if (sock_path && *sock_path && g == 0) {
+            n = snprintf(sock, sizeof(sock), "%s", sock_path);
+        }
+        if (n < 0 || (size_t)n >= sizeof(sock)) {
+            snprintf(err, errlen, "embedded socket path is too long for sockaddr_un");
+            goto fail;
+        }
+        w->sock_owned[g] = strdup(sock);
+        if (!w->sock_owned[g]) {
+            snprintf(err, errlen, "out of memory");
+            goto fail;
+        }
+
+        /* The prefixes are passed to sfa as well as tested here. The mark covers a whole
+         * mount, so an index rooted at /usr is otherwise sent every change made anywhere on
+         * it -- measured on a fixture that wrote 100 files inside the root and 100 beside it:
+         * 196 events, 96 of them outside. under_root() throws those away either way; this
+         * stops them being produced at all.
+         *
+         * At most SFA_SRV_MAX_PREFIXES per instance, which is sfa's own cap. Passing more is
+         * not an error there, it is a truncation -- and a truncation here would be silent,
+         * except that under_root() is the real gate and a prefix is only an optimisation, so
+         * the worst a dropped prefix can do is cost events that would have been discarded. */
+        const char *prefixes[SFA_SRV_MAX_PREFIXES];
+        uint32_t np = 0;
+        for (uint32_t i = 0; i < nroots && np < SFA_SRV_MAX_PREFIXES; i++)
+            if (groups[i] == g) prefixes[np++] = w->roots[i];
+
+        struct sfa_srv_opts opts = {
+            .mount        = prefixes[0],
+            .sock         = sock,
+            .group        = (group && *group) ? group : NULL,
+            .prefix       = prefixes,
+            .nprefix      = (int)np,
+            .log          = on_srv_log,
+            .on_event     = on_event,
+            .on_event_user = w,
+            /* The same mask the socket client subscribes to, so a loss signal reaches this
+             * watcher too. Not SFA_EV_ALL: subscribing wider would ask for signals this layer
+             * has no answer for, and the answer to a loss signal is the one thing in here that
+             * must not be skipped. */
+            .on_event_mask = SFA_WATCH_MASK,
+        };
+        if (sfa_srv_open(&w->srv[g], &opts) < 0) {
+            snprintf(err, errlen, "sfa_srv_open(%s): %s", prefixes[0],
+                     w->srv[g] ? sfa_srv_error(w->srv[g]) : "no instance");
+            goto fail;
+        }
+        w->nsrv = g + 1;
+        LOGI("watch: mount group %u/%u marked at %s, prefixes %u of the %u root%s",
+             g + 1, ng, prefixes[0], np, nroots, nroots == 1 ? "" : "s");
     }
 
     /* Privileged from here to exactly one line below. */
-    if (drop_privilege(drop_to, err, errlen) < 0) {
-        sfa_srv_close(w->srv);
-        free(w->sock_owned); free(w->root); free(w);
-        return NULL;
-    }
+    if (drop_privilege(drop_to, err, errlen) < 0) goto fail;
 
     /* There is no handshake to read in this mode -- the client half is not used -- so the
      * work mode comes from the server's own capability report instead. sfa prints it
      * through the log callback above; what is left here is the default a proxy too old to
      * report anything would have given, which is a fact and not an error (same rule as
-     * esidx_watch_work_mode). */
+     * esidx_watch_work_mode). Several groups may have negotiated *different* modes -- the
+     * probe is per target -- so the first is reported and a difference is said out loud
+     * rather than averaged into something that describes neither. */
     w->work_mode = 0;
-    snprintf(w->work_str, sizeof(w->work_str), "(embedded)");
+    snprintf(w->work_str, sizeof(w->work_str), "(embedded%s)",
+             ng > 1 ? ", one mark per mount" : "");
     return w;
+
+fail:
+    for (uint32_t i = 0; i < w->nsrv; i++) sfa_srv_close(w->srv[i]);
+    for (uint32_t i = 0; i < w->nsrv; i++)
+        if (w->sock_owned[i]) { unlink(w->sock_owned[i]); free(w->sock_owned[i]); }
+    /* A group whose sfa_srv_open() failed may have created its socket before failing. */
+    for (uint32_t g = w->nsrv; g < ng; g++)
+        if (w->sock_owned[g]) { unlink(w->sock_owned[g]); free(w->sock_owned[g]); }
+    free(w->sock_owned);
+    free(w->srv);
+    watch_free_roots(w);
+    free(w);
+    return NULL;
 }
 
-int esidx_watch_fd(const esidx_watch_t *w)
+uint32_t esidx_watch_fds(const esidx_watch_t *w, int *out, uint32_t max)
 {
-    if (!w) return -1;
-    if (w->srv) return sfa_srv_fd(w->srv);
-    return w->fd;
+    if (!w) return 0;
+    if (w->nsrv) {
+        for (uint32_t i = 0; out && i < w->nsrv && i < max; i++)
+            out[i] = sfa_srv_fd(w->srv[i]);
+        return w->nsrv;
+    }
+    if (w->fd < 0) return 0;
+    if (out && max) out[0] = w->fd;
+    return 1;
 }
 
 /* Is this path inside the index? The comparison is on a whole component boundary, so
@@ -421,8 +586,11 @@ int esidx_watch_fd(const esidx_watch_t *w)
  * root is the full pass that overflow falls back to. */
 static int under_root(const esidx_watch_t *w, const char *path)
 {
-    if (strncmp(path, w->root, w->rootlen) != 0) return 0;
-    return path[w->rootlen] == '\0' || path[w->rootlen] == '/';
+    for (uint32_t i = 0; i < w->nroots; i++) {
+        if (strncmp(path, w->roots[i], w->rootlens[i]) != 0) continue;
+        if (path[w->rootlens[i]] == '\0' || path[w->rootlens[i]] == '/') return 1;
+    }
+    return 0;
 }
 
 /* Mark every root, and report how many took. Reached when the loss signals come in -- a
@@ -430,14 +598,21 @@ static int under_root(const esidx_watch_t *w, const char *path)
  * answer to "I do not know what changed" is every root, not the first one: a partial
  * sweep would leave the other trees frozen and read exactly like "nothing is changing
  * over there". The caller adds to both counters, because it is the one that knows which
- * is the batch and which is the session. */
-static uint32_t mark_all_roots(esidx_t *db)
+ * is the batch and which is the session.
+ *
+ * `only` is the root that has to be marked when the caller knows which tree lost the event,
+ * which is the ordinary path for one tree's overflow; UINT32_MAX means all of them, which is
+ * what a signal that cannot be attributed to a tree means. */
+static uint32_t mark_roots(esidx_t *db, uint32_t only)
 {
     uint32_t n = 0;
-    for (uint32_t i = 0, m = esidx_nroots(db); i < m; i++)
+    for (uint32_t i = 0, m = esidx_nroots(db); i < m; i++) {
+        if (only != UINT32_MAX && i != only) continue;
         if (esidx_mark_dirty(db, esidx_root(db, i)) == 0) n++;
+    }
     return n;
 }
+
 /* Mark the directory that holds `path`. The parent, always -- see the header.
  * `made` is this batch's count and `st` is the lifetime total; they are separate because
  * the two are asked different questions: the log line says what this poll turn cost, and
@@ -453,15 +628,22 @@ static void mark_parent(esidx_watch_t *w, esidx_t *db, const char *path, int *ma
          * name. Marking the root is the correct answer for the first case -- a change to
          * the root's own attributes is what a full pass is for -- and a no-op for the
          * second, since the root is already the top of the index. */
-        if (strcmp(path, w->root) == 0) {
-            /* w->root is this watcher's one tree, and it is *the* tree only because
-             * esidx_watch_open* refuses an index with more than one root (etp.c). So
-             * root 0 is not "the first of several" here -- it is the whole set. */
-            if (esidx_mark_dirty(db, esidx_root(db, 0)) == 0) { w->st.marked++; (*made)++; }
-            else w->st.unknown++;
-        } else {
-            w->st.unknown++;
+        for (uint32_t i = 0; i < w->nroots; i++) {
+            if (strcmp(path, w->roots[i]) != 0) continue;
+            /* The root that matched is marked by *its* index, not by position in the
+             * watcher's list: the two lists are in the same order (etp.c hands over the
+             * snapshot's roots in order) but only the index means anything here, and
+             * looking it up is what makes a second root work at all. */
+            if (i < esidx_nroots(db) &&
+                esidx_mark_dirty(db, esidx_root(db, i)) == 0) {
+                w->st.marked++;
+                (*made)++;
+            } else {
+                w->st.unknown++;
+            }
+            return;
         }
+        w->st.unknown++;
         return;
     }
 
@@ -501,7 +683,7 @@ static void handle_event(esidx_watch_t *w, esidx_t *db, const struct sfa_event *
          * sweep is declined or fails, which is the weaker but non-empty answer. */
         w->st.overflow++;
         w->want_sweep = 1;
-        { uint32_t k = mark_all_roots(db); w->st.marked += k; *made += k; }
+        { uint32_t k = mark_roots(db, UINT32_MAX); w->st.marked += k; *made += k; }
         return;
     }
     if (ev->path_len == 0 || ev->path[0] == '\0') {
@@ -523,7 +705,7 @@ static void handle_event(esidx_watch_t *w, esidx_t *db, const struct sfa_event *
         w->want_sweep = 1;
         LOGW("watch: %llu event batch(es) the proxy could not attribute to a path; "
              "asking for a sweep", (unsigned long long)w->st.unresolved);
-        { uint32_t k = mark_all_roots(db); w->st.marked += k; *made += k; }
+        { uint32_t k = mark_roots(db, UINT32_MAX); w->st.marked += k; *made += k; }
         return;
     }
 
@@ -538,16 +720,23 @@ int esidx_watch_drain(esidx_watch_t *w, esidx_t *db)
 
     int made = 0;             /* marks made by *this* call, before de-duplication */
 
-    if (w->srv) {
+    if (w->nsrv) {
         /* Embedded: this process is the proxy, so there is nothing to read -- the events
          * arrive inside the poll, through the callback below. What drain() has to do is
-         * give that poll a turn and report what it marked. Timeout 0: the caller has
-         * already waited in poll() for exactly this fd to become readable, and blocking
-         * here would be a second wait for the same readiness. */
+         * give each poll a turn and report what they marked. Timeout 0: the caller has
+         * already waited in poll() for one of these fds to become readable, and blocking
+         * here would be a second wait for the same readiness.
+         *
+         * Every group is polled, not just the one that woke: which group an event belongs to
+         * is not in the revents, and a poll with nothing ready costs a read() that returns
+         * EAGAIN. */
         int before = w->made;
-        if (sfa_srv_poll(w->srv, 0) < 0) {
-            LOGW("watch: embedded sfa poll failed: %s", sfa_srv_error(w->srv));
-            return -1;
+        for (uint32_t g = 0; g < w->nsrv; g++) {
+            if (sfa_srv_poll(w->srv[g], 0) < 0) {
+                LOGW("watch: embedded sfa poll failed on group %u of %u: %s",
+                     g + 1, w->nsrv, sfa_srv_error(w->srv[g]));
+                return -1;
+            }
         }
         made = w->made - before;
         if (made) w->st.batches++;
@@ -601,13 +790,16 @@ const watch_stats_t *esidx_watch_stats(const esidx_watch_t *w)
 void esidx_watch_close(esidx_watch_t *w)
 {
     if (!w) return;
-    if (w->srv) sfa_srv_close(w->srv);
+    for (uint32_t g = 0; g < w->nsrv; g++) sfa_srv_close(w->srv[g]);
     if (w->fd >= 0) close(w->fd);
-    /* sfa_srv_open() unlinks before bind, so a stale file cannot stop the next start; it is
+    /* sfa_srv_open() unlinks before bind, so a stale file cannot stop the next start; each is
      * removed here anyway because a socket left behind by a clean exit is a question an
      * operator should never have to ask. */
-    if (w->sock_owned) { unlink(w->sock_owned); free(w->sock_owned); }
-    free(w->root);
+    for (uint32_t g = 0; g < w->nsrv; g++)
+        if (w->sock_owned[g]) { unlink(w->sock_owned[g]); free(w->sock_owned[g]); }
+    free(w->sock_owned);
+    free(w->srv);
+    watch_free_roots(w);
     free(w);
 }
 

@@ -69,19 +69,27 @@ uint64_t overflow;   /* the kernel queue overflowed; a full pass is the only hon
     uint64_t batches;    /* drain() calls that marked something */
 } watch_stats_t;
 
-/* Connect and subscribe. `root` is the index root and is compared against event paths
- * without a trailing slash; the reason esidx does its own prefix test is in
- * sfa/issues/closed/subscribe-prefix-filter.md: the mark is a whole filesystem, so an index
- * on /usr is sent every change made anywhere on it. The proxy grew a `--prefix` option for
- * that, and an operator should use it -- but the test stays here anyway, because one proxy
- * may serve several indexes with different roots and a proxy started with no prefix (or a
- * wider one) must not be able to mark a directory this index has never heard of. Measured on
- * a fixture that wrote 100 files inside the root and 100 beside it: 196 events, 96 of them
- * outside, i.e. half the stream is spent on paths `under_root()` throws away.
+/* Connect and subscribe. `roots` is every location the index covers, `nroots` of them; each
+ * is compared against event paths by component, without a trailing slash. The reason esidx
+ * does its own prefix test is in sfa/issues/closed/subscribe-prefix-filter.md: the mark is a
+ * whole mount, so an index on /usr is sent every change made anywhere on it. The proxy grew
+ * a `--prefix` option for that, and an operator should use it -- but the test stays here
+ * anyway, because one proxy may serve several indexes with different roots and a proxy
+ * started with no prefix (or a wider one) must not be able to mark a directory this index
+ * has never heard of. Measured on a fixture that wrote 100 files inside the root and 100
+ * beside it: 196 events, 96 of them outside, i.e. half the stream is spent on paths
+ * `under_root()` throws away.
+ *
+ * More than one *mount* is refused here, and the reason belongs to the proxy rather than to
+ * this client: `sfa` calls `fanotify_mark()` once, on one path, and a mark covers one mount.
+ * Roots that live on different mounts need one proxy each -- one privileged process per
+ * mount -- and that is a deployment decision an operator should make visibly, not something
+ * this function papers over by connecting twice and hoping. Roots on the *same* mount are
+ * fine and cost nothing: one mark covers them all and `under_root()` does the rest.
  *
  * `err` receives a one-line reason on failure. Returns NULL on failure. */
-esidx_watch_t *esidx_watch_open(const char *sock_path, const char *root,
-                                char *err, size_t errlen);
+esidx_watch_t *esidx_watch_open(const char *sock_path, char *const *roots,
+                                uint32_t nroots, char *err, size_t errlen);
 
 /* Embedded mode: one process, no proxy, no client socket.
  *
@@ -107,14 +115,19 @@ esidx_watch_t *esidx_watch_open(const char *sock_path, const char *root,
  * `group` is the socket's group and exists so the file is not left world-accessible.
  *
  * `err` receives a one-line reason on failure. Returns NULL on failure. */
-esidx_watch_t *esidx_watch_open_embed(const char *root, esidx_t *db,
+esidx_watch_t *esidx_watch_open_embed(char *const *roots, uint32_t nroots, esidx_t *db,
                                       const char *sock_path, const char *group,
                                       const char *drop_to, char *err, size_t errlen);
 
-/* The socket, for the caller's poll set -- or, in embedded mode, the fanotify fd. Either
- * way it is one fd and it is the same "there is an event to read" signal, which is why the
- * serve loop needs no separate branch for the two forms: -1 only before a successful open. */
-int esidx_watch_fd(const esidx_watch_t *w);
+/* The fds, for the caller's poll set -- in the socket form the one socket, in embedded mode
+ * one fanotify fd per mount this watcher holds a mark on. Either way it is "there is an
+ * event to read", which is why the serve loop needs no separate branch for the two forms.
+ *
+ * A *count* and not one fd, because the second form can hold several: a caller that put one
+ * of them in its poll set would spin on the others forever. The count is written to `out`
+ * and returned; `out` may be NULL to ask only how many there are, which is how a caller
+ * sizes the array in the first place. 0 only before a successful open. */
+uint32_t esidx_watch_fds(const esidx_watch_t *w, int *out, uint32_t max);
 
 /* Read every message the socket has ready and mark the parent directory of each path.
  * Called when poll() says the fd is readable, and it must drain rather than take one

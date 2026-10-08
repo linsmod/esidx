@@ -1427,9 +1427,11 @@ static int serve_watch(esidx_t *db, esidx_watch_t **w)
          * still repairs it. What must not happen is silently carrying on as though the
          * events were still coming, so this is a warning and the watcher is dropped. */
         ws = esidx_watch_stats(*w);
+        int gone_fd[1] = { -1 };
+        esidx_watch_fds(*w, gone_fd, 1);
         LOGW("watch: the sfa proxy at fd %d is gone after %llu events; no longer watching. "
              "The index is as it stands -- use --refresh to keep repairing it",
-             esidx_watch_fd(*w), (unsigned long long)(ws ? ws->events : 0));
+             gone_fd[0], (unsigned long long)(ws ? ws->events : 0));
         esidx_watch_close(*w);
         *w = NULL;
         return 0;
@@ -1560,34 +1562,43 @@ int etp_serve(const etp_opts_t *opts)
      * default without -v and getting no line at all). */
     char embed_as[160] = "";
     if (opts->watch_sock || opts->watch_embed) {
-        char root[PATH_MAX], err[256];
-        /* The watcher holds ONE fanotify mark, and a mark is per mount (sfa_server.c
-         * calls fanotify_mark() once, on this path). An index of several trees needs one
-         * mark per mount, which is the next layer's work; until it lands, this refuses
-         * rather than watching root 0 and calling the index current -- a server that is
-         * up to date about one tree and frozen about the others reports exactly like a
-         * server that is up to date about all of them. */
-        if (esidx_nroots(&db) != 1) {
-            fprintf(stderr, "watch: this snapshot has %u roots and the watcher covers one "
-                            "tree per mark; serve it without --watch, or rebuild it from a "
-                            "single root\n", esidx_nroots(&db));
+        char roots_buf[ESIDX_MAX_ROOTS][PATH_MAX];
+        char *roots[ESIDX_MAX_ROOTS];
+        uint32_t nroots = esidx_nroots(&db);
+        if (nroots > ESIDX_MAX_ROOTS) {
+            fprintf(stderr, "watch: the snapshot names %u roots, past the %u this frame holds\n",
+                    nroots, (unsigned)ESIDX_MAX_ROOTS);
             esidx_free(&db);
             return -1;
         }
-        path_of(&db, esidx_root(&db, 0), root, sizeof(root));
+        for (uint32_t i = 0; i < nroots; i++) {
+            path_of(&db, esidx_root(&db, i), roots_buf[i], PATH_MAX);
+            roots[i] = roots_buf[i];
+        }
+        char err[256];
+        /* How many locations there are, before anything opens: a watcher that silently
+         * covered some of them is the failure this whole layer is about. */
+        LOGI("watch: %u root%s to mark, from the snapshot: %s%s", nroots,
+             nroots == 1 ? "" : "s", roots[0], nroots > 1 ? " ..." : "");
         if (opts->watch_embed) {
-            /* Bare --watch-embed marks the snapshot's own root: the tree whose events make
-             * this index current is the tree that was indexed, so there is no second opinion
-             * to have about it and nothing worth typing. Naming one anyway is allowed and
+            /* Bare --watch-embed marks the snapshot's own roots: the trees whose events make
+             * this index current are the trees that were indexed, so there is no second opinion
+             * to have about them and nothing worth typing. Naming one anyway is allowed and
              * compared rather than silently winning -- a watcher on a different tree from the
              * index produces a server that is current about files it does not have, which
              * reads exactly like "nothing is changing".
              */
             size_t rl = strlen(opts->watch_embed);
             while (rl > 1 && opts->watch_embed[rl - 1] == '/') rl--;
-            if (rl && (rl != strlen(root) || strncmp(root, opts->watch_embed, rl) != 0)) {
-                fprintf(stderr, "watch: --watch-embed=%s but the snapshot's root is %s\n",
-                        opts->watch_embed, root);
+            int named = 0;
+            for (uint32_t i = 0; i < nroots && !named; i++) {
+                size_t have = strlen(roots[i]);
+                named = (rl == have && strncmp(roots[i], opts->watch_embed, rl) == 0);
+            }
+            if (rl && !named) {
+                fprintf(stderr, "watch: --watch-embed=%s is not one of the snapshot's %u root%s "
+                                "(%s)\n", opts->watch_embed, nroots, nroots == 1 ? "" : "s",
+                        roots[0]);
                 esidx_free(&db);
                 return -1;
             }
@@ -1618,11 +1629,11 @@ int etp_serve(const etp_opts_t *opts)
                      "(pass --drop-to=USER to choose another)", drop_to, opts->dbfile);
             }
             snprintf(embed_as, sizeof(embed_as), ", as %s", drop_to);
-            watch = esidx_watch_open_embed(root, &db, opts->watch_sock,
+            watch = esidx_watch_open_embed(roots, nroots, &db, opts->watch_sock,
                                            opts->watch_group, drop_to,
                                            err, sizeof(err));
         } else {
-            watch = esidx_watch_open(opts->watch_sock, root, err, sizeof(err));
+            watch = esidx_watch_open(opts->watch_sock, roots, nroots, err, sizeof(err));
         }
         if (!watch) {
             /* Refusing to start is the point: a --watch that silently does nothing is a
@@ -1714,8 +1725,9 @@ int etp_serve(const etp_opts_t *opts)
     }
     if (watch) {
         char root[PATH_MAX];
-        /* One root, guaranteed: the watcher branch above refuses anything else, so this
-         * is the whole list rather than its first element. */
+        /* The first root, named in the banner because it is the one an operator will
+         * recognise; how many there are, and which mounts are marked, are their own lines
+         * below. A banner that listed all of them would be unreadable at 64. */
         path_of(&db, esidx_root(&db, 0), root, sizeof(root));
         /* Saying what the subscription does *not* cover is part of the banner: names
          * become current, attributes do not (§12 risk 8), and an operator reading only
@@ -1832,7 +1844,13 @@ int etp_serve(const etp_opts_t *opts)
             client_free(c);
         }
 
-        struct pollfd pfd[MAX_CLIENTS + 2];
+        /* Room for the listener, every client, and one fd per mount the watcher has marked.
+         * The watcher term is ESIDX_MAX_ROOTS rather than 1 because a multi-location index
+         * marks one mount per distinct mount among its roots, and a mount that does not fit
+         * here would be a mount that is silently unwatched -- the failure mode this layer
+         * exists to remove, and the reason the loop below refuses to run without room
+         * rather than truncating. */
+        struct pollfd pfd[MAX_CLIENTS + 2 + ESIDX_MAX_ROOTS];
         int nfd = 0;
         pfd[nfd].fd = s;
         pfd[nfd].events = POLLIN;
@@ -1849,11 +1867,24 @@ int etp_serve(const etp_opts_t *opts)
         }
         /* Last, so pfd[0] stays the listener and map[i - 1] stays the client mapping --
          * both of which the loop below hard-codes. */
-        int widx = -1;
+        /* The watcher may hold several fds -- one per mount it has marked -- so this
+         * records a *range* rather than a slot. They are contiguous and they are all
+         * drained by the same call, so the dispatch below only has to know whether any of
+         * them fired, not which. */
+        int wfirst = -1, wcount = 0;
         if (watch) {
-            pfd[nfd].fd = esidx_watch_fd(watch);
-            pfd[nfd].events = POLLIN;
-            widx = nfd++;
+            uint32_t want = esidx_watch_fds(watch, NULL, 0);
+            for (uint32_t k = 0; k < want && nfd < (int)(sizeof(pfd) / sizeof(pfd[0])) - 1; k++) {
+                pfd[nfd].fd = -1;
+                pfd[nfd].events = POLLIN;
+                wfirst = nfd;
+                wcount++;
+                nfd++;
+            }
+            int wfds[ESIDX_MAX_ROOTS];
+            uint32_t got = esidx_watch_fds(watch, wfds, ESIDX_MAX_ROOTS);
+            for (uint32_t k = 0; k < got && k < (uint32_t)wcount; k++)
+                pfd[wfirst + k].fd = wfds[k];
         }
         /* Wake for whichever comes first: a client, or the next deadline. Without the
          * second term the timer resolution is the 1000 ms poll timeout, which happens to
@@ -1921,7 +1952,12 @@ int etp_serve(const etp_opts_t *opts)
          * which is bounded by the number of marked directories and is what makes the
          * answer to the client that caused it correct. Doing it the other way round would
          * answer that client from the index as it was when it asked. */
-        if (widx >= 0 && (pfd[widx].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
+        if (wcount > 0) {
+            int ready = 0;
+            for (int k = 0; k < wcount; k++)
+                if (pfd[wfirst + k].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))
+                    ready = 1;
+            if (ready) {
             int marks = serve_watch(&db, &watch);
             if (marks) {
                 pending_marks += marks;
@@ -1932,10 +1968,14 @@ int etp_serve(const etp_opts_t *opts)
                 next_watch = pending_marks >= WATCH_COALESCE_MARKS
                            ? 0 : ts_us() + WATCH_COALESCE_MS * 1000ULL;
             }
+            }
         }
 
+        /* The watcher owns a contiguous *range* of slots at the end of pfd[] (see above),
+         * and this loop walks the client slots by index into map[], so the range has to be
+         * stepped over rather than one slot compared. */
         for (int i = 1; i < nfd; i++) {
-            if (i == widx) continue;
+            if (wcount > 0 && i >= wfirst && i < wfirst + wcount) continue;
             client_t *c = &clients[map[i - 1]];
             /* POLLOUT is the other half of the non-blocking write: the socket has room again,
              * so the queued tail goes out. POLLIN is a separate question and can be set at the

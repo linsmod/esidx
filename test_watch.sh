@@ -584,16 +584,98 @@ if [ -n "$PORT" ]; then
     fi
     kill "$EMB2_PID" 2>/dev/null; wait "$EMB2_PID" 2>/dev/null; EMB2_PID=""
 
-    # ...and naming a tree that is not the snapshot's root is refused, which is the only
-    # reason spelling it out exists: it is a statement about the deployment that can be wrong.
+    # ...and naming a tree that is not one of the snapshot's roots is refused, which is the
+    # only reason spelling it out exists: it is a statement about the deployment that can be
+    # wrong. With more than one root the message says how many there are, and still names the
+    # one that was asked for -- a refusal that only says "no" sends the reader to the snapshot
+    # to find out which tree it actually covers.
     if "$BIN" -v 3 serve "$EDB" -p 0 --bind 127.0.0.1 --watch-embed="$TMP" \
             >/dev/null 2>"$EMB/serve3.log"; then
         bad "a --watch-embed naming another tree is refused" "it started anyway"
-    elif grep -q "but the snapshot's root is" "$EMB/serve3.log"; then
+    elif grep -q "is not one of the snapshot's" "$EMB/serve3.log" &&
+         grep -q "$TMP" "$EMB/serve3.log"; then
         ok "a --watch-embed naming another tree is refused, naming both paths"
     else
-        bad "a tree that is not the snapshot's root is refused" \
+        bad "a --watch-embed naming another tree is refused" \
             "$(tail -2 "$EMB/serve3.log" | tr '\n' ' ')"
+    fi
+
+    # Two roots, one process, both watched. This is the case the storage layer made
+    # possible and this layer used to refuse outright, so the test that matters is the one
+    # that watches the *second* tree: a server that marked only the first would answer
+    # every query here perfectly while never noticing a change in the other tree, and the
+    # only way to see that is to change a file in the tree that is not root 0.
+    #
+    # Both trees are inside $TMP, so they are on one mount and this exercises "several
+    # roots, one mark" -- not "one mark per mount". The multi-mark half needs a second
+    # filesystem, which this suite cannot create without mounting a loop image, so what is
+    # asserted about it is the grouping itself (below) and not a live event.
+    MR1="$TMP/mr-one"; MR2="$TMP/mr-two"
+    mkdir -p "$MR1" "$MR2"
+    echo one > "$MR1/one.txt"
+    echo two > "$MR2/two.txt"
+    MRDB="$TMP/mr.idx"
+    "$BIN" build "$MR1" "$MR2" -o "$MRDB" >"$TMP/mr-build.log" 2>&1
+    if [ ! -f "$MRDB" ]; then
+        bad "a two-root snapshot builds" "$(tail -2 "$TMP/mr-build.log" | tr '\n' ' ')"
+    else
+        ok "a two-root snapshot builds"
+        chmod 0644 "$MRDB"
+        chown "$DROP_USER" "$MRDB"
+        SAVED_PORT=$PORT
+        "$BIN" -v 3 serve "$MRDB" -p 0 --bind 127.0.0.1 --watch-embed --drop-to="$DROP_USER" \
+            >"$TMP/mr.out" 2>"$TMP/mr.log" &
+        MR_PID=$!
+        MRPORT=""
+        for _ in $(seq 1 50); do
+            MRPORT=$(sed -n 's/.*on 127\.0\.0\.1:\([0-9]*\).*/\1/p' "$TMP/mr.log" 2>/dev/null | head -1)
+            [ -n "$MRPORT" ] && break
+            sleep 0.1
+        done
+        if [ -z "$MRPORT" ]; then
+            bad "the embedded server starts on a two-root snapshot" \
+                "$(tail -3 "$TMP/mr.log" | tr '\n' ' ')"
+        else
+            ok "the embedded server starts on a two-root snapshot"
+
+            # The banner must say how many roots it is marking. A server that marked one and
+            # said nothing would be the old refusal by another name.
+            if grep -q '2 roots to mark' "$TMP/mr.log"; then
+                ok "the banner says how many roots are being marked"
+            else
+                bad "the banner says how many roots are being marked" \
+                    "$(grep 'root' "$TMP/mr.log" | head -2 | tr '\n' ' ')"
+            fi
+            # One mark per *mount*, and these two share one -- so one group, named once.
+            if grep -q 'mount group 1/1 marked' "$TMP/mr.log"; then
+                ok "two roots on one mount are one mark, and it says so"
+            else
+                bad "two roots on one mount are one mark" \
+                    "$(grep 'mount group' "$TMP/mr.log" | tr '\n' ' ')"
+            fi
+
+            # And the change has to become visible -- in the *second* tree, which is the one
+            # a first-root-only watcher would never see. PORT is what query() reads, so
+            # pointing it at the new server is the whole switch.
+            PORT=$MRPORT
+            echo three > "$MR2/three.txt"
+            N=$(await_name three.txt)
+            if [ "$N" != "-1" ]; then
+                ok "a create in the second tree is applied (after $N poll interval(s))"
+            else
+                bad "a create in the second tree is applied" "name:three.txt never appeared"
+            fi
+            # ...and the first tree is still watched, because "both" is the claim.
+            echo four > "$MR1/four.txt"
+            N=$(await_name four.txt)
+            if [ "$N" != "-1" ]; then
+                ok "a create in the first tree is applied too (after $N poll interval(s))"
+            else
+                bad "a create in the first tree is applied" "name:four.txt never appeared"
+            fi
+            PORT=$SAVED_PORT
+        fi
+        kill "$MR_PID" 2>/dev/null; wait "$MR_PID" 2>/dev/null
     fi
 fi
 
