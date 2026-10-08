@@ -3,10 +3,15 @@
 # One absolute path per line, '#' comments and blank lines ignored. This is the file
 # `esidx build --roots-file=` reads, and it exists because systemd does not split an
 # environment file's value into words: a list of locations cannot be one KEY=value, and
-# quoting it into one does not survive either. The unit does not read this file -- the
-# snapshot carries its own list of roots, and re-stating them in the unit would be a second
-# place for them to be wrong -- so this is what you edit when you add or remove a location,
-# and the only thing you must then rebuild the snapshot for.
+# quoting it into one does not survive either. The unit watches this file
+# (--reload-config): edit it while the service runs and the index is rebuilt in a child
+# process and swapped in without a restart -- a client is answered throughout, from the
+# old index until the new one is ready, and the snapshot on disk is rewritten too, so the
+# next restart comes up on the new locations. One limit: an edit made while the service
+# is STOPPED is not noticed (the watch seeds from the file at startup), so the first
+# build, or one after such an edit, is still the command below. And changes *under* a
+# newly added location are noticed by the hourly sweep rather than immediately, until
+# a restart re-opens the event watcher for them -- the journal says so when it happens.
 #
 # A location may appear at most once, and no location may be inside another. Both are
 # refused rather than tolerated: together they would give every file below them two rows,

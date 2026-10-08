@@ -33,6 +33,12 @@ PORT=${ESIDX_PORT:-2121}
 DB=/var/lib/esidx/root.idx
 PROBE=${PROBE:-./etp-probe}
 S=${TMPDIR:-/tmp}/esidx-deb-test.script
+# postinst's output is kept (its warnings are the only place some refusals are visible), so
+# it needs a directory that exists on every run -- found the hard way: the script used the
+# ambient $TMP and ran on a host that happened to export one, then died at dpkg -i on a host
+# that did not.
+TMP=${TMPDIR:-/tmp}/esidx-deb-test
+mkdir -p "$TMP"
 FAILED=0
 ok()   { printf '  ok    %s\n' "$*"; }
 bad()  { printf '  FAIL  %s\n' "$*"; FAILED=$((FAILED + 1)); }
@@ -164,6 +170,67 @@ if [ "$HAVE_PROBE" = 1 ]; then
         bad "created -> $r1 rows (want 1), removed -> $r2 rows (want 0)"
     fi
     journalctl -u esidx --no-pager -n 4 | sed 's/^/   /'
+else
+    note "SKIPPED: no runnable etp-probe"
+fi
+
+stage "7b. the locations file: add one, no restart"
+# The packaged unit passes --reload-config=/etc/esidx/roots, so editing that file must reach
+# the *running* server: a stat every 5 s, a rebuild in a child, a swap without a restart. The
+# pid is what separates a reload from a restart -- a restart would also show the new
+# location, after a much bigger gap -- so it is captured before and asserted after.
+if [ "$HAVE_PROBE" = 1 ]; then
+    TREE2=${TREE2:-/usr/share/doc}
+    if [ ! -d "$TREE2" ]; then
+        note "SKIPPED: TREE2=$TREE2 does not exist"
+    elif [ "${TREE2#"$TREE"}" != "$TREE2" ] || [ "${TREE#"$TREE2"}" != "$TREE" ]; then
+        note "SKIPPED: TREE2=$TREE2 overlaps TREE=$TREE (a root inside another is refused)"
+    else
+        # A name that lives in TREE2 and not under TREE, picked rather than hardcoded so the
+        # step does not depend on one particular doc file existing everywhere.
+        name=$(find "$TREE2" -maxdepth 2 -type f -printf '%f\n' 2>/dev/null | grep -m1 . || true)
+        if [ -z "$name" ]; then
+            note "SKIPPED: nothing to search for under $TREE2"
+        else
+            pid0=$(systemctl show -p MainPID --value esidx)
+            r0=$(probe "$name" | grep -c '^ROW ' || true)
+            if [ "$r0" != 0 ]; then
+                note "SKIPPED: '$name' is already indexed via $TREE; pick another TREE2"
+            else
+                printf '%s\n%s\n' "$TREE" "$TREE2" > /etc/esidx/roots
+                r1=""; n=0
+                # 5 s to notice + a full scan of both trees; the loop is generous because
+                # this machine is not the baseline host.
+                for i in $(seq 1 40); do
+                    sleep 3
+                    n=$i
+                    r1=$(probe "$name" | grep -c '^ROW ' || true)
+                    [ "$r1" -gt 0 ] && break
+                done
+                pid1=$(systemctl show -p MainPID --value esidx)
+                if [ "$r1" -gt 0 ]; then
+                    ok "a location added to /etc/esidx/roots is served after ~$((n*3)) s"
+                else
+                    bad "a location added to /etc/esidx/roots was never served"
+                fi
+                if [ -n "$pid0" ] && [ "$pid0" = "$pid1" ]; then
+                    ok "without a restart (MainPID $pid1 unchanged)"
+                else
+                    bad "the service restarted ($pid0 -> $pid1); --reload-config is not wired"
+                fi
+                # The structural degradation of the embedded form, pinned so the line the
+                # operator is told to watch cannot quietly disappear: the watcher cannot be
+                # re-opened after the drop, so the new location is sweep-only and the journal
+                # says so at ERROR.
+                if journalctl -u esidx --no-pager -n 30 2>/dev/null \
+                        | grep -q 'reload-config: the watcher could not be rebuilt'; then
+                    ok "journal says the new location is sweep-only (watcher rebuild post-drop)"
+                else
+                    bad "no ERROR line about the watcher rebuild -- is the unit not --watch-embed?"
+                fi
+            fi
+        fi
+    fi
 else
     note "SKIPPED: no runnable etp-probe"
 fi

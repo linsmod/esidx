@@ -128,13 +128,20 @@ as the mount point rather than as the directory behind it. A location may not ap
 or inside another, and `esidx build` refuses such a set *before* walking anything — together
 they would give every file below them two rows, which nothing downstream can undo.
 
-The unit does not read the roots file. `--watch-embed` takes the list from the snapshot
-itself, so there is no second place for the locations to be wrong — which is also why
-changing the file changes nothing until you rebuild:
+The unit watches the roots file (`--reload-config`): once the service is running, editing
+`/etc/esidx/roots` is enough — it is noticed within seconds (a stat every 5 s), the new
+index is built in a **child process** and swapped in **without a restart**, and the serve
+loop keeps answering while it runs. Two limits, both stated so they are not discovered the
+hard way: an edit made while the service is *stopped* is not noticed (the watch seeds from
+the file at startup), so the first build, or one after such an edit, is still:
 
 ```sh
 sudo -u esidx esidx build --roots-file=/etc/esidx/roots -o /var/lib/esidx/root.idx
 ```
+
+and because the event watcher cannot be re-opened after the privilege drop, changes
+*under* a newly added location are noticed by the hourly sweep rather than immediately,
+until a restart — the journal says so, at ERROR, when it happens.
 
 A snapshot may cover several locations: `parent:""` and `root:` are then the **union** of
 their top levels, which is what a client showing one volume with several trees underneath
@@ -186,7 +193,9 @@ a second server, not to survive a crash. `build`, `update` and `query` are one-s
 take it — which is deliberate and is also the limit of what it covers: rebuilding a snapshot
 that a server has loaded is the operator's call. The server keeps answering from the copy in
 memory, and a `--save` would write that copy back over the rebuild, so rebuild and then restart
-(which is what an upgrade does), or build to another path.
+(which is what an upgrade does), or build to another path. `serve --reload-config` is the
+route that avoids the question entirely: the rebuild runs in a child and the swap resets the
+save epoch, so the copy in memory and the file on disk never disagree.
 
 The lock lives beside the snapshot, which makes its permissions part of the deployment: it is
 created **before** the server gives its privilege back, and the unit's capability set does not

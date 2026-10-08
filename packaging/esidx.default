@@ -13,10 +13,13 @@
 
 # The locations to index are NOT here. They are in /etc/esidx/roots, one absolute path per
 # line, and that is where you add or remove one -- see the comments in that file for why a
-# list cannot be a KEY=value. The unit does not read it: `--watch-embed` takes the list from
-# the snapshot itself, so there is no second place for it to be wrong. The two-process form
-# does need it twice (the proxy's --prefix, and what esidx is told to accept), which is the
-# one place this deployment still has to keep two things in step; see README, "Deployment".
+# list cannot be a KEY=value. This file needs a restart; the roots file does not: the unit
+# passes --reload-config=/etc/esidx/roots, so an edit there is picked up live (a stat every
+# 5 s, then a rebuild in a child process and a swap without a restart). The list itself
+# still reaches the server through the snapshot -- `--watch-embed` takes it from there, so
+# there is no second place for it to be wrong. The two-process form does need it twice (the
+# proxy's --prefix, and what esidx is told to accept), which is the one place this deployment
+# still has to keep two things in step; see README, "Deployment".
 
 # The snapshot. Nothing builds this for you at install time -- the first one is a full scan,
 # which does not belong in a maintainer script -- so it is usually absent until you run:

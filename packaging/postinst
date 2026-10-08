@@ -212,13 +212,16 @@ case "$1" in
             #
             # The roots file is named even here, because this is the message an operator reads
             # when they expected their new location to be indexed and it is not: an upgrade
-            # never rebuilds the snapshot, so editing $ROOTSF changes nothing until they do.
+            # restarts the service, and the reload watch seeds from the file at startup -- so
+            # a change made while it was stopped is never "seen", and they still have to build.
             cat <<EOF
 
 esidx $newver installed over a running service. It was restarted onto the new binary and the
-snapshot at $db was kept, covering the $nroots location(s) it was built from. An upgrade never
-rebuilds it -- if you changed $ROOTSF, build a new snapshot to pick that up. Configuration is
-$DEFAULTCFG.
+snapshot at $db was kept, covering the $nroots location(s) it was built from. From here on,
+editing $ROOTSF while the service runs is enough: it is picked up within seconds and the index
+is rebuilt and swapped in without a restart. (A change made while it was stopped still needs
+the build command above, and newly added locations are sweep-repaired until a restart.)
+Configuration is $DEFAULTCFG.
 
   systemctl status esidx
   journalctl -u esidx -f
@@ -233,8 +236,10 @@ needs a snapshot and building the first one scans $nroots location(s): $roots
   1. sudo -u $svc esidx build --roots-file=$ROOTSF -o $db
   2. sudo systemctl start esidx
 
-then an ETP client (Everything) can connect to $bind:$port. The locations are $ROOTSF; the rest
-of the configuration is $DEFAULTCFG; logs are in the journal:
+then an ETP client (Everything) can connect to $bind:$port. The locations are $ROOTSF -- once
+the service is running, editing that file adds or removes a location without a restart (the
+rebuild runs in a child process and the server keeps answering). The rest of the configuration
+is $DEFAULTCFG; logs are in the journal:
 
   journalctl -u esidx -f
 
