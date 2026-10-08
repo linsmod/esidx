@@ -223,24 +223,25 @@ expect "ext: is case-insensitive"             "$(n "$LAST")" "3"
 q "ext:conf" "sort:size:desc"
 expect "ext:conf sorted by size desc"         "$(col2 "$LAST")" "5000 500 200 "
 
-# An extension id is a byte offset into the pool of extension names, and it is 16-bit.
-# A pool past 64 KB wraps those offsets onto *other* extensions, so `ext:` answers with
-# rows that do not carry the extension: on a 2 500-extension fixture, 904 of the 2 500
-# returned the wrong row count, in 452 aliased pairs, and ext:e...005 matched both
-# f5.e...005 and f1477.e...001477. Nothing above could see it -- the flat fixture has 3
-# extensions -- so the fixture here exists to overflow the pool: 2 200 x 32 bytes = 70 KB.
+# An extension id was once a byte offset into the pool of extension names, and it was
+# 16-bit, so a pool past 64 KB wrapped those offsets onto *other* extensions: on a
+# 2 500-extension fixture, 904 of the 2 500 returned the wrong row count, in 452 aliased
+# pairs, and ext:e...005 matched both f5.e...005 and f1477.e...001477. Nothing above could
+# see it -- the flat fixture has 3 extensions -- so the fixture here exists to overflow the
+# pool: 2 200 x 32 bytes = 70 KB. Ids are dense and 32-bit-backed now (ESIDX_VERSION 3),
+# so the mechanism cannot recur; what *can* recur is an id that resolves to no string, and
+# that is what the build is asked to refuse.
 #
-# Two assertions, because they answer different questions. The build's own invariant is
-# the mechanism (every string in the pool was interned by an entry, so the pool's string
-# count and the number of extensions in use must be equal); the sample is the answer.
+# Two assertions, because they answer different questions: the build's own refusal is the
+# mechanism, and the sample below is the answer.
 EXTD="$TMP/exts"
 mkdir -p "$EXTD"
 seq 1 2200 | awk '{printf "f%d.e%030d\n", $1, $1}' | ( cd "$EXTD" && xargs touch )
 EXT_DB="$TMP/exts.idx"
 build "$EXTD" "$EXT_DB" >/dev/null
-if grep -q 'ext pool holds' "$TMP/be"; then
+if grep -q 'would match the wrong rows' "$TMP/be"; then
     bad "an extension pool past 64 KB does not alias ids" \
-        "$(grep -m1 'ext pool holds' "$TMP/be" | sed 's/^\[error \] //')"
+        "$(grep -m1 'would match the wrong rows' "$TMP/be" | sed 's/^\[error \] //')"
 else
     ok "an extension pool past 64 KB does not alias ids"
 fi
@@ -699,7 +700,45 @@ build "$FLAT" "$FLAT_DB" >/dev/null
 expect "flat fixture has 13 entries" "$BUILT" "13"
 DB="$FLAT_DB"
 
-# ------------------------------------------------------- several locations in one index
+# Removing the last file carrying an extension leaves that extension's string in the pool
+# with nothing pointing at it. That is untidiness, not a wrong answer -- `ext:` resolves
+# ids, never the pool -- and it must not be reported: the assertion that used to stand here
+# compared the pool's string count against the number of *live* ids, so removing a unique
+# extension printed a LOGE claiming `ext:` matched the wrong rows. It fires on a 4-entry
+# tree, it fired while building this feature, and it is in HEAD. A LOGE that cries wolf is
+# worse than no check at all: it teaches an operator to ignore the line a real fault uses.
+say "an extension nothing references any more"
+ORPH="$TMP/orph"
+mkdir -p "$ORPH"
+: >"$ORPH/keep.txt"
+: >"$ORPH/gone.zzz"
+ORPH_DB="$TMP/orph.idx"
+build "$ORPH" "$ORPH_DB" >/dev/null
+rm "$ORPH/gone.zzz"
+DB="$ORPH_DB"
+"$BIN" update "$ORPH_DB" >/dev/null 2>"$TMP/err"
+if grep -q 'wrong rows' "$TMP/err"; then
+    bad "removing the last file of an extension is not reported as a fault" \
+        "$(grep -m1 'wrong rows' "$TMP/err" | sed 's/^\[error \] //')"
+else
+    ok "removing the last file of an extension is not reported as a fault"
+fi
+# ...and the same file loaded from disk, which is where it used to appear: the build's
+# finalize runs before the removal, so only a *reload* ever saw the orphaned string.
+"$BIN" query "$ORPH_DB" 'count:0' >/dev/null 2>"$TMP/err"
+if grep -q 'wrong rows' "$TMP/err"; then
+    bad "a snapshot carrying an orphaned extension loads without a fault" \
+        "$(grep -m1 'wrong rows' "$TMP/err" | sed 's/^\[error \] //')"
+else
+    ok "a snapshot carrying an orphaned extension loads without a fault"
+fi
+# The other direction, and the reason muting it is defensible: `ext:` must still answer
+# correctly for what is left and stop matching what was removed. A muted check is only
+# acceptable if the property it guarded is asserted elsewhere, and this is that.
+q "ext:txt"; expect "ext: still matches what is left" "$(n "$LAST")" "1"
+q "ext:zzz"; expect "ext: no longer matches what was removed" "$(n "$LAST")" "0"
+
+# ------------------------------------------------------- several locations in one index</new_string>
 #
 # The other half of the fixture, indexed as its own snapshot rather than as a subdirectory
 # of $FLAT: two trees with no common ancestor inside the index, which is the only way to

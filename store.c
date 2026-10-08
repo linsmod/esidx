@@ -1728,7 +1728,7 @@ static void log_ext_cardinality(const ext_index_t *xi, uint32_t entries)
  * 32-63 is the first after it -- so a tree that is *about* to hit the cut is visible as
  * mass at the top of 16-31 rather than as a surprise much later.
  */
-static void log_ext_lengths(const esidx_t *db, uint32_t ext_in_use)
+static void log_ext_lengths(const esidx_t *db)
 {
     /* =1, 2-3, 4-7, 8-15, 16-31, 32-63, >=64 */
     enum { NB = 7 };
@@ -1761,23 +1761,6 @@ static void log_ext_lengths(const esidx_t *db, uint32_t ext_in_use)
         LOGW("ext lengths: %llu entries had an extension too long for %d characters and"
              " were cut -- the index is lossy, ext: will not match the real name",
              (unsigned long long)g_ext_truncated, EXT_NAME_MAX - 1);
-
-    /* Every string in the pool was interned by some entry, and ids are dense over that
-     * pool -- so at build time the two counts must be equal, and when they are not, some
-     * id has collided with another and `ext:` is answering with the wrong rows. It is
-     * checked here rather than in a test because the fixture that triggers it needs a
-     * pool past 64 KB, i.e. thousands of distinct extensions (AGENTS.md 3.4: only visible
-     * above a size threshold), whereas this runs on every build of every tree.
-     *
-     * A query can also intern a string that is in no entry at all (ext_list_ids() on an
-     * unknown extension), which makes the pool legitimately longer -- so this is only
-     * valid because ext_index_build() runs during finalize, before anything has queried
-     * this db. */
-    if (n != ext_in_use)
-        LOGE("ext pool holds %u distinct strings but only %u extensions are in use:"
-             " %u interned id(s) address the wrong string, so ext: matches the wrong"
-             " rows (ext ids are 16-bit offsets into a pool that has outgrown 64 KB)",
-             n, ext_in_use, n - ext_in_use);
 }
 
 /* A bitmap is kept only when the extension is broad enough that *selecting* it as a
@@ -1833,6 +1816,30 @@ int ext_index_build(ext_index_t *xi, const esidx_t *db)
     for (uint32_t i = 0; i < et->count; i++) {
         uint16_t e = et->ext_id[i];
         if (!e || (et->flags[i] & EF_DEAD)) continue;
+        /* Every id must resolve to a string, and this is the only pass that reads all of
+         * them, so the check costs nothing beyond the load it already does.
+         *
+         * This is the assertion that used to live in log_ext_lengths(), where it was
+         * wrong twice over: it compared two *counts* (pool strings against live ids,
+         * which differ legitimately once a removal leaves a string nothing references),
+         * and its diagnosis -- "ext ids are 16-bit offsets into a pool that has outgrown
+         * 64 KB" -- described the bug the dense ext_id table fixed (esidx.h, ESIDX_VERSION
+         * 3). Ids are dense and 32-bit-backed now, so wraparound cannot happen; what can
+         * happen is an id with no offset behind it, and that is what this asks.
+         *
+         * A pool string that no row references is the opposite case and is *not* an
+         * error: ext_list_ids() interns a string for an extension the index does not
+         * have, and a removal leaves the string it was interned for behind. Untidiness,
+         * not a wrong answer -- so it is not checked, and nothing here needs it to be. */
+        if (e > db->n_ext || db->ext_off[e - 1] >= db->exts.len) {
+            LOGE("entry %u carries extension id %u, which resolves to offset %u of a %llu"
+                 " byte pool holding %u ids: `ext:` would match the wrong rows",
+                 i, (unsigned)e, (unsigned)(e <= db->n_ext ? db->ext_off[e - 1] : 0),
+                 (unsigned long long)db->exts.len, db->n_ext);
+            free(tab);
+            free(ids);
+            return -1;
+        }
         uint32_t h = (e * 2654435761u) & mask;
         while (tab[h] && ids[tab[h] - 1] != e) h = (h + 1) & mask;
         if (tab[h]) continue;
@@ -1927,7 +1934,7 @@ int ext_index_build(ext_index_t *xi, const esidx_t *db)
     xi->tab = tab;
     xi->tab_mask = mask;
     log_ext_cardinality(xi, et->count);
-    log_ext_lengths(db, xi->n);
+    log_ext_lengths(db);
     char bmb[32], lmb[32];
     fmt_bytes(bmb, sizeof(bmb), mem_bitmap);
     fmt_bytes(lmb, sizeof(lmb), mem_list);
