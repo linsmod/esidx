@@ -38,8 +38,9 @@ static void usage(void)
 {
     fprintf(stderr,
         "usage:\n"
-        "  esidx [-v N] build <root> -o <dbfile> [--no-index[=LIST]]\n"
-        "  esidx [-v N] update <dbfile> [root] [--deep] [--dir PATH]...\n"
+        "  esidx [-v N] build <root>... -o <dbfile> [--no-index[=LIST]]\n"
+        "                             [--roots-file=PATH]\n"
+        "  esidx [-v N] update <dbfile> [root]... [--deep] [--dir PATH]...\n"
         "                             [--no-index[=LIST]]\n"
         "  esidx [-v N] query <dbfile> [expr ...] [--no-index[=LIST]]\n"
         "  esidx [-v N] serve <dbfile> [-p port] [--bind addr]\n"
@@ -56,6 +57,14 @@ static void usage(void)
         "        <root> defaults to the one the index was built from, and --dir\n"
         "        PATH refreshes only that directory (repeatable) -- the same\n"
         "        reconcile with a smaller set of directories to list.\n"
+        "\n"
+        "build and update take every root they are given, in the order given: one\n"
+        "        snapshot can cover several trees, `parent:\"\"` and `root:` are the union\n"
+        "        of their top levels, and a root set that would index the same bytes\n"
+        "        twice (the same directory twice, or one root under another) is refused.\n"
+        "        --roots-file=PATH reads one absolute path per line, '#' comments,\n"
+        "        which is how a packaged install names several trees without putting a\n"
+        "        list in one environment variable.\n"
         "\n"
         "serve --refresh=SECS runs that same names pass inside the server, every SECS\n"
         "        seconds and once at startup, so a long-running process keeps its own\n"
@@ -173,14 +182,121 @@ static void idx_configure(esidx_t *db, const char *dbfile, idx_flag_t f)
 
 /* ------------------------------------------------------------------- build */
 
+/* The roots a build was asked for. `--roots-file` is how a list arrives: one absolute
+ * path per line, '#' comments and blank lines ignored -- the same shape as the
+ * <dbfile>.opts sidecar, and the same reason (a list has to be readable by something
+ * that is not a shell). Precedence is positional > file > the one path a bare `build
+ * <path>` gives, and they compose: positional paths are walked first, in the order they
+ * were typed, then the file's. Duplicates are caught by esidx_scan(), which refuses a set
+ * that would index the same bytes twice.
+ *
+ * The cap is ESIDX_MAX_ROOTS and the count is enforced here as well as there: this is
+ * where a command line is turned into an argument, so it is the only place that can say
+ * "you typed too many" before the scan starts. */
+
+static int roots_read_file(const char *path, char **out, uint32_t cap, uint32_t *nout)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "esidx: cannot read %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    char line[PATH_MAX];
+    while (fgets(line, sizeof(line), f)) {
+        char *s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        size_t len = strlen(s);
+        while (len && (s[len - 1] == '\n' || s[len - 1] == '\r' ||
+                       s[len - 1] == ' '  || s[len - 1] == '\t')) s[--len] = '\0';
+        if (!*s || *s == '#') continue;
+        if (s[0] != '/') {
+            fprintf(stderr, "%s: %s is not an absolute path\n", path, s);
+            fclose(f);
+            return -1;
+        }
+        if (*nout >= cap) {
+            fprintf(stderr, "esidx: more than %u roots\n", cap);
+            fclose(f);
+            return -1;
+        }
+        out[(*nout)++] = strdup(s);
+    }
+    fclose(f);
+    return 0;
+}
+
+static void roots_free(char **v, uint32_t n)
+{
+    for (uint32_t i = 0; i < n; i++) free(v[i]);
+}
+
+/* The `--roots-file` spelling, shared: both subcommands take it, and a list that means
+ * one thing must be spelled one way or the packaged cron line and the packaged postinst
+ * line drift apart. `*slot` is left alone when the flag is absent. */
+static int roots_file_opt(int argc, char **argv, int i, const char **slot)
+{
+    if (!strcmp(argv[i], "--roots-file")) {
+        if (i + 1 >= argc) {
+            fprintf(stderr, "--roots-file needs a path\n");
+            return -1;
+        }
+        *slot = argv[i + 1];
+        return 1;
+    }
+    if (!strncmp(argv[i], "--roots-file=", 13)) {
+        if (!argv[i][13]) {
+            fprintf(stderr, "--roots-file= needs a path\n");
+            return -1;
+        }
+        *slot = argv[i] + 13;
+        return 1;
+    }
+    return 0;
+}
+
 static int cmd_build(int argc, char **argv)
 {
-    const char *root = NULL, *out = "esidx.db";
+    const char *out = "esidx.db", *roots_file = NULL;
+    char *roots[ESIDX_MAX_ROOTS];
+    uint32_t nroots = 0;
     for (int i = 0; i < argc; i++) {
         if (!strcmp(argv[i], "-o") && i + 1 < argc) { out = argv[++i]; continue; }
-        if (!root) root = argv[i];
+        int rf = roots_file_opt(argc, argv, i, &roots_file);
+        if (rf < 0) { roots_free(roots, nroots); return 1; }
+        if (rf > 0) { if (i + 1 < argc && argv[i][0] != '-') i++; continue; }
+        if (argv[i][0] == '-' && argv[i][1]) {
+            fprintf(stderr, "build: unknown option %s\n", argv[i]);
+            roots_free(roots, nroots);
+            return 1;
+        }
+        if (nroots >= ESIDX_MAX_ROOTS) {
+            fprintf(stderr, "build: more than %u roots\n", (unsigned)ESIDX_MAX_ROOTS);
+            roots_free(roots, nroots);
+            return 1;
+        }
+        /* strdup, not the pointer: every exit path below frees the list, and half of
+         * these come from argv, which is not ours to free. */
+        roots[nroots] = strdup(argv[i]);
+        if (!roots[nroots]) {
+            fprintf(stderr, "build: out of memory\n");
+            roots_free(roots, nroots);
+            return 1;
+        }
+        nroots++;
     }
-    if (!root) { usage(); return 1; }
+    /* Every positional is kept now. `build /a /b` used to take /a and drop /b without a
+     * word, which is the one behaviour here that could not be discovered by reading the
+     * output: the index looked complete and was half of what was asked for. */
+    if (roots_file) {
+        uint32_t before = nroots;
+        if (roots_read_file(roots_file, roots, ESIDX_MAX_ROOTS, &nroots) != 0) {
+            roots_free(roots, nroots);
+            return 1;
+        }
+        fprintf(stderr, "build: %u root%s from %s, %u on the command line\n",
+                nroots - before, nroots - before == 1 ? "" : "s", roots_file, before);
+    }
+    if (nroots == 0) { usage(); roots_free(roots, nroots); return 1; }
 
     esidx_t db;
     esidx_init(&db);
@@ -191,8 +307,9 @@ static int cmd_build(int argc, char **argv)
     idx_configure(&db, out, g_flag);
 
     uint64_t t0 = ts_us();
-    if (esidx_scan(&db, root) != 0) {
-        fprintf(stderr, "scan failed: %s\n", root);
+    if (esidx_scan(&db, roots, nroots) != 0) {
+        fprintf(stderr, "scan failed\n");
+        roots_free(roots, nroots);
         esidx_free(&db);
         return 1;
     }
@@ -214,11 +331,13 @@ static int cmd_build(int argc, char **argv)
 
     if (esidx_save(&db, out) != 0) {
         fprintf(stderr, "save failed: %s\n", out);
+        roots_free(roots, nroots);
         esidx_free(&db);
         return 1;
     }
     TSDONE("build: total", t0);
-    fprintf(stderr, "saved -> %s\n", out);
+    fprintf(stderr, "saved -> %s  (%u root%s)\n", out, nroots, nroots == 1 ? "" : "s");
+    roots_free(roots, nroots);
     esidx_free(&db);
     return 0;
 }
@@ -238,10 +357,12 @@ static int cmd_build(int argc, char **argv)
  * is the same one a full pass runs -- only the set of directories to list is smaller. */
 static int cmd_update(int argc, char **argv)
 {
-    const char *dbfile = NULL, *root = NULL;
+    const char *dbfile = NULL, *roots_file = NULL;
     const char *dirs[128];
     int ndirs = 0;
     unsigned flags = 0;
+    char *roots[ESIDX_MAX_ROOTS];
+    uint32_t nroots = 0;
     for (int i = 0; i < argc; i++) {
         const char *a = argv[i];
         if (!strcmp(a, "--deep")) { flags |= EU_DEEP; continue; }
@@ -254,21 +375,47 @@ static int cmd_update(int argc, char **argv)
             dirs[ndirs++] = argv[++i];
             continue;
         }
+        int rf = roots_file_opt(argc, argv, i, &roots_file);
+        if (rf < 0) return 1;
+        if (rf > 0) { if (i + 1 < argc && argv[i][0] != '-') i++; continue; }
         if (a[0] == '-') { fprintf(stderr, "update: unknown option %s\n", a); return 1; }
         if (!dbfile) { dbfile = a; continue; }
-        if (!root)   { root = a; continue; }
-        fprintf(stderr, "update: unexpected argument %s\n", a);
-        return 1;
+        /* Every one of them is kept, for the reason cmd_build() keeps them. */
+        if (nroots >= ESIDX_MAX_ROOTS) {
+            fprintf(stderr, "update: more than %u roots\n", (unsigned)ESIDX_MAX_ROOTS);
+            roots_free(roots, nroots);
+            return 1;
+        }
+        roots[nroots] = strdup(a);
+        if (!roots[nroots]) {
+            fprintf(stderr, "update: out of memory\n");
+            roots_free(roots, nroots);
+            return 1;
+        }
+        nroots++;
+    }
+    /* The same list, the same spelling: a packaged install names its locations in a file
+     * and the line that brings the index forward has to be able to read it too. */
+    if (roots_file) {
+        uint32_t before = nroots;
+        if (roots_read_file(roots_file, roots, ESIDX_MAX_ROOTS, &nroots) != 0) {
+            roots_free(roots, nroots);
+            return 1;
+        }
+        fprintf(stderr, "update: %u root%s from %s, %u on the command line\n",
+                nroots - before, nroots - before == 1 ? "" : "s", roots_file, before);
     }
     if (!dbfile) {
-        fprintf(stderr, "usage: esidx update <dbfile> [root] [--deep] [--sweep] "
-                        "[--dir PATH]...\n");
+        fprintf(stderr, "usage: esidx update <dbfile> [root]... [--deep] [--sweep] "
+                        "[--dir PATH]... [--roots-file=PATH]\n");
+        roots_free(roots, nroots);
         return 1;
     }
-    if (ndirs && root) {
+    if (ndirs && nroots) {
         /* Both name a set of directories and they mean different things; refusing is
          * cheaper than deciding which one wins. */
-        fprintf(stderr, "update: give either a root or --dir, not both\n");
+        fprintf(stderr, "update: give either roots or --dir, not both\n");
+        roots_free(roots, nroots);
         return 1;
     }
 
@@ -281,6 +428,7 @@ static int cmd_update(int argc, char **argv)
     if (esidx_load(&db, dbfile) != 0) {
         fprintf(stderr, "load failed: %s\n", dbfile);
         esidx_free(&db);
+        roots_free(roots, nroots);
         return 1;
     }
     uint32_t before = esidx_live_count(&db);
@@ -294,20 +442,23 @@ static int cmd_update(int argc, char **argv)
         if (e == EID_NONE) {
             fprintf(stderr, "update: %s is not a directory in this index\n", dirs[i]);
             esidx_free(&db);
+            roots_free(roots, nroots);
             return 1;
         }
         if (esidx_mark_dirty(&db, e) != 0) {
             fprintf(stderr, "update: %s is not a directory\n", dirs[i]);
             esidx_free(&db);
+            roots_free(roots, nroots);
             return 1;
         }
     }
 
     update_stats_t st;
     int rc = ndirs ? esidx_refresh_dirs(&db, flags, &st)
-                   : esidx_update(&db, root, flags, &st);
+                   : esidx_update(&db, nroots ? roots : NULL, nroots, flags, &st);
     if (rc != 0) {
         esidx_free(&db);
+        roots_free(roots, nroots);
         return 1;
     }
 
@@ -324,10 +475,12 @@ static int cmd_update(int argc, char **argv)
     if (esidx_save(&db, dbfile) != 0) {
         fprintf(stderr, "save failed: %s\n", dbfile);
         esidx_free(&db);
+        roots_free(roots, nroots);
         return 1;
     }
     TSDONE2("update: total", t0, "(%u entries)", db.et.count);
     esidx_free(&db);
+    roots_free(roots, nroots);
     return 0;
 }
 

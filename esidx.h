@@ -561,7 +561,30 @@ typedef struct {
     const char   *skip_src;  /* which flag/sidecar/env decided it, for the log and for
                               * `esidx options`; a static string, never NULL after
                               * esidx_index_apply() */
-    eid_t         root_eid; /* the scanned root; parent:"" and root: anchor here */
+    /* The indexed locations, one per tree this index covers. `parent:""` and `root:`
+     * anchor here, esidx_update() reconciles them, esidx_compact() rebuilds from them,
+     * and the watcher marks them -- so "where does this snapshot come from" is a list
+     * and every one of those had to stop meaning "the" root.
+     *
+     * Derived, not stored: a root is exactly an entry whose parent is EID_NONE, so
+     * esidx_load() collects every parentless row while it rebuilds the children
+     * vectors and the snapshot carries nothing extra. Appending is what esidx_add()
+     * does with a parentless add, so the two cannot disagree about what a root is.
+     *
+     * In scan order -- the order `build` was handed them, and the order `parent:""`
+     * returns them in. Deliberately not sorted: that would make the result order a
+     * function of the paths rather than of the command, and a client pages through
+     * that order by OFFSET. */
+    eid_t        *roots;
+    uint32_t      nroots, roots_cap;
+    /* How many roots one index may name. One place, because four layers need to agree on
+     * it and a cap written down twice is a cap that differs once: the CLI counts command
+     * line paths, esidx_scan() resolves roots into a stack array, esidx_compact() collects
+     * their paths before freeing the tree that names them, and esidx_add() appends. It is
+     * a ceiling rather than a limit anyone should hit -- 64 locations is a machine with a
+     * lot of mounts -- and it exists to turn "unbounded" into a refusal with a number in
+     * it rather than a stack overflow with a number in the wrong place. */
+#define ESIDX_MAX_ROOTS 64
     /* Directories marked for the next reconcile (design §7's dirty set), in the order they
      * were marked. Transient state, like the overlays: never persisted, because it is a
      * function of what happened to the *filesystem* and not of the columns (D4), and reset
@@ -617,7 +640,24 @@ int esidx_remove(esidx_t *db, eid_t id);
 uint32_t esidx_live_count(const esidx_t *db);
 
 /* scan */
-int  esidx_scan(esidx_t *db, const char *root);
+/* Walk `nroots` trees into this index, in the order given: root 0's subtree first,
+ * then root 1's, so the roots list is the command line. Each becomes a parentless
+ * entry and therefore a root (see esidx_t.roots).
+ *
+ * Two roots that name the same directory, or one that is under another, are refused
+ * rather than walked: both would add a second copy of every row underneath, and the
+ * copy is indistinguishable from the original once it is in the index -- `path:` would
+ * answer with two ids and a client would show every file twice. */
+int  esidx_scan(esidx_t *db, char *const *roots, uint32_t nroots);
+/* The roots, in scan order. `i` out of range reads as EID_NONE, so a caller looping
+ * to esidx_nroots() cannot walk off the end -- the list is caller-sized and a
+ * read past it would be a read into whatever follows. */
+uint32_t esidx_nroots(const esidx_t *db);
+eid_t    esidx_root(const esidx_t *db, uint32_t i);
+/* Is `id` one of the roots? For the callers that ask per directory -- the sweep's skip
+ * test, the watcher's overflow mark -- this walks a list of a handful of entries,
+ * which is cheaper than the hash lookup that would answer the same question. */
+bool     esidx_is_root(const esidx_t *db, eid_t id);
 /* Bring a built index back in line with the filesystem (design §7). */
 #define EU_DEEP 0x1u   /* stat every entry, not just directories whose stamp moved */
 /* Do not compact, even past the tombstone threshold below. A batch caller wants the
@@ -634,7 +674,14 @@ int  esidx_scan(esidx_t *db, const char *root);
  * than the default: measured warm on r7000, 94 ms for /usr's 34 811 directories and
  * 1941 ms for /work's 651 894, against 0.4-1.1 ms for the pruned pass it sits next to. */
 #define EU_SWEEP 0x4u
-int  esidx_update(esidx_t *db, const char *root, unsigned flags, update_stats_t *st);
+/* Bring a built index back in line with the filesystem (design §7).
+ *
+ * `roots`/`nroots` selects which trees to reconcile; NULL/0 means every root, which is
+ * what a server wants and what a batch caller gets by naming none. A named tree must be
+ * one this index was built from -- see the guard in scan.c, which is the reason a
+ * reconcile cannot empty the index. */
+int  esidx_update(esidx_t *db, char *const *roots, uint32_t nroots,
+                  unsigned flags, update_stats_t *st);
 /* Mark every directory whose stored stamp differs from the filesystem's, and nothing
  * else. Fills the dirty set for esidx_refresh_dirs(); on its own it changes no row, which
  * is why every caller pairs it with one. Cost is one path-based stat per live directory

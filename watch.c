@@ -425,6 +425,19 @@ static int under_root(const esidx_watch_t *w, const char *path)
     return path[w->rootlen] == '\0' || path[w->rootlen] == '/';
 }
 
+/* Mark every root, and report how many took. Reached when the loss signals come in -- a
+ * batch the proxy could not attribute to a path, or a queue overflow -- and the honest
+ * answer to "I do not know what changed" is every root, not the first one: a partial
+ * sweep would leave the other trees frozen and read exactly like "nothing is changing
+ * over there". The caller adds to both counters, because it is the one that knows which
+ * is the batch and which is the session. */
+static uint32_t mark_all_roots(esidx_t *db)
+{
+    uint32_t n = 0;
+    for (uint32_t i = 0, m = esidx_nroots(db); i < m; i++)
+        if (esidx_mark_dirty(db, esidx_root(db, i)) == 0) n++;
+    return n;
+}
 /* Mark the directory that holds `path`. The parent, always -- see the header.
  * `made` is this batch's count and `st` is the lifetime total; they are separate because
  * the two are asked different questions: the log line says what this poll turn cost, and
@@ -441,7 +454,10 @@ static void mark_parent(esidx_watch_t *w, esidx_t *db, const char *path, int *ma
          * the root's own attributes is what a full pass is for -- and a no-op for the
          * second, since the root is already the top of the index. */
         if (strcmp(path, w->root) == 0) {
-            if (esidx_mark_dirty(db, db->root_eid) == 0) { w->st.marked++; (*made)++; }
+            /* w->root is this watcher's one tree, and it is *the* tree only because
+             * esidx_watch_open* refuses an index with more than one root (etp.c). So
+             * root 0 is not "the first of several" here -- it is the whole set. */
+            if (esidx_mark_dirty(db, esidx_root(db, 0)) == 0) { w->st.marked++; (*made)++; }
             else w->st.unknown++;
         } else {
             w->st.unknown++;
@@ -485,7 +501,7 @@ static void handle_event(esidx_watch_t *w, esidx_t *db, const struct sfa_event *
          * sweep is declined or fails, which is the weaker but non-empty answer. */
         w->st.overflow++;
         w->want_sweep = 1;
-        if (esidx_mark_dirty(db, db->root_eid) == 0) { w->st.marked++; (*made)++; }
+        { uint32_t k = mark_all_roots(db); w->st.marked += k; *made += k; }
         return;
     }
     if (ev->path_len == 0 || ev->path[0] == '\0') {
@@ -507,7 +523,7 @@ static void handle_event(esidx_watch_t *w, esidx_t *db, const struct sfa_event *
         w->want_sweep = 1;
         LOGW("watch: %llu event batch(es) the proxy could not attribute to a path; "
              "asking for a sweep", (unsigned long long)w->st.unresolved);
-        if (esidx_mark_dirty(db, db->root_eid) == 0) { w->st.marked++; (*made)++; }
+        { uint32_t k = mark_all_roots(db); w->st.marked += k; *made += k; }
         return;
     }
 

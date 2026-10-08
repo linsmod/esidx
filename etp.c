@@ -1384,7 +1384,9 @@ static void client_free(client_t *c)
 static void serve_refresh(esidx_t *db)
 {
     update_stats_t st;
-    if (esidx_update(db, NULL, EU_NOCOMPACT, &st) != 0)
+    /* NULL/0 roots: the whole-index pass, which is every root -- one in the only shape
+     * the watcher accepts today, several once it takes more than one mark. */
+    if (esidx_update(db, NULL, 0, EU_NOCOMPACT, &st) != 0)
         LOGW("refresh: reconcile failed; still serving the index as it was");
 }
 
@@ -1559,7 +1561,20 @@ int etp_serve(const etp_opts_t *opts)
     char embed_as[160] = "";
     if (opts->watch_sock || opts->watch_embed) {
         char root[PATH_MAX], err[256];
-        path_of(&db, db.root_eid, root, sizeof(root));
+        /* The watcher holds ONE fanotify mark, and a mark is per mount (sfa_server.c
+         * calls fanotify_mark() once, on this path). An index of several trees needs one
+         * mark per mount, which is the next layer's work; until it lands, this refuses
+         * rather than watching root 0 and calling the index current -- a server that is
+         * up to date about one tree and frozen about the others reports exactly like a
+         * server that is up to date about all of them. */
+        if (esidx_nroots(&db) != 1) {
+            fprintf(stderr, "watch: this snapshot has %u roots and the watcher covers one "
+                            "tree per mark; serve it without --watch, or rebuild it from a "
+                            "single root\n", esidx_nroots(&db));
+            esidx_free(&db);
+            return -1;
+        }
+        path_of(&db, esidx_root(&db, 0), root, sizeof(root));
         if (opts->watch_embed) {
             /* Bare --watch-embed marks the snapshot's own root: the tree whose events make
              * this index current is the tree that was indexed, so there is no second opinion
@@ -1699,7 +1714,9 @@ int etp_serve(const etp_opts_t *opts)
     }
     if (watch) {
         char root[PATH_MAX];
-        path_of(&db, db.root_eid, root, sizeof(root));
+        /* One root, guaranteed: the watcher branch above refuses anything else, so this
+         * is the whole list rather than its first element. */
+        path_of(&db, esidx_root(&db, 0), root, sizeof(root));
         /* Saying what the subscription does *not* cover is part of the banner: names
          * become current, attributes do not (§12 risk 8), and an operator reading only
          * the first line would otherwise assume otherwise. The middle clause is the other

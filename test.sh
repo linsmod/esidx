@@ -90,6 +90,23 @@ build() {
     return 1
 }
 
+# buildn <outfile> <root>...  -> the same, for an index with more than one location.
+# The per-root buildn counts are summed here rather than printed by the binary, which
+# is what makes a multi-root build comparable with find(1): one number for the lot.
+buildn() {
+    out="$1"; shift
+    if timeout 120 "$BIN" build "$@" -o "$out" >/dev/null 2>"$TMP/be"; then
+        BUILT=$(sed -n 's/^indexed \([0-9]*\) entries.*/\1/p' "$TMP/be")
+        grep -E '^indexed ' "$TMP/be" | sed 's/^/   /'
+        cat "$TMP/be" >>"$DIAG"
+        return 0
+    fi
+    cat "$TMP/be" >>"$DIAG"
+    bad "buildn $*" "see $DIAG"
+    BUILT=""
+    return 1
+}
+
 # ------------------------------------------------------------------ fixtures
 
 say "fixtures"
@@ -680,6 +697,124 @@ printf 'q' >"$FLAT/sub1/deep/leaf.txt"
 FLAT_DB="$TMP/flat.idx"
 build "$FLAT" "$FLAT_DB" >/dev/null
 expect "flat fixture has 13 entries" "$BUILT" "13"
+DB="$FLAT_DB"
+
+# ------------------------------------------------------- several locations in one index
+#
+# The other half of the fixture, indexed as its own snapshot rather than as a subdirectory
+# of $FLAT: two trees with no common ancestor inside the index, which is the only way to
+# reach an index that is not "a directory and everything under it". Compared against
+# find(1) over both, because the index suite's job is the *index* -- and because the count
+# is the number that would silently double if a root were walked twice.
+say "several locations in one index"
+
+MR_A="$TMP/mr/a"; MR_B="$TMP/mr/b"
+mkdir -p "$MR_A/sub1/deep" "$MR_B/sub2"
+: >"$MR_A/a.txt"
+printf 'x%.0s' $(seq 1 500)  >"$MR_A/b.conf"
+printf 'y%.0s' $(seq 1 200)  >"$MR_A/sub1/x.conf"
+printf 'q' >"$MR_A/sub1/deep/leaf.txt"
+: >"$MR_B/d.log"
+printf 'z%.0s' $(seq 1 100)  >"$MR_B/sub2/y.txt"
+MR_DB="$TMP/mr.idx"
+mr_find() { find "$MR_A" "$MR_B" | wc -l; }
+buildn "$MR_DB" "$MR_A" "$MR_B" >/dev/null
+expect "two roots index both trees" "$BUILT" "$(mr_find)"
+
+DB="$MR_DB"
+# inc_sync() is wired to $INC, so this needs its own: same shape (index vs find(1), then
+# the dir/file split), pointed at the two-root fixture.
+mr_sync() {
+    q ""
+    expect "two-root index matches find(1) after: $1" "$(n "$LAST")" "$(mr_find)"
+    q "folder:"; MRD=$(n "$LAST")
+    q "file:";   MRF=$(n "$LAST")
+    expect "dir/file split matches find after: $1" "$MRD/$MRF" \
+        "$(find "$MR_A" "$MR_B" -type d | wc -l)/$(find "$MR_A" "$MR_B" -type f | wc -l)"
+}
+mr_sync "the two-root build"
+q "parent:$MR_A/sub1"
+expect "parent: of a subdirectory still works" "$(n "$LAST")" "2"
+q "parent:$MR_B/sub2"
+expect "parent: under the other root" "$(n "$LAST")" "1"
+
+# The paths must stay absolute and per-tree: two rows sharing a display name is the
+# ordinary case (a.txt exists once, x.conf once) and nothing about a multi-root index
+# may make them collide.
+q "a.txt"
+expect "a name from the first root resolves" "$(n "$LAST")" "1"
+expect "...with its own tree's path" "$(paths "$LAST")" "$MR_A/a.txt "
+
+# A snapshot reload rebuilds the root list from the rows (a root is an entry with no
+# parent), so this is the assertion that the list survives a round trip rather than being
+# carried across in memory.
+cp "$MR_DB" "$TMP/mr-copy.idx"
+DB="$TMP/mr-copy.idx"
+q "ext:log"
+expect "the rows survive a snapshot round trip" "$(n "$LAST")" "1"
+q "parent:$MR_A/sub1"
+expect "...and so does the path hash" "$(n "$LAST")" "2"
+
+# Two roots that would index the same bytes twice are refused, not walked. Both spellings
+# of that mistake are here because only one of them is obvious from the command line.
+if "$BIN" build "$MR_A" "$MR_A" -o "$TMP/dup.idx" >/dev/null 2>"$TMP/err"; then
+    bad "the same directory twice is refused"
+else
+    grep -q 'same directory' "$TMP/err" \
+        && ok "the same directory twice is refused" \
+        || bad "the same directory twice is refused" "$(cat "$TMP/err")"
+fi
+if "$BIN" build "$MR_A" "$MR_A/sub1" -o "$TMP/nest.idx" >/dev/null 2>"$TMP/err"; then
+    bad "one root under another is refused"
+else
+    grep -q 'indexing both would list every file' "$TMP/err" \
+        && ok "one root under another is refused" \
+        || bad "one root under another is refused" "$(cat "$TMP/err")"
+fi
+# ... and the refusal must leave no snapshot behind, or the next start reads a half index.
+if [ -e "$TMP/dup.idx" ]; then
+    bad "a refused build writes no snapshot"
+else
+    ok "a refused build writes no snapshot"
+fi
+
+# A roots file is how a packaged install names several trees, so the file has to survive
+# the things a hand-typed list does not: comments, blank lines, CRLF, and a relative path
+# that must not be resolved against the current directory.
+printf '# two trees\r\n\r\n%s\r\n\n%s\r\nnot/a/path\r\n' "$MR_A" "$MR_B" >"$TMP/roots.txt"
+printf '%s\n%s\n' "$MR_A" "$MR_B" >"$TMP/roots-ok.txt"
+buildn "$TMP/mr-file.idx" --roots-file="$TMP/roots-ok.txt" >/dev/null
+expect "--roots-file builds the same index" "$BUILT" "$(mr_find)"
+if "$BIN" build --roots-file="$TMP/roots.txt" -o "$TMP/mr-bad.idx" >/dev/null 2>"$TMP/err"; then
+    bad "--roots-file refuses a relative path"
+else
+    grep -q 'is not an absolute path' "$TMP/err" \
+        && ok "--roots-file refuses a relative path" \
+        || bad "--roots-file refuses a relative path" "$(cat "$TMP/err")"
+fi
+
+# One update reconciles every root, and a root that was not asked for stays untouched --
+# the whole point of naming them, and the reason the argument is checked rather than
+# believed (a reconcile against the wrong tree deletes every row it cannot find).
+DB="$MR_DB"
+"$BIN" update "$MR_DB" >/dev/null 2>>"$DIAG"
+mr_sync "a full pass over both roots"
+: >"$MR_A/fresh.txt"; : >"$MR_B/fresh.txt"
+"$BIN" update "$MR_DB" >/dev/null 2>>"$DIAG"
+mr_sync "a file appearing in each root"
+rm -f "$MR_A/a.txt"
+"$BIN" update "$MR_DB" >/dev/null 2>>"$DIAG"
+mr_sync "a file removed from the first root"
+# Naming one root reconciles that root only -- this is the assertion that the argument has
+# teeth, and it is the reason a named root is resolved against esidx_is_root() rather than
+# accepted as any directory the index happens to hold.
+: >"$MR_B/only-b.txt"
+if "$BIN" update "$MR_DB" "$MR_B" >/dev/null 2>"$TMP/err"; then
+    mr_sync "one named root out of two"
+else
+    bad "update naming one of two roots" "$(cat "$TMP/err")"
+fi
+
 DB="$FLAT_DB"
 
 say "query language: L0 structural"
@@ -1299,13 +1434,23 @@ expect "the depth-1 case --sweep also has, with nothing to do" \
 DB="$INC_DB"
 
 # 13. a refresh against a tree that is not this index must refuse rather than
-#     delete every row it cannot find
+#     delete every row it cannot find. Two refusals, because there are two mistakes:
+#     a path this index does not have at all, and one it has but that is not a root --
+#     the second is the one a multi-location index can now make by accident, and
+#     reconciling "one level down" would delete everything below it.
 if "$BIN" update "$INC_DB" "$TREE" >/dev/null 2>"$TMP/err"; then
     bad "update refuses a root that is not this index"
 else
-    grep -q 'is not this index' "$TMP/err" \
+    grep -q 'is not a root of this index' "$TMP/err" \
         && ok "update refuses a root that is not this index" \
         || bad "update refuses a root that is not this index" "$(cat "$TMP/err")"
+fi
+if "$BIN" update "$INC_DB" "$TREE/sub1" >/dev/null 2>"$TMP/err"; then
+    bad "update refuses an indexed directory that is not a root"
+else
+    grep -q 'is not a root of this index' "$TMP/err" \
+        && ok "update refuses an indexed directory that is not a root" \
+        || bad "update refuses an indexed directory that is not a root" "$(cat "$TMP/err")"
 fi
 inc_sync "after the refused update"
 

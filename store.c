@@ -626,6 +626,24 @@ static int link_new(esidx_t *db, eid_t id)
     return 0;
 }
 
+/* Append one root. The one writer of the list, from both of the places that find one:
+ * esidx_add() with a parentless entry, and esidx_load()'s rebuild. Returns 0 on
+ * allocation failure, which the caller turns into EID_NONE or -1 -- an index whose
+ * root list is short is an index that answers `parent:""` with the wrong rows, so
+ * neither caller is allowed to carry on. */
+static int root_push(esidx_t *db, eid_t id)
+{
+    if (db->nroots == db->roots_cap) {
+        uint32_t cap = db->roots_cap ? db->roots_cap * 2 : 4;
+        eid_t *grown = realloc(db->roots, cap * sizeof(eid_t));
+        if (!grown) return -1;
+        db->roots = grown;
+        db->roots_cap = cap;
+    }
+    db->roots[db->nroots++] = id;
+    return 0;
+}
+
 eid_t esidx_add(esidx_t *db, eid_t parent, const entry_in_t *in)
 {
     entry_table_t *et = &db->et;
@@ -655,8 +673,12 @@ eid_t esidx_add(esidx_t *db, eid_t parent, const entry_in_t *in)
     et->stamp[id]     = in->stamp;
     et->ext_id[id]    = (in->flags & EF_DIR) ? 0 : ext_of(db, in->name);
 
-    if (parent == EID_NONE) db->root_eid = id;
-    else if (di_add_child(db, parent, id) != 0) return EID_NONE;
+    /* A parentless entry *is* a root, and this is the only writer of the list: the
+     * load path collects the same predicate while it rebuilds the children vectors,
+     * so a snapshot round-trips without the list being stored. */
+    if (parent == EID_NONE) {
+        if (root_push(db, id) != 0) return EID_NONE;
+    } else if (di_add_child(db, parent, id) != 0) return EID_NONE;
 
     if (db->built) {
         if (link_new(db, id) != 0) { LOGE("cannot index new entry %s", in->name); return EID_NONE; }
@@ -2210,7 +2232,9 @@ void esidx_init(esidx_t *db)
     db->di.ht_off = calloc(1024, sizeof(uint32_t));
     db->di.ht_val = calloc(1024, sizeof(eid_t));
     db->di.ht_mask = 1023;
-    db->root_eid = EID_NONE;
+    /* The roots list needs no sentinel: nroots == 0 is "no roots", which is what the
+     * memset above already left it as. It used to be root_eid = EID_NONE here, and
+     * that line was the reason a caller could not tell "no root" from "root 0". */
     /* No decision here about which indexes exist. esidx_init() is called by paths that
      * have no dbfile (a compact's scratch index) and by paths that have already
      * resolved one, so a default set here would be a second place to be right about.
@@ -2237,7 +2261,22 @@ void esidx_free(esidx_t *db)
     esidx_free_name_rank(db);
     bs_free(&db->type.all); bs_free(&db->type.dirs); bs_free(&db->type.files);
     bs_free(&db->live);
+    free(db->roots); db->roots = NULL; db->nroots = db->roots_cap = 0;
     memset(db, 0, sizeof(*db));
+}
+
+uint32_t esidx_nroots(const esidx_t *db) { return db->nroots; }
+
+eid_t esidx_root(const esidx_t *db, uint32_t i)
+{
+    return i < db->nroots ? db->roots[i] : EID_NONE;
+}
+
+bool esidx_is_root(const esidx_t *db, eid_t id)
+{
+    for (uint32_t i = 0; i < db->nroots; i++)
+        if (db->roots[i] == id) return true;
+    return false;
 }
 
 /* (Re)allocate the dir path hash. Used by finalize for the batch build and by
@@ -2959,10 +2998,16 @@ int esidx_load(esidx_t *db, const char *path)
 
     /* rebuild derived structures: children lists, path hash, sorted indexes */
     uint64_t t1 = ts_us();
-    db->root_eid = EID_NONE;
+    /* Every parentless row is a root, and they are collected in id order -- which is
+     * scan order, because esidx_add() hands out ascending ids (D8) and the roots were
+     * appended in the order they were walked. So the list a load rebuilds is the list
+     * the build had, with nothing stored to say so. */
+    db->nroots = 0;
     for (uint32_t i = 0; i < et->count; i++) {
         if (et->flags[i] & EF_DEAD) continue;   /* a tombstone is nobody's child */
-        if (et->parent[i] == EID_NONE) db->root_eid = i;
+        if (et->parent[i] == EID_NONE) {
+            if (root_push(db, i) != 0) return -1;
+        }
         else di_add_child(db, et->parent[i], i);
     }
     TSDONE("load: rebuild children vectors", t1);

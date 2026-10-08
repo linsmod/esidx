@@ -179,7 +179,11 @@ static void scan_dir(esidx_t *db, int dirfd, eid_t parent, uint16_t depth, char 
     }
 }
 
-int esidx_scan(esidx_t *db, const char *root)
+/* One root: add the row, walk it, and attribute the walk. Split out of esidx_scan()
+ * so that a multi-root build reports its timings per tree -- three roots on three
+ * filesystems are three different measurements, and one number for the lot would be
+ * the least informative one. */
+static int scan_one_root(esidx_t *db, const char *root)
 {
     struct stat sb;
     if (stat(root, &sb) != 0) {
@@ -215,15 +219,21 @@ int esidx_scan(esidx_t *db, const char *root)
      * LOG_PERF), and round.sh -- which produces the numbers in design §10 -- builds
      * at INFO. */
     bool timing = log_enabled(LOG_PERF);
+    /* Deltas, not the running counters: from the second root on, the totals are every
+     * tree walked so far, and dividing those by this root's elapsed time would print a
+     * rate that falls with each root added and means nothing. */
+    uint64_t e0 = db->scan.entries, f0 = db->scan.files,
+             d0 = db->scan.dirs, fd0 = db->scan.dirs_found,
+             so0 = db->scan.stat_ok, sf0 = db->scan.stat_fail;
     scan_dir(db, fd, root_id, 1, pool, timing);
     close(fd);
 
     TSDONE2("scan: walk", t0,
             "(dirs=%llu entries=%llu files=%llu dirs_found=%llu depth_max=%llu)",
-            (unsigned long long)db->scan.dirs,
-            (unsigned long long)db->scan.entries,
-            (unsigned long long)db->scan.files,
-            (unsigned long long)db->scan.dirs_found,
+            (unsigned long long)(db->scan.dirs - d0),
+            (unsigned long long)(db->scan.entries - e0),
+            (unsigned long long)(db->scan.files - f0),
+            (unsigned long long)(db->scan.dirs_found - fd0),
             (unsigned long long)db->scan.depth_max);
 
     if (timing) {
@@ -280,7 +290,7 @@ int esidx_scan(esidx_t *db, const char *root)
         LOGW("scan: %llu directories could not be opened (permissions?)",
              (unsigned long long)db->scan.open_fail);
 
-    uint64_t total = db->scan.stat_ok + db->scan.stat_fail;
+    uint64_t total = (db->scan.stat_ok - so0) + (db->scan.stat_fail - sf0);
     if (total) {
         double sec = ts_ms_since(t0) / 1000.0;
         LOGI("scan: %.1f us/entry, %.0f entries/s",
@@ -299,6 +309,72 @@ int esidx_scan(esidx_t *db, const char *root)
     if (db->scan.depth_max >= SCAN_MAX_DEPTH)
         LOGW("scan: hit the depth cap (%u) -- subtrees below that were NOT indexed",
              SCAN_MAX_DEPTH);
+    return 0;
+}
+
+/* Is `b` `a`, or something under it? On whole components, so "/work2" is not under
+ * "/work" -- the same rule under_root() uses for event paths, and for the same reason:
+ * a prefix compare that is not component-wise collects a neighbour's tree. */
+static int path_under(const char *a, size_t alen, const char *b, size_t blen)
+{
+    if (blen == 1 && b[0] == '/') return 1;         /* "/" contains everything */
+    if (alen < blen) return 0;
+    if (strncmp(a, b, blen) != 0) return 0;
+    return a[blen] == '\0' || a[blen] == '/';
+}
+
+/* Refuse a root set that would index the same bytes twice.
+ *
+ * Both failure modes are silent afterwards, which is why they are caught here rather
+ * than left to the query layer: two roots naming one directory, or one root under
+ * another, put two rows for every file underneath, and once they are in the index the
+ * duplicate is indistinguishable from the original -- `path:` answers with two ids,
+ * `count:` is twice the truth, and Everything shows every file twice. There is no
+ * point downstream at which this becomes visible and cheap to undo.
+ *
+ * dev+ino is the test for "the same directory" rather than a path compare, because the
+ * root itself is reached with openat(AT_FDCWD, root), which follows a symlink: /work
+ * and /srv/work are two names for one tree and would otherwise both be walked. */
+static int roots_reject_overlap(char *const *roots, uint32_t nroots)
+{
+    for (uint32_t i = 0; i < nroots; i++) {
+        struct stat si;
+        if (stat(roots[i], &si) != 0) {
+            LOGE("stat(%s) failed: %s", roots[i], strerror(errno));
+            return -1;
+        }
+        for (uint32_t j = 0; j < i; j++) {
+            struct stat sj;
+            size_t bi = strlen(roots[j]), ai = strlen(roots[i]);
+            if (stat(roots[j], &sj) != 0) continue;   /* reported when j is the subject */
+
+            if (si.st_dev == sj.st_dev && si.st_ino == sj.st_ino) {
+                LOGE("roots: %s and %s are the same directory (dev %llu ino %llu)",
+                     roots[j], roots[i],
+                     (unsigned long long)si.st_dev, (unsigned long long)si.st_ino);
+                return -1;
+            }
+            if (path_under(roots[i], ai, roots[j], bi) ||
+                path_under(roots[j], bi, roots[i], ai)) {
+                LOGE("roots: %s contains %s -- indexing both would list every file "
+                     "under it twice", roots[i], roots[j]);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+int esidx_scan(esidx_t *db, char *const *roots, uint32_t nroots)
+{
+    if (!roots || nroots == 0) { LOGE("scan: no root given"); return -1; }
+    if (roots_reject_overlap(roots, nroots) != 0) return -1;
+
+    for (uint32_t i = 0; i < nroots; i++)
+        if (scan_one_root(db, roots[i]) != 0) return -1;
+
+    LOGI("scan: %u root%s: %s", nroots, nroots == 1 ? "" : "s",
+         nroots == 1 ? roots[0] : "several (see each 'scan: root=' above)");
     return 0;
 }
 
@@ -673,7 +749,7 @@ int esidx_sweep_dirs(esidx_t *db, sweep_stats_t *st)
 
     for (uint32_t i = bs_next(&db->type.dirs, 0); i < db->et.count;
          i = bs_next(&db->type.dirs, i + 1)) {
-        if (i == db->root_eid) continue;      /* always reconciled anyway */
+        if (esidx_is_root(db, i)) continue;     /* always reconciled anyway */
         if (!bs_test(&db->live, i)) continue; /* a tombstone keeps its bits until killed */
         if (db->et.stamp[i] == 0) continue;   /* never stat'ed, so nothing to compare */
 
@@ -815,39 +891,53 @@ int esidx_refresh_dirs(esidx_t *db, unsigned flags, update_stats_t *st)
     return 0;
 }
 
-/* The whole-index pass: mark the root and apply. It is not a different reconcile from a
- * partial one -- the root's reconcile descends into every subdirectory whose stamp moved,
+/* The whole-index pass: mark every root and apply. It is not a different reconcile from a
+ * partial one -- a root's reconcile descends into every subdirectory whose stamp moved,
  * which is what "full" has always meant here, and whatever a watcher missed is exactly what
- * the next one of these is for.
+ * the next one of these is for. With several roots it is still one pass: all of them go
+ * into the same dirty set and the apply below reconciles all of them in one go, so a
+ * three-tree index costs one pass, not three.
  *
  * That sentence is also the reach, and EU_SWEEP is how a caller buys past it: descending
  * into "every subdirectory whose stamp moved" only finds the ones above the change. With
  * the sweep the dirty set holds every directory that moved anywhere, so the apply below
- * reconciles all of them and the root's own descent becomes redundant rather than wrong. */
-int esidx_update(esidx_t *db, const char *root, unsigned flags, update_stats_t *st)
+ * reconciles all of them and the roots' own descent becomes redundant rather than wrong. */
+int esidx_update(esidx_t *db, char *const *roots, uint32_t nroots,
+                 unsigned flags, update_stats_t *st)
 {
     memset(st, 0, sizeof(*st));
     if (!db || !db->built) { LOGE("update: the index has not been finalized"); return -1; }
-    if (db->root_eid == EID_NONE) { LOGE("update: the index has no root"); return -1; }
+    if (db->nroots == 0) { LOGE("update: the index has no root"); return -1; }
 
-    /* The root argument is matched against the indexed root rather than trusted,
-     * because a reconcile against a different tree would delete every row it did
-     * not find -- a typo must not be able to empty the index. */
-    eid_t rid = db->root_eid;
-    if (root && *root) {
-        rid = di_lookup(db, root);
-        if (rid == EID_NONE) {
-            char have[4096];
-            path_of(db, db->root_eid, have, sizeof(have));
-            LOGE("update: %s is not this index (it was built from %s)", root, have);
-            return -1;
+    /* Every named tree is matched against the indexed roots rather than trusted, because
+     * a reconcile against a different tree would delete every row it did not find -- a
+     * typo must not be able to empty the index. Naming none means all of them, which is
+     * the whole-index pass above and the only form a server uses. */
+    uint32_t nsel = nroots;
+    eid_t   sel[ESIDX_MAX_ROOTS];
+    if (!roots || nroots == 0) {
+        for (uint32_t i = 0; i < db->nroots; i++) sel[i] = db->roots[i];
+        nsel = db->nroots;
+    } else {
+        for (uint32_t i = 0; i < nroots; i++) {
+            eid_t rid = di_lookup(db, roots[i]);
+            if (rid == EID_NONE || !esidx_is_root(db, rid)) {
+                LOGE("update: %s is not a root of this index (it was built from %s)",
+                     roots[i], db->nroots == 1 ? "one tree" : "several");
+                return -1;
+            }
+            sel[i] = rid;
         }
     }
-    if (esidx_mark_dirty(db, rid) != 0) return -1;
-    /* After the root, not before it: the sweep's marks are for directories the root's own
-     * descent cannot reach, and marking the root first keeps the set sorted into a shape
-     * the apply already handles (parent before child), so a new subdirectory is listed
-     * before the sweep's own mark of it is considered. */
+    /* Marked in index order, not command-line order: esidx_refresh_dirs() sorts the set
+     * so a parent is reconciled before its children, and roots can never be each other's
+     * children, so the only thing this decides is which tree's changes land first. */
+    for (uint32_t i = 0; i < nsel; i++)
+        if (esidx_mark_dirty(db, sel[i]) != 0) return -1;
+    /* After the roots, not before them: the sweep's marks are for directories the roots'
+     * own descent cannot reach, and marking a root first keeps the set sorted into a
+     * shape the apply already handles (parent before child), so a new subdirectory is
+     * listed before the sweep's own mark of it is considered. */
     if (flags & EU_SWEEP) {
         sweep_stats_t sst;
         if (esidx_sweep_dirs(db, &sst) != 0) return -1;
@@ -857,11 +947,30 @@ int esidx_update(esidx_t *db, const char *root, unsigned flags, update_stats_t *
 
 int esidx_compact(esidx_t *db)
 {
-    char root[4096];
-    if (db->root_eid == EID_NONE) return -1;
-    path_of(db, db->root_eid, root, sizeof(root));
+    if (db->nroots == 0) return -1;
 
-    LOGI("compact: rebuilding from %s", root);
+    /* Every root's path, collected first: esidx_scan() needs them all before it starts,
+     * and esidx_free(db) below is about to take the only copy of the tree they names.
+     *
+     * Heap, not a stack array: 64 roots of PATH_MAX is 256 KiB of frame, and this file
+     * has already had to move a getdents buffer off the stack for exactly this reason
+     * (scan_dir's pool). The count is bounded by ESIDX_MAX_ROOTS either way, so nothing
+     * is given up by allocating. */
+    char  (*paths)[PATH_MAX] = malloc((size_t)db->nroots * PATH_MAX);
+    char **names = malloc((size_t)db->nroots * sizeof(*names));
+    if (!paths || !names) {
+        LOGE("compact: cannot allocate room for %u root paths", db->nroots);
+        free(paths);
+        free(names);
+        return -1;
+    }
+    int rc = -1;
+    for (uint32_t i = 0; i < db->nroots; i++) {
+        path_of(db, db->roots[i], paths[i], PATH_MAX);
+        names[i] = paths[i];
+    }
+
+    LOGI("compact: rebuilding from %u root%s", db->nroots, db->nroots == 1 ? "" : "s");
     esidx_t fresh;
     esidx_init(&fresh);
     /* The scratch index inherits the mask rather than re-resolving it: a compaction run
@@ -870,14 +979,20 @@ int esidx_compact(esidx_t *db)
      * same answer, but inheriting cannot disagree with the process that is running. */
     fresh.skip = db->skip;
     fresh.skip_src = db->skip_src;
-    if (esidx_scan(&fresh, root) != 0) { esidx_free(&fresh); return -1; }
-    esidx_finalize(&fresh);
-    /* Every id the caller may still be holding is now a different row, so the
-     * epoch has to move even though nothing about the filesystem did. */
-    fresh.epoch = db->epoch + 1;
-    esidx_free(db);
-    *db = fresh;
-    LOGI("compact: done, %u entries, epoch %llu", db->et.count,
-         (unsigned long long)db->epoch);
-    return 0;
+    if (esidx_scan(&fresh, names, db->nroots) == 0) {
+        esidx_finalize(&fresh);
+        /* Every id the caller may still be holding is now a different row, so the
+         * epoch has to move even though nothing about the filesystem did. */
+        fresh.epoch = db->epoch + 1;
+        esidx_free(db);
+        *db = fresh;
+        LOGI("compact: done, %u entries, epoch %llu", db->et.count,
+             (unsigned long long)db->epoch);
+        rc = 0;
+    } else {
+        esidx_free(&fresh);
+    }
+    free(paths);
+    free(names);
+    return rc;
 }
