@@ -1903,6 +1903,13 @@ and it is derived from a flag in the column dump, so a snapshot round trip needs
 reconciliation state at all — which is why the snapshot is still a plain dump of
 the columns and only gained the directory stamp.
 
+**Cost, measured**: memory grows with the tombstone ratio, and so does the
+per-query `bs_next` walk over the candidate words. Both are why compaction is
+automatic at 25 % rather than never — but §10 records that a tree whose *names*
+change costs nothing, so in practice the threshold is reached only by a workload
+that rewrites directories wholesale, and there a full rebuild is the cheaper
+answer anyway.
+
 ### D9 — An index has one *or more* roots, and a root is an entry with no parent
 
 **Decision**: `esidx_t` holds `roots[]` rather than one `root_eid`. `esidx_scan()`
@@ -1939,23 +1946,86 @@ Two properties of the shape are what make it cheap rather than a new mechanism:
   downstream point at which that becomes visible and cheap to undo, so it is refused at
   the only moment where the answer is still "nothing was built".
 
-**Not in this decision, and deliberately**: the watcher. `sfa` calls `fanotify_mark()`
-once, on one path, and a mark is per *mount* — so several roots on several filesystems
-need one mark each, which is a `watch.c` change and its own commit. Until it lands,
-`serve --watch` **refuses** a snapshot with more than one root rather than watching the
-first and reporting the rest as current, because a server that is up to date about one
-tree and frozen about the others is indistinguishable from one that is current about
-all of them. `serve` without `--watch` answers from a multi-root snapshot correctly;
-only the incremental half is missing.
+**The watcher was not in this decision, and needed its own.** `sfa` calls `fanotify_mark()`
+once, on one path, and a mark is per *mount*, so several roots on several filesystems need one
+mark each. It landed separately, in `watch.c`: one group per distinct mount **id** among the
+roots, with the socket form refusing more than one mount because one proxy holds one mark
+(§12.14 has the grouping and the hole it leaves). Between this decision and that one,
+`serve --watch` refused a snapshot with more than one root rather than watching the first and
+reporting the rest as current — a server up to date about one tree and frozen about the others
+is indistinguishable from one that is current about all of them.
 
-**Cost, measured**: memory grows with the tombstone ratio, and so does the
-per-query `bs_next` walk over the candidate words. Both are why compaction is
-automatic at 25 % rather than never — but §10 records that a tree whose *names*
-change costs nothing, so in practice the threshold is reached only by a workload
-that rewrites directories wholesale, and there a full rebuild is the cheaper
-answer anyway.
+### D10 — A running server reloads its locations from a file, in a child process
+
+**Decision**: `serve --reload-config=PATH` stats `PATH` every 5 s. When its identity changes
+(device, inode, mtime, size), it runs **`esidx build --roots-file=PATH -o <dbfile>.new`** as a
+child process, and on that child's exit status of 0 loads the result and swaps it into the live
+index by the mechanism `esidx_compact()` already uses: epoch + 1, free the old, assign the new.
+Then it writes the new index to the live `<dbfile>`, rebuilds the watcher for the new root set,
+and unlinks the temporary.
+
+**Reason**: adding a location is a *full scan* of that location — there is nothing to
+reconcile, because `esidx_update()` only walks trees the index already holds. That scan is
+60–90 s on a real tree, and in-process it would be 60–90 s in which the serve loop answers
+nobody. A child is half the answer; the other half is the reap — the serve loop is
+single-threaded, so a blocking `waitpid()` in it would be the same outage wearing a
+different hat. The child is forked and *reaped with `WNOHANG` on every loop wake* (the
+1000 ms poll timeout guarantees one), so clients are answered from the old index
+throughout the build and the swap lands within a second of the child exiting.
+
+Four details are decisions rather than consequences:
+
+- **The child writes `<dbfile>.new`, never the live path.** `esidx_save()` opens with `"wb"` —
+  it truncates in place. A child writing the live path would leave a half file if it died,
+  which the *next* restart would refuse to load, and the running server's own `--save` would
+  put its older in-memory copy back over the child's work. The swap therefore goes through a
+  temporary, and the live path is written afterwards **by the server, from the index it is now
+  serving** — which is also what makes the next start fast instead of loading a stale file.
+  Omitting that last write is the bug this paragraph exists to prevent: the service would be
+  correct while running and revert to the old locations on the next restart.
+- **`build`, not `update`, and the whole root list rather than the new entries.** There is no
+  merge: an index is a set of columns over one id space, and combining two means renumbering
+  every id in one of them. So the cost of adding one location is a rescan of everything, and
+  that cost is stated in the log line when it happens rather than implied by the flag's name.
+- **A stat, not a fanotify mark.** The marks cover the mounts the *indexed roots* are on, and
+  `/etc/esidx/roots` is on the root filesystem, which an index of `/work` and `/data` has no
+  reason to include. Watching one file would mean a privileged mark for it. One `stat` every
+  5 s is not measurable and works identically in both watcher forms — which matters, because
+  the two-process form cannot open an extra mark at all.
+- **The child is forked after the privilege drop**, so it runs as the identity the server
+  became (`--drop-to`). Forking before the drop would hand a root child to a deployment whose
+  entire point is that no process here is root. `sfa` opens its fds `O_CLOEXEC`, so `execv`
+  closes the fanotify group rather than passing a privileged fd to an unprivileged child.
+- **At shutdown, a child still building is killed, not waited for.** It wrote only the
+  temporary, so nothing on disk is half-written and the next start loads the live file as it
+  was; a server that was asked to stop should stop. `esidx build` installs no handlers, so
+  SIGTERM takes the child immediately.
+
+**What this does not do, stated because it will be tried**: it does not watch
+`/etc/default/esidx`. That file is systemd's, read once before `ExecStart`, so a change there
+needs a restart — the port, the bind address and the sweep interval cannot move under a running
+server, and a knob that appeared to do that would be worse than none. Only the locations file
+is applied live.
+
+**Where the two requirements conflict.** Reloading changes the root set, so the watcher
+has to be rebuilt: new prefixes, and a mount that was not marked before may need one. In the
+**embedded form this rebuild structurally cannot succeed**: `fanotify_init` needs
+CAP_SYS_ADMIN, the reload runs long after the drop, and measured, the serve process is
+uid `nobody` with `CapEff` = CAP_DAC_READ_SEARCH and nothing else at that moment. So the
+new watcher is opened **before** the old one is closed — an EPERM there must not take a
+group that was still delivering events for the old locations down with it. What survives
+helps: those locations are in the new index too, so their events reconcile unchanged, and
+only the newly added ones are repaired by the sweep or `--refresh` until a restart. The
+failure is one ERROR line saying exactly that. In the **socket form** the rebuild is
+unprivileged (`sfa` holds the group) and is expected to work; if it still fails, the old
+watcher is kept on the same terms. Refusing to reload would satisfy the "a `--watch` that
+silently does nothing is worse than none" rule and break the requirement this decision
+exists to satisfy; a service that is up, correct-as-of-now and event-driven about everything
+but the newest location is the better of the two provided the log line is there.
 
 ---
+
+
 
 ## 12. Risks
 

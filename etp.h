@@ -50,6 +50,14 @@ typedef struct {
      * survive the drop). `watch_sock` is ignored in this mode except as the name of the
      * socket sfa still creates for other clients; NULL takes a per-process default. */
     const char *watch_embed;
+    /* A locations file to watch, and reload from without restarting -- design D10.
+     * `serve` stats it every 5 s and, when it changes, builds a new index in a child
+     * process and swaps it in. NULL (the default) means the feature is off, so a
+     * deployment that does not want a self-restarting index does not get one.
+     *
+     * It is NOT /etc/default/esidx: that file is systemd's, read once before ExecStart,
+     * and the port or the bind address in it cannot move under a running process. */
+    const char *reload_config;
     /* "user" or "user:group" to become once the group is open. Required with
      * watch_embed, and refusing to be absent is the point: see watch.h. */
     const char *drop_to;

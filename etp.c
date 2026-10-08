@@ -67,6 +67,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -1497,6 +1498,85 @@ static void serve_apply_watch(esidx_t *db, esidx_watch_t *w, int *pending,
          (unsigned long long)(ws ? ws->unknown : 0));
 }
 
+/* ---- reloading the indexed locations from a file (design D10) ----------------
+ *
+ * One stat every CONFIG_POLL_US, and a child process when the file's identity moves. The
+ * child is `esidx build --roots-file=... -o <dbfile>.new`: a *new* location has never been
+ * scanned, so there is nothing to reconcile and `update` cannot help; and the result is
+ * applied by the swap esidx_compact() already performs, so "the index changed underneath
+ * the running server" has one implementation rather than two.
+ *
+ * What this deliberately does not watch is /etc/default/esidx. systemd reads that file
+ * once, before ExecStart, so the port and the bind address in it cannot move under a
+ * running process -- and a flag that appeared to do that would be worse than none.
+ */
+
+/* 5 s. One stat is not a measurable cost against a serve loop that answers queries, and
+ * the knob that would tune it is a knob nobody would ever turn. */
+#define CONFIG_POLL_US 5000000ULL
+
+/* Enough of a file's identity to notice an edit. Device and inode are in it because an
+ * editor that replaces rather than writes (which is what `mv` over the file does, and what
+ * most editors do on save) leaves mtime and size looking plausible while the file is a
+ * different one -- and serving from the wrong list of locations is the failure this whole
+ * feature has to not have. */
+typedef struct { dev_t dev; ino_t ino; int64_t mtime; int64_t size; bool have; } cfgid_t;
+
+static cfgid_t cfg_stat(const char *path)
+{
+    cfgid_t c = { 0 };
+    struct stat st;
+    if (stat(path, &st) != 0) return c;
+    c.dev = st.st_dev; c.ino = st.st_ino;
+    c.mtime = (int64_t)st.st_mtim.tv_sec * 1000000000LL + (int64_t)st.st_mtim.tv_nsec;
+    c.size = (int64_t)st.st_size;
+    c.have = true;
+    return c;
+}
+
+static bool cfg_same(const cfgid_t *a, const cfgid_t *b)
+{
+    return a->have && b->have && a->dev == b->dev && a->ino == b->ino &&
+           a->mtime == b->mtime && a->size == b->size;
+}
+
+/* Fork the build child and return its pid, or -1 if it could not be started at all.
+ *
+ * /proc/self/exe rather than argv[0]: the unit runs `esidx`, an operator runs `./esidx`,
+ * and a caller that reached this through a symlink or a relative path would otherwise have
+ * the child look for a file that is not there. execv on a path that has gone away is an
+ * error we report, not one a client ever sees.
+ *
+ * No fork() before the privilege drop and no second one after: this runs in the serve
+ * loop, long after `--watch-embed` gave CAP_SYS_ADMIN back, so the child is the identity
+ * the server became. sfa opens its fds O_CLOEXEC, so execv closes the fanotify group
+ * rather than handing a privileged descriptor to an unprivileged process.
+ *
+ * Fork and *not* wait: the serve loop is single-threaded, so a waitpid() here would be
+ * the whole server holding its breath for the length of a scan -- 60-90 s on /usr, which
+ * is exactly the outage the feature exists to avoid. The child is reaped with
+ * WNOHANG on every loop wake instead (reload_reap), which is what makes the claim in
+ * the log line below true rather than aspirational: a client that connects while the
+ * build runs is answered, from the old index, immediately. */
+static pid_t spawn_build(const char *roots_file, const char *out)
+{
+    char self[64], flags[PATH_MAX + 32];
+    snprintf(self, sizeof(self), "/proc/self/exe");
+    snprintf(flags, sizeof(flags), "--roots-file=%s", roots_file);
+
+    pid_t pid = fork();
+    if (pid < 0) { LOGE("reload-config: fork failed: %s", strerror(errno)); return -1; }
+    if (pid == 0) {
+        char *argv[] = { self, (char *)"build", flags, (char *)"-o", (char *)out, NULL };
+        execv(self, argv);
+        /* Only reached on failure. _exit and not exit: this process is a copy of a serve
+         * loop with clients attached, and running atexit handlers or flushing its buffers
+         * a second time is not something a failed exec should be allowed to do. */
+        _exit(127);
+    }
+    return pid;
+}
+
 /* Write the snapshot, but only if something has changed since the last write.
  *
  * `since` is the epoch the file on disk corresponds to, so "nothing changed" needs no
@@ -1511,6 +1591,175 @@ static void serve_save(const esidx_t *db, const char *dbfile, uint64_t *since, c
     if (esidx_save(db, dbfile) != 0) { LOGE("refresh: cannot write %s", dbfile); return; }
     *since = db->epoch;
     LOGI("refresh: wrote %s (%s) in %.1f ms", dbfile, why, (double)(ts_us() - t0) / 1000.0);
+}
+
+/* Swap in a freshly built index. Returns 0 on success.
+ *
+ * The order of these steps is the whole design, so it is worth stating why each is where
+ * it is. The temporary is loaded first (nothing is disturbed until it has parsed). The
+ * epoch moves before the free, because every cached result set in every client is a set of
+ * ids and the new index renumbers all of them -- `cache_matches()` compares the epoch, so
+ * this is what stops a client being served a set of unrelated rows. The live path is then
+ * written *from the index now in memory*, which is not housekeeping: without it the service
+ * would be correct while running and come back up on the old locations after a restart,
+ * which is the one outcome this feature cannot have. Only then is the temporary unlinked.
+ *
+ * A failure anywhere leaves `*db` exactly as it was, which is the property that makes it
+ * safe to call from the serve loop at all. */
+static int reload_swap(esidx_t *db, const char *live, const char *tmp)
+{
+    esidx_t fresh;
+    esidx_init(&fresh);
+    /* The same mask, for the reason esidx_compact() gives: a reload run by a process told
+     * not to build an index must not quietly put it back on disk. */
+    fresh.skip = db->skip;
+    fresh.skip_src = db->skip_src;
+    if (esidx_load(&fresh, tmp) != 0) {
+        LOGE("reload-config: the rebuilt index at %s did not load; still serving the one I have",
+             tmp);
+        esidx_free(&fresh);
+        return -1;
+    }
+    if (fresh.nroots == 0) {
+        LOGE("reload-config: %s built an index with no location; keeping the current one", tmp);
+        esidx_free(&fresh);
+        return -1;
+    }
+    fresh.epoch = db->epoch + 1;
+
+    char root[PATH_MAX];
+    path_of(&fresh, esidx_root(&fresh, 0), root, sizeof(root));
+    LOGI("reload-config: new index: %u entries, %u location%s (%s%s)",
+         fresh.et.count, fresh.nroots, fresh.nroots == 1 ? "" : "s", root,
+         fresh.nroots > 1 ? " ..." : "");
+
+    esidx_free(db);
+    *db = fresh;
+
+    if (esidx_save(db, live) != 0)
+        LOGE("reload-config: could not write %s; the running index is correct but a restart "
+             "would load the old one", live);
+    unlink(tmp);
+    return 0;
+}
+
+/* The in-flight rebuild, if any. pid 0 means none is running. */
+typedef struct { pid_t pid; char tmp[PATH_MAX]; } reload_t;
+
+/* Reap the rebuild child if it has finished, and apply the result. Called on every
+ * serve-loop wake while a build is running -- one waitpid(WNOHANG), which is why the
+ * reap is not folded into the 5 s stat tick: the build is the long part, and the swap
+ * should land within one poll wake (1 s) of the child exiting rather than up to 5 s. */
+static void reload_reap(esidx_t *db, const etp_opts_t *opts, esidx_watch_t **watch,
+                        uint64_t *saved_epoch, int *pending_marks, reload_t *rl)
+{
+    int ws;
+    pid_t r = waitpid(rl->pid, &ws, WNOHANG);
+    if (r == 0) return;           /* still building; the loop answers clients meanwhile */
+    if (r < 0) {
+        LOGE("reload-config: waitpid(%d) failed: %s; the rebuild is abandoned and the index "
+             "I have keeps serving", (int)rl->pid, strerror(errno));
+        unlink(rl->tmp);
+        rl->pid = 0;
+        return;
+    }
+    rl->pid = 0;
+    int rc = WIFEXITED(ws) ? WEXITSTATUS(ws) : 128 + WTERMSIG(ws);
+    if (rc != 0) {
+        LOGE("reload-config: the child build exited %d; still serving the index I have. "
+             "The reason is above; nothing was changed.", rc);
+        unlink(rl->tmp);
+        return;
+    }
+    if (reload_swap(db, opts->dbfile, rl->tmp) != 0) { unlink(rl->tmp); return; }
+
+    /* The marks are per mount and per prefix, and both just changed: a location on a
+     * filesystem that was not marked before produces no events at all until it is. So the
+     * watcher is rebuilt rather than reused.
+     *
+     * The new one is opened *before* the old one is closed, because in the embedded form
+     * the rebuild structurally cannot succeed: fanotify_init needs CAP_SYS_ADMIN, this
+     * runs long after the drop, and an EPERM here would otherwise take a watcher that was
+     * still working for the old locations down with it. What is kept still helps: events
+     * under the locations the index already held keep arriving (they are in the new index
+     * too, so the reconcile works unchanged); only the newly added ones are sweep-repaired.
+     * In the socket form the rebuild is unprivileged and expected to work.
+     *
+     * A rebuild that fails is still logged at ERROR and says which half is broken --
+     * because the alternative reading, "the index is fine", is what a frozen index looks
+     * like from the outside. */
+    if (*watch) {
+        char err[256];
+        char roots_buf[ESIDX_MAX_ROOTS][PATH_MAX];
+        char *roots[ESIDX_MAX_ROOTS];
+        uint32_t n = esidx_nroots(db);
+        for (uint32_t i = 0; i < n && i < ESIDX_MAX_ROOTS; i++) {
+            path_of(db, esidx_root(db, i), roots_buf[i], PATH_MAX);
+            roots[i] = roots_buf[i];
+        }
+        esidx_watch_t *nw;
+        if (opts->watch_embed)
+            nw = esidx_watch_open_embed(roots, n, db, opts->watch_sock,
+                                        opts->watch_group, opts->drop_to,
+                                        err, sizeof(err));
+        else
+            nw = esidx_watch_open(opts->watch_sock, roots, n, err, sizeof(err));
+        if (nw) {
+            esidx_watch_close(*watch);
+            *watch = nw;
+            *pending_marks = 0;
+            LOGI("reload-config: watcher rebuilt for %u location%s", n, n == 1 ? "" : "s");
+        } else {
+            LOGE("reload-config: the watcher could not be rebuilt for the new locations "
+                 "(%s) -- the OLD one is kept and changes under the locations this index "
+                 "already held keep arriving; the new ones are repaired only by the sweep "
+                 "or --refresh. Restart to make the new locations event-driven.", err);
+        }
+    }
+    /* The snapshot on disk is now the one in memory, so a --save timer must not consider
+     * the file already written for this epoch -- or the next tick would rewrite it. */
+    *saved_epoch = db->epoch;
+}
+
+/* One 5 s tick of the configuration watch: stat the file, and fork a rebuild when its
+ * identity has moved. Applying the result is reload_reap()'s half of the handshake --
+ * this end only starts builds. */
+static void serve_reload_config(const etp_opts_t *opts, cfgid_t *last,
+                                 bool *reported_missing, reload_t *rl)
+{
+    const char *cfg = opts->reload_config;
+
+    cfgid_t now = cfg_stat(cfg);
+    if (!now.have) {
+        /* Once per disappearance, not once per poll: a file that is missing for an hour is
+         * one line in the journal, not 720 of them. */
+        if (!*reported_missing) {
+            LOGE("reload-config: %s cannot be read; the indexed locations are whatever this "
+                 "server started with, and adding one will not be noticed", cfg);
+            *reported_missing = true;
+        }
+        return;
+    }
+    *reported_missing = false;
+    if (cfg_same(&now, last)) return;
+
+    /* One build at a time, and `*last` is deliberately NOT updated in this case: the
+     * change stays undetected-but-recorded-nowhere, so the first tick after the running
+     * build is reaped sees it again and starts the second build. */
+    if (rl->pid != 0) return;
+
+    /* Recorded *before* the fork, not after the reap: an edit that lands while the child
+     * runs must leave `*last` behind the file, or the change would be swallowed. The
+     * cost is that a failed build is not retried until the file moves again -- see the
+     * error line in reload_reap, which is what the operator acts on. */
+    *last = now;
+
+    snprintf(rl->tmp, sizeof(rl->tmp), "%s.reload", opts->dbfile);
+    unlink(rl->tmp);   /* a previous attempt's leftovers, if any */
+
+    LOGI("reload-config: %s changed; building %s in a child (the serve loop keeps "
+         "answering while it runs)", cfg, rl->tmp);
+    rl->pid = spawn_build(cfg, rl->tmp);
 }
 
 int etp_serve(const etp_opts_t *opts)
@@ -1769,6 +2018,15 @@ int etp_serve(const etp_opts_t *opts)
     uint64_t next_refresh = ts_us() + refresh_us;
     uint64_t next_save    = ts_us() + save_us;
     uint64_t next_sweep   = ts_us() + sweep_us;
+    /* The locations file's identity as of the last tick, and the deadline. Seeded from the
+     * file rather than left unset, so that starting a server does not immediately look like
+     * an edit and rebuild the index it was just started from. */
+    cfgid_t cfg_last = opts->reload_config ? cfg_stat(opts->reload_config) : (cfgid_t){ 0 };
+    bool    cfg_missing = false;
+    uint64_t next_cfg   = ts_us() + CONFIG_POLL_US;
+    /* The in-flight rebuild, its reap and this tick's stat being separate calls is what
+     * keeps the serve loop answering while a build runs. */
+    reload_t rl = { .pid = 0 };
 
     /* Either mechanism can change the index, and a server that changed it and exits without
      * writing is a day of work thrown away -- so the clean-exit save is keyed on this, not
@@ -1806,6 +2064,20 @@ int etp_serve(const etp_opts_t *opts)
          * the pending_marks test so a sweep cannot be silently skipped by a coalescing
          * window that is not due yet. */
         bool sweep_due = sweep_us && ts_us() >= next_sweep;
+        /* The rebuild child is reaped on every wake, not on the stat deadline: the build
+         * is the long part, the reap is one waitpid(WNOHANG), and a finished build should
+         * be swapped in within one poll wake rather than up to a full interval later.
+         * Checked even on a turn where poll() reported clients, because a long burst of
+         * client work must not hold the swap hostage either. */
+        if (rl.pid != 0)
+            reload_reap(&db, opts, &watch, &saved_epoch, &pending_marks, &rl);
+        /* The configuration watch is a deadline like the others, and it goes here for the
+         * reason the comment above this loop gives: poll() returning 0 is how the loop wakes
+         * up to do timed work at all. A tick that finds nothing is a stat and a comparison. */
+        if (opts->reload_config && ts_us() >= next_cfg) {
+            serve_reload_config(opts, &cfg_last, &cfg_missing, &rl);
+            next_cfg = ts_us() + CONFIG_POLL_US;
+        }
         if (sweep_due) {
             serve_apply_watch(&db, watch, &pending_marks, "a sweep timer", true);
             next_sweep = ts_us() + sweep_us;
@@ -1917,6 +2189,13 @@ int etp_serve(const etp_opts_t *opts)
             int64_t ms = (int64_t)((next_watch - now) / 1000);
             if (ms < tmo) tmo = ms > 0 ? (int)ms : 1;
         }
+        /* And for the locations file. At 5 s it would be quantised to the 1000 ms poll tick
+         * and then fire five times per interval, which is five stats and five comparisons --
+         * harmless, but it would make the interval a lie in the log. */
+        if (opts->reload_config && next_cfg > now) {
+            int64_t ms = (int64_t)((next_cfg - now) / 1000);
+            if (ms < tmo) tmo = ms > 0 ? (int)ms : 1;
+        }
         int r = poll(pfd, (nfds_t)nfd, tmo);
         if (r < 0) {
             if (errno == EINTR) continue;
@@ -1997,6 +2276,16 @@ int etp_serve(const etp_opts_t *opts)
     }
 
 done:
+    /* A rebuild still running at shutdown is killed and its temporary discarded rather
+     * than waited for: the child writes only the temporary, so nothing on disk is
+     * half-written, and a server that was asked to stop should stop. (The child execs
+     * `esidx build`, which installs no handlers, so SIGTERM is its default action.) */
+    if (rl.pid != 0) {
+        kill(rl.pid, SIGTERM);
+        while (waitpid(rl.pid, NULL, 0) < 0 && errno == EINTR) { }
+        unlink(rl.tmp);
+        rl.pid = 0;
+    }
     /* A batch that was still inside its coalescing window when the server was asked to
      * stop is applied rather than dropped: with --once that window is the whole lifetime
      * of a change made while the one client was connected. */

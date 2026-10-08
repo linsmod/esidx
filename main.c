@@ -48,6 +48,7 @@ static void usage(void)
 "                             [--refresh=SECS] [--save=SECS] [--watch[=SOCK]]\n"
 "                             [--watch-embed[=ROOT]] [--drop-to=USER[:GROUP]]\n"
 "                             [--sweep=SECS] [--stall-ms=MS]\n"
+"                             [--reload-config=PATH]\n"
         "                             [--no-index[=LIST]]\n"
         "  esidx options <dbfile> [--no-index[=LIST]]\n"
         "\n"
@@ -114,6 +115,19 @@ static void usage(void)
         "        r7000), so it is a separate coarse knob: it also runs once at startup,\n"
         "        where it is what makes 'the server is up to date' true, and whenever the\n"
         "        event proxy reports that it lost events.\n"
+        "\n"
+        "        --reload-config=PATH watches a --roots-file format file (one absolute\n"
+        "        path per line, '#' comments) and, when it changes, rebuilds the index\n"
+        "        in a child process and swaps the result in -- so a location can be\n"
+        "        added or removed without restarting the server. The file is stat'ed\n"
+        "        every 5 s; the child is this same binary via /proc/self/exe, and the\n"
+        "        serve loop keeps answering while it runs. The snapshot on disk is\n"
+        "        rewritten from the new index, so a restart comes back up on the new\n"
+        "        locations; a watcher, if any, is rebuilt for them. A build that fails\n"
+        "        is logged at error level and changes nothing: the server keeps the\n"
+        "        index it has until the file changes again. It is not /etc/default/\n"
+        "        esidx -- systemd reads that once before the process starts, and the\n"
+        "        port and the bind address in it cannot move under a running one.\n"
         "\n"
         "derived indexes (design D4: none of them are in the snapshot, so this is a\n"
         "choice about this process and the same file serves both settings):\n"
@@ -791,6 +805,15 @@ static int cmd_serve(int argc, char **argv)
              * --watch-embed=ROOT stays accepted and is compared, for the caller who wants the
              * check to be performed against what they think they deployed. */
             o.watch_embed = a[13] == '=' ? a + 14 : "";
+            continue;
+        }
+        if (!strncmp(a, "--reload-config=", 16)) {
+            if (!a[16]) {
+                fprintf(stderr, "serve: --reload-config= needs a path, e.g. "
+                                "--reload-config=/etc/esidx/roots\n");
+                return 1;
+            }
+            o.reload_config = a + 16;
             continue;
         }
         if (!strncmp(a, "--drop-to=", 10)) {
