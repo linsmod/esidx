@@ -36,7 +36,8 @@ Group=esidx
 #
 # --no-download is not a knob either. RETR returns file *contents* over the data connection,
 # so leaving it off turns a search service into an anonymous file server for everything under
-# ESIDX_ROOT. Take the flag out of this line, in a drop-in, if that is what you want.
+# the indexed roots (one absolute path per line, in /etc/esidx/roots). Take the flag out of
+# this line, in a drop-in, if that is what you want.
 ExecStart=/usr/bin/esidx -v 3 serve ${ESIDX_DB} -p ${ESIDX_PORT} --bind ${ESIDX_BIND} --no-download --watch-embed --drop-to=${ESIDX_USER} --sweep=${ESIDX_SWEEP}
 Restart=always
 RestartSec=2
@@ -54,7 +55,8 @@ PrivateTmp=yes
 ReadWritePaths=/var/lib/esidx
 
 # ESIDX_BIND decides the exposure, and what it decides is not small: with downloads refused it
-# is still "anyone who reaches the port can enumerate every filename under ESIDX_ROOT" -- the
+# is still "anyone who reaches the port can enumerate every filename under the indexed roots"
+# -- the
 # index rather than the files, but on a shared network that is the whole directory listing. The
 # packaged default is 0.0.0.0, because a search service that only answers on its own host is not
 # the deployment anyone wants, and these two lines are what makes that safe without a firewall:

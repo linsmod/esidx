@@ -74,20 +74,44 @@ getent passwd esidx >/dev/null 2>&1 && bad "an esidx user already exists -- not 
 ss -ltn 2>/dev/null | grep -q ":$PORT " && bad "port $PORT is busy" || ok "port $PORT is free"
 
 stage "2. dpkg -i (postinst output verbatim)"
-dpkg -i "$DEB" 2>&1 | sed 's/^/   /'
+# Kept, not just printed: postinst's warnings are the only place some of its refusals are
+# visible at all, and an assertion about a warning needs the text. The install itself must
+# not be asserted on here -- this machine is not the deployment (there is no /work), so what
+# is checked below is that it *complained*, not that it succeeded quietly.
+dpkg -i "$DEB" >"$TMP/install.log" 2>&1
+sed 's/^/   /' "$TMP/install.log"
 
 stage "3. what postinst left behind"
 getent passwd esidx >/dev/null 2>&1 \
     && ok "user: $(id -un esidx) uid=$(id -u esidx) gid=$(id -g esidx)" || bad "no esidx user"
 stat -c '        /var/lib/esidx: %U:%G %a' /var/lib/esidx 2>/dev/null || bad "/var/lib/esidx missing"
 [ -f /etc/default/esidx ] && ok "configuration /etc/default/esidx" || bad "no /etc/default/esidx"
+[ -f /etc/esidx/roots ] && ok "locations /etc/esidx/roots" || bad "no /etc/esidx/roots"
 [ -f /usr/lib/systemd/system/esidx.service ] && ok "unit" || bad "no unit"
+# Both are conffiles, so an upgrade leaves an edited copy alone. The unit does not read the
+# locations file at startup (--watch-embed takes them from the snapshot), but a dpkg upgrade
+# that overwrote it would silently discard a deployment's configuration.
+for c in /etc/default/esidx /etc/esidx/roots; do
+    if grep -qx "$c" /var/lib/dpkg/info/esidx.conffiles 2>/dev/null; then
+        ok "$c is a conffile"
+    else
+        bad "$c is not in dpkg's conffile list"
+    fi
+done
 note "is-enabled: $(systemctl is-enabled esidx 2>&1)"
-root_val=$(sed -n 's/^ESIDX_ROOT=//p' /etc/default/esidx)
-note "ESIDX_ROOT=$root_val   (exists here: $([ -d "$root_val" ] && echo yes || echo no))"
+# The packaged roots file names /work, which does not exist on a test machine: that is the
+# deployment's business, not the package's, and postinst is expected to warn about exactly
+# this rather than fail. So the assertion is that it *warns*, not that the path exists.
+grep -q 'esidx: warning: .*esidx/roots names' "$TMP/install.log" 2>/dev/null \
+    && ok "postinst warns about a location that does not exist here" \
+    || bad "postinst did not warn about /etc/esidx/roots naming a missing path"
 
 stage "4. the first snapshot, as the service user"
-sudo -u esidx /usr/bin/esidx build "$TREE" -o "$DB" 2>&1 | tail -2 | sed 's/^/   /'
+# Built from this machine's tree rather than from the packaged roots file, because the
+# packaged one names /work. The *spelling* is the one postinst printed, which is the thing
+# under test: --roots-file= is how a deployment's list reaches esidx.
+printf '%s\n' "$TREE" > /etc/esidx/roots
+sudo -u esidx /usr/bin/esidx build --roots-file=/etc/esidx/roots -o "$DB" 2>&1 | tail -2 | sed 's/^/   /'
 [ -f "$DB" ] && ok "snapshot: $(stat -c '%U:%G %s bytes' "$DB")" || bad "no snapshot"
 
 stage "5. systemctl start"
@@ -151,6 +175,7 @@ dpkg -P esidx 2>&1 | sed 's/^/   /'
 getent passwd esidx >/dev/null 2>&1 && bad "user still there" || ok "user gone"
 [ -d /var/lib/esidx ] && bad "state directory still there" || ok "state directory gone"
 [ -e /etc/default/esidx ] && bad "configuration still there" || ok "configuration gone"
+[ -e /etc/esidx/roots ] && bad "locations file still there" || ok "locations file gone"
 [ -e /usr/lib/systemd/system/esidx.service ] && bad "unit still there" || ok "unit gone"
 [ -e /usr/bin/esidx ] && bad "esidx still there" || ok "esidx gone"
 [ -e /usr/bin/sfa-server ] && bad "sfa-server still there" || ok "sfa-server gone"

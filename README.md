@@ -115,8 +115,31 @@ tarball cannot carry:
   `/var/lib/esidx`, retire the two units an earlier package installed, and enable this one.
 
 It deliberately does not start it: the server refuses to run without a snapshot
-(`main.c:247`), and building the first one is a full scan of `ESIDX_ROOT`, which does not
-belong in a maintainer script. So `postinst` prints the two commands.
+(`main.c`), and building the first one is a full scan of everything named in
+`/etc/esidx/roots`, which does not belong in a maintainer script. So `postinst` prints the
+two commands.
+
+**The indexed locations are `/etc/esidx/roots`**, one absolute path per line, and that is
+where you add or remove one — not `/etc/default/esidx`, because a list of paths cannot be a
+`KEY=value` in a systemd environment file. Both files are conffiles, so an upgrade leaves
+them alone. The paths in that file are the paths in the index and the paths a client is
+shown: there is no mapping back to wherever the data really lives, so a bind mount indexes
+as the mount point rather than as the directory behind it. A location may not appear twice
+or inside another, and `esidx build` refuses such a set *before* walking anything — together
+they would give every file below them two rows, which nothing downstream can undo.
+
+The unit does not read the roots file. `--watch-embed` takes the list from the snapshot
+itself, so there is no second place for the locations to be wrong — which is also why
+changing the file changes nothing until you rebuild:
+
+```sh
+sudo -u esidx esidx build --roots-file=/etc/esidx/roots -o /var/lib/esidx/root.idx
+```
+
+A snapshot may cover several locations: `parent:""` and `root:` are then the **union** of
+their top levels, which is what a client showing one volume with several trees underneath
+has to mean. Note that there is no ETP command that reports volumes, so a multi-location
+index cannot describe itself over the wire — the client shows a single volume.
 
 Two things the package decides, both in `/etc/default/esidx` rather than in the unit: the
 bind address, and `RETR` — which returns file *contents* — is refused by the unit, so the
@@ -281,6 +304,15 @@ inside a `mktemp` directory, leaving the source tree clean.
 # index a tree
 ./esidx build /etc -o /etc.idx
 #   indexed 1622 entries in 5.4 ms  (scan 5.4 ms, finalize 0.4 ms)
+
+# index several at once, or from a list
+./esidx build /work /data/pics -o /etc.idx
+./esidx build --roots-file=/etc/esidx/roots -o /var/lib/esidx/root.idx
+#   saved -> /var/lib/esidx/root.idx  (2 roots)
+
+# what does this snapshot cover?
+./esidx roots /etc.idx
+#   /etc
 
 # browse: direct children of a directory
 ./esidx query /etc.idx 'parent:/etc/ssh'

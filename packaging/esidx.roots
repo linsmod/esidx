@@ -1,0 +1,27 @@
+# The locations this index covers.
+#
+# One absolute path per line, '#' comments and blank lines ignored. This is the file
+# `esidx build --roots-file=` reads, and it exists because systemd does not split an
+# environment file's value into words: a list of locations cannot be one KEY=value, and
+# quoting it into one does not survive either. The unit does not read this file -- the
+# snapshot carries its own list of roots, and re-stating them in the unit would be a second
+# place for them to be wrong -- so this is what you edit when you add or remove a location,
+# and the only thing you must then rebuild the snapshot for.
+#
+# A location may appear at most once, and no location may be inside another. Both are
+# refused rather than tolerated: together they would give every file below them two rows,
+# and once they are in the index the duplicate is indistinguishable from the original --
+# `path:` answers with two ids and `count:` is twice the truth. `esidx build` checks this
+# against the filesystem before it walks anything, so a refused build leaves no snapshot.
+#
+# These are absolute paths in *this* machine's namespace, and they are what the client is
+# shown: the paths stored in the index are the ones named here, with no mapping back to
+# wherever the data really lives. A bind mount therefore indexes as the mount point, not
+# as the directory behind it.
+#
+# The first build is a full scan of everything below these paths, which is not something
+# a package can do for you. After installing:
+#
+#   1. sudo -u esidx esidx build --roots-file=/etc/esidx/roots -o /var/lib/esidx/root.idx
+#   2. sudo systemctl start esidx
+/work

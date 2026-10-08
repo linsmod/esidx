@@ -7,23 +7,35 @@ Depends: libc6 (>= 2.34)
 Maintainer: @MAINTAINER@
 Installed-Size: @SIZE@
 Description: ext4 search index engine with an Everything (ETP) server
- esidx walks a directory tree into a snapshot, answers Everything's search language
- (ext:, dc:, dm:, size:, parent:, path:, wildcards, boolean and grouping) over the ETP
- protocol, and reconciles that snapshot from kernel filesystem events so it stays current
- without a periodic rescan.
+ esidx walks one or more directory trees into a snapshot, answers Everything's search
+ language (ext:, dc:, dm:, size:, parent:, path:, wildcards, boolean and grouping) over the
+ ETP protocol, and reconciles that snapshot from kernel filesystem events so it stays
+ current without a periodic rescan.
+ .
+ The locations are named in /etc/esidx/roots, one absolute path per line. A snapshot may
+ cover several of them: parent:"" and root: then mean the union of their top levels, which
+ is what a client showing one volume with several trees underneath has to mean. A location
+ may not appear twice or inside another -- that would give every file below it two rows,
+ which no downstream step can undo -- and the build refuses such a set before walking
+ anything.
  .
  The event source is fanotify, which needs CAP_SYS_ADMIN. In this deployment one process
  holds it: the unit starts esidx as root, the binary opens the fanotify group, gives the
  capability back before it opens the listener, and keeps only CAP_DAC_READ_SEARCH -- the
  one thing that turns an event into a path. What the process is allowed to hold is stated
  in the unit's CapabilityBoundingSet, so the ceiling is a property of the install rather
- than a promise in a comment.
+ than a promise in a comment. A mark covers one mount, so an index whose locations are on
+ different mounts gets one mark each; a tree with a mount point *inside* it is repaired by
+ the periodic sweep rather than by events.
  .
  The two-process form is still shipped: sfa-server is installed as well, a root proxy that
  hands absolute paths over a group-owned socket to an unprivileged esidx. Upgrading from a
- package that ran it retires the two units it used.
+ package that ran it retires the two units it used. In that form the locations have to be
+ named twice -- the proxy's --prefix and what esidx accepts -- because a proxy holds one
+ mark; the embedded form above is what avoids it.
  .
- This package installs one systemd unit, esidx.service, and the configuration it reads
- (/etc/default/esidx). It enables the unit but does not start it: the server needs a
- snapshot, and building the first one scans the tree, which does not belong in a
- maintainer script. The install output says the two commands.
+ This package installs one systemd unit, esidx.service, and the two files it is configured
+ by: /etc/esidx/roots (the locations) and /etc/default/esidx (everything else). It enables
+ the unit but does not start it: the server needs a snapshot, and building the first one
+ scans every tree named, which does not belong in a maintainer script. The install output
+ says the two commands.</new_string>

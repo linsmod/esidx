@@ -11,14 +11,16 @@
 # form still exists (run sfa-server separately and pass --watch=SOCK), and then ESIDX_ROOT has
 # to be named in both places; see README, "Deployment".
 
-# The tree to index. This is what the snapshot- building command below uses, and what a
-# hand-run proxy would mark in the two-process form. The unit does not pass it: `--watch-embed`
-# takes the tree from the snapshot itself, so there is no second place for it to be wrong.
-ESIDX_ROOT=/work
+# The locations to index are NOT here. They are in /etc/esidx/roots, one absolute path per
+# line, and that is where you add or remove one -- see the comments in that file for why a
+# list cannot be a KEY=value. The unit does not read it: `--watch-embed` takes the list from
+# the snapshot itself, so there is no second place for it to be wrong. The two-process form
+# does need it twice (the proxy's --prefix, and what esidx is told to accept), which is the
+# one place this deployment still has to keep two things in step; see README, "Deployment".
 
 # The snapshot. Nothing builds this for you at install time -- the first one is a full scan,
 # which does not belong in a maintainer script -- so it is usually absent until you run:
-#     sudo -u esidx esidx build "$ESIDX_ROOT" -o "$ESIDX_DB"
+#     sudo -u esidx esidx build --roots-file=/etc/esidx/roots -o "$ESIDX_DB"
 # The server refuses to start without it: a search service answering from no snapshot would
 # answer from nothing. The snapshot must stay readable by ESIDX_USER, and writable by it if
 # --save is on. That is arranged with the group rather than with ownership: the directory is

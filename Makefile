@@ -371,7 +371,7 @@ deb: require-sfa
 	@echo "== stage into a Debian layout under $(DEBSTAGE)"
 	@rm -rf "$(DEBSTAGE)"
 	@mkdir -p "$(DEBSTAGE)/DEBIAN" "$(DEBSTAGE)/usr/bin" "$(DEBSTAGE)/usr/lib/systemd/system" \
-	          "$(DEBSTAGE)/etc/default" "$(DEBSTAGE)/usr/share/doc/esidx"
+	          "$(DEBSTAGE)/etc/default" "$(DEBSTAGE)/etc/esidx" "$(DEBSTAGE)/usr/share/doc/esidx"
 	@$(MAKE) install PREFIX=/usr DESTDIR="$(DEBSTAGE)"
 	@# sfa's install-bin, not its install: this is a runtime package, and dev headers and a
 	@# static SDK archive belong to a -dev package that nothing here needs.
@@ -379,6 +379,7 @@ deb: require-sfa
 	@install -m 0644 packaging/systemd/esidx.service \
 	    "$(DEBSTAGE)/usr/lib/systemd/system/esidx.service"
 	@install -m 0644 packaging/esidx.default "$(DEBSTAGE)/etc/default/esidx"
+	@install -m 0644 packaging/esidx.roots "$(DEBSTAGE)/etc/esidx/roots"
 	@install -m 0644 README.md "$(DEBSTAGE)/usr/share/doc/esidx/README.md"
 	@install -m 0644 docs/design.md "$(DEBSTAGE)/usr/share/doc/esidx/design.md"
 	@install -m 0644 docs/everything-syntax.md \
@@ -400,7 +401,11 @@ deb: require-sfa
 	     packaging/control.in > "$(DEBSTAGE)/DEBIAN/control"; \
 	 printf 'Maintainer: %s <%s>\n' "$(DEB_MNAME)" "$(DEB_MEMAIL)" \
 	     >> "$(DEBSTAGE)/DEBIAN/control"
-	@printf '%s\n' '/etc/default/esidx' > "$(DEBSTAGE)/DEBIAN/conffiles"
+	@# Two conffiles, and both are there for the same reason: each is a thing an admin edits
+	@# in place across an upgrade, so dpkg must not overwrite them. /etc/esidx/roots is the
+	@# one that names the locations; /etc/default/esidx is the one that names the port, the
+	@# bind address and the sweep interval.
+	@printf '%s\n' '/etc/default/esidx' '/etc/esidx/roots' > "$(DEBSTAGE)/DEBIAN/conffiles"
 	@# dpkg-deb only *warns* about a control file with no Maintainer, and then builds the
 	@# package anyway -- which is how the previous version of this target shipped a control
 	@# file whose Maintainer had been appended onto the last line of the description: the
@@ -445,9 +450,16 @@ deb-verify: deb
 	@# one and answer from a socket the server no longer reads.
 	@for f in usr/bin/esidx usr/bin/sfa-server \
 	          usr/lib/systemd/system/esidx.service \
-	          etc/default/esidx DEBIAN/conffiles; do \
+	          etc/default/esidx etc/esidx/roots DEBIAN/conffiles; do \
 	    test -e "/tmp/.esidx-debcheck/$$f" \
 	        || { echo "   MISSING: $$f"; exit 1; }; \
+	done
+	@# Both conffiles, or an upgrade silently overwrites the locations an admin edited. The
+	@# list is the whole of what dpkg is told not to touch, so "one of the two" is the failure
+	@# and a count is the only assertion that cannot be satisfied by a rename.
+	@for c in /etc/default/esidx /etc/esidx/roots; do \
+	    grep -qx "$$c" /tmp/.esidx-debcheck/DEBIAN/conffiles \
+	        || { echo "   NOT A CONFFILE: $$c"; exit 1; }; \
 	done
 	@for f in usr/lib/systemd/system/esidx-proxy.service \
 	          usr/lib/systemd/system/esidx-index.service; do \

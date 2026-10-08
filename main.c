@@ -123,6 +123,7 @@ static void usage(void)
         "  <dbfile>.opts  one name per line, '#' comments; --no-index wins over it,\n"
         "                 and ESIDX_SKIP_INDEX is the last resort (tests use it)\n"
         "  esidx options <dbfile>     print what would be left out, and why\n"
+        "  esidx roots <dbfile>       print the locations the snapshot covers\n"
         "\n"
         "logging: ESIDX_LOG=error|warn|info|debug  or  -v / -v N / --verbose=N\n");
 }
@@ -885,8 +886,50 @@ static int cmd_serve(int argc, char **argv)
     return etp_serve(&o) == 0 ? 0 : 1;
 }
 
-/* ----------------------------------------------------------------- options */
+/* ------------------------------------------------------------------- roots */
 
+/* Print the locations a snapshot covers, one per line, in index order.
+ *
+ * The question this answers is "what is in this index?", and it is asked by whoever changed
+ * /etc/esidx/roots and has not rebuilt yet -- the answer they need is the *snapshot's* list,
+ * not the file's, and those are two different lists the moment either of them changes. It
+ * also has to load the snapshot to answer, because the roots are derived from the rows
+ * (D9) and nothing stores them; `esidx options` avoids the load because it can, and this
+ * one cannot.
+ *
+ * Exits 1 on an empty index rather than printing nothing: "this snapshot covers no
+ * locations" is a fact worth a non-zero exit, because the reason a server would refuse to
+ * start is that this file is absent. */
+static int cmd_roots(int argc, char **argv)
+{
+    const char *dbfile = (argc > 0 && argv[0][0] != '-') ? argv[0] : NULL;
+    if (!dbfile || (argc > 1 && argv[1][0] != '-')) {
+        fprintf(stderr, "usage: esidx roots <dbfile>\n");
+        return 1;
+    }
+    esidx_t db;
+    esidx_init(&db);
+    idx_configure(&db, dbfile, g_flag);
+    if (esidx_load(&db, dbfile) != 0) {
+        fprintf(stderr, "load failed: %s\n", dbfile);
+        esidx_free(&db);
+        return 1;
+    }
+    if (db.nroots == 0) {
+        fprintf(stderr, "esidx: %s has no indexed location\n", dbfile);
+        esidx_free(&db);
+        return 1;
+    }
+    char path[PATH_MAX];
+    for (uint32_t i = 0; i < db.nroots; i++) {
+        path_of(&db, esidx_root(&db, i), path, sizeof(path));
+        printf("%s\n", path);
+    }
+    esidx_free(&db);
+    return 0;
+}
+
+/* ----------------------------------------------------------------- options */
 /* Print what this invocation would leave unbuilt, without loading anything. The point is
  * that the answer is cheap: a 300 MB snapshot must not have to be read to be asked a
  * question about configuration, and a command that did would be one nobody runs before
@@ -938,6 +981,7 @@ int main(int argc, char **argv)
     if (!strcmp(argv[1], "query"))  return cmd_query(argc - 2, argv + 2);
     if (!strcmp(argv[1], "serve"))  return cmd_serve(argc - 2, argv + 2);
     if (!strcmp(argv[1], "options")) return cmd_options(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "roots"))   return cmd_roots(argc - 2, argv + 2);
     usage();
     return 1;
 }

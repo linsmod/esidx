@@ -5,15 +5,16 @@
 # unit.
 #
 # It deliberately does not start it. The server refuses to run without a snapshot
-# (main.c:247, "load failed"), and the first snapshot is a full scan of ESIDX_ROOT -- 60s
-# on a workstation's /work, a minute and a half on /usr -- which does not belong in a
-# maintainer script: no tty, dpkg's own timeouts, and a failed install halfway through a
-# scan. So this enables and prints the two commands, because a service that is "running" and
-# cannot answer anything is worse than one that is plainly not started yet.
+# (main.c, "load failed"), and the first snapshot is a full scan of everything named in
+# /etc/esidx/roots -- 60s on a workstation's /work, a minute and a half on /usr -- which
+# does not belong in a maintainer script: no tty, dpkg's own timeouts, and a failed install
+# halfway through a scan. So this enables and prints the two commands, because a service that
+# is "running" and cannot answer anything is worse than one that is plainly not started yet.
 
 set -e
 
 DEFAULTCFG=/etc/default/esidx
+ROOTSF=/etc/esidx/roots
 VARLIB=/var/lib/esidx
 UNITDIR=/usr/lib/systemd/system
 
@@ -31,6 +32,16 @@ die() { echo "esidx: $*" >&2; exit 1; }
 read_kv() {
     [ -f "$DEFAULTCFG" ] || return 0
     sed -n "s/^[[:space:]]*$1=\(.*\)$/\1/p" "$DEFAULTCFG" | tail -1
+}
+
+# The indexed locations, one per line, from the roots file. Read as data for the same reason
+# read_kv() reads a KEY=value: sourcing it would run whatever else an admin has put there,
+# as root, from a maintainer script. Blank lines and '#' comments are dropped because the
+# file's own documentation promises they are.
+read_roots() {
+    [ -f "$ROOTSF" ] || return 0
+    sed -e 's/#.*$//' -e 's/[[:space:]]*$//' -e 's/^[[:space:]]*//' "$ROOTSF" \
+        | grep -v '^$'
 }
 
 case "$1" in
@@ -159,9 +170,13 @@ case "$1" in
         # 4. say what is left to do, because "installed" and "answering queries" are not the
         #    same state and only one of them is true right now.
         db=$(read_kv ESIDX_DB)
-        root=$(read_kv ESIDX_ROOT)
         port=$(read_kv ESIDX_PORT)
         bind=$(read_kv ESIDX_BIND)
+        # The locations, as a count and as a list. The count is what the message leads with,
+        # because "one tree" and "four directories" are different statements about what is
+        # about to be scanned and the reader cannot tell which from a path.
+        nroots=$(read_roots | wc -l)
+        roots=$(read_roots | tr '\n' ' ')
         # The build has to run as the user that will *serve* the snapshot, not as the user this
         # package created: the index is a view of what that identity may read, and building it
         # as anyone else quietly produces a smaller one -- the service then answers as if the
@@ -169,7 +184,6 @@ case "$1" in
         # against 5 476 485 as the deploying user, 1 407 directories the difference. That is why
         # the command below is printed with $svc (read in step 1b).
         [ -n "$db" ] || db=$VARLIB/root.idx
-        [ -n "$root" ] || root=/
         [ -n "$port" ] || port=2121
         [ -n "$bind" ] || bind=127.0.0.1
         [ -n "$svc" ] || svc=$SYSUSER
@@ -181,16 +195,30 @@ case "$1" in
         # version, which is what this reads.
         newver=$(dpkg-query -W -f='${Version}' esidx 2>/dev/null || true)
         [ -n "$newver" ] || newver=$2
-        [ -d "$root" ] || echo "esidx: warning: ESIDX_ROOT=$root does not exist; the server will not start." >&2
+        # Every location is checked, not just the first: a roots file naming four trees where
+        # one is on a volume that is not mounted yet would otherwise be reported by the server
+        # refusing to start, which is the same information delivered later and less usefully.
+        for r in $roots; do
+            [ -d "$r" ] || echo "esidx: warning: $ROOTSF names $r, which does not exist;" \
+                              "the build below will fail on it" >&2
+        done
+        [ "$nroots" -gt 0 ] || echo "esidx: warning: $ROOTSF names no locations; edit it before" \
+                              "building the first snapshot" >&2
 
         if systemctl is-active --quiet esidx.service 2>/dev/null; then
             # An upgrade over a running deployment: no instructions to give, but the two
             # things an operator wants confirmed are that it is on the new binary and that
             # the snapshot survived -- the state directory is not touched by an upgrade.
+            #
+            # The roots file is named even here, because this is the message an operator reads
+            # when they expected their new location to be indexed and it is not: an upgrade
+            # never rebuilds the snapshot, so editing $ROOTSF changes nothing until they do.
             cat <<EOF
 
 esidx $newver installed over a running service. It was restarted onto the new binary and the
-snapshot at $db was kept (an upgrade never rebuilds it). Configuration is $DEFAULTCFG.
+snapshot at $db was kept, covering the $nroots location(s) it was built from. An upgrade never
+rebuilds it -- if you changed $ROOTSF, build a new snapshot to pick that up. Configuration is
+$DEFAULTCFG.
 
   systemctl status esidx
   journalctl -u esidx -f
@@ -200,13 +228,13 @@ EOF
             cat <<EOF
 
 esidx $newver installed. One service is enabled and it is not running yet, because the server
-needs a snapshot and building the first one scans $root:
+needs a snapshot and building the first one scans $nroots location(s): $roots
 
-  1. sudo -u $svc esidx build $root -o $db
+  1. sudo -u $svc esidx build --roots-file=$ROOTSF -o $db
   2. sudo systemctl start esidx
 
-then an ETP client (Everything) can connect to $bind:$port. Configuration is
-$DEFAULTCFG; logs are in the journal:
+then an ETP client (Everything) can connect to $bind:$port. The locations are $ROOTSF; the rest
+of the configuration is $DEFAULTCFG; logs are in the journal:
 
   journalctl -u esidx -f
 

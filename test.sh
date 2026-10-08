@@ -862,6 +862,29 @@ else
     bad "update naming one of two roots" "$(cat "$TMP/err")"
 fi
 
+# `esidx roots` answers "what is in this snapshot?", which is the question an operator has
+# after editing a roots file and before rebuilding -- and the answer has to be the snapshot's
+# own list, not the file's. Those are two different lists the moment either one changes, which
+# is the whole reason for the command: `--watch-embed` reads the snapshot's, so the snapshot's
+# is the one that decides what gets marked.
+if [ "$("$BIN" roots "$MR_DB" 2>/dev/null | tr '\n' ' ')" = "$MR_A $MR_B " ]; then
+    ok "esidx roots lists both locations, in index order"
+else
+    bad "esidx roots lists both locations" \
+        "got [$("$BIN" roots "$MR_DB" 2>/dev/null | tr '\n' ' ')] want [$MR_A $MR_B ]"
+fi
+if [ "$("$BIN" roots "$FLAT_DB" 2>/dev/null)" = "$FLAT" ]; then
+    ok "esidx roots on a one-location snapshot prints that one"
+else
+    bad "esidx roots on a one-location snapshot" \
+        "got [$("$BIN" roots "$FLAT_DB" 2>/dev/null)] want [$FLAT]"
+fi
+if "$BIN" roots "$TMP/no-such.idx" >/dev/null 2>&1; then
+    bad "esidx roots on a missing snapshot fails"
+else
+    ok "esidx roots on a missing snapshot fails"
+fi
+
 DB="$FLAT_DB"
 
 say "query language: L0 structural"

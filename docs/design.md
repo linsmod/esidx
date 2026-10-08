@@ -2163,30 +2163,40 @@ the depth-1 case kept beside it as the control that has to keep working.
       indistinguishable, from the log and from the client, from one that is current
       about all of them, so it refuses rather than serving a partial answer. See §12.14.
 
-14. **A mark is per mount, and one mount is what the watcher marks.** `sfa` calls
-    `fanotify_mark()` once, on one path, with `FAN_MARK_MOUNT` (or
-    `FAN_MARK_FILESYSTEM` where the kernel refuses it, which covers the whole
-    superblock instead — `sfa/README.md:44-48` says so and `--probe` reports both).
-    That is enough for a single-location index and it has a hole that predates the
-    root list: **an index tree containing any nested mount point receives no events
-    from below it.** A bind mount, another filesystem mounted inside the tree, a
-    tmpfs, anything — `scan_dir()` descends through it (it is an ordinary `DT_DIR`
-    entry), so those files are in the index and are not in the event path. They are
-    repaired by `--sweep=SECS`, i.e. eventually, and until that lands the honest
-    statement for a tree with a mount point inside it is: **names below the mount
-    point lag by one sweep interval** (3600 s in the packaged unit).
-
-    The fix is not "one mark per root" — it is one mark per mount **the index
-    actually reaches**, discovered at startup by asking every indexed directory for
-    its mount id (`statx(STATX_MNT_ID)`, kernel 5.8+) and opening one `sfa` instance
-    per distinct one. `st_dev` is not a substitute: a bind mount shares its source's
+14. **A mark is per mount, and what is marked is the mounts the *roots* are on — not
+    every mount the index reaches.** `sfa` calls `fanotify_mark()` once, on one path,
+    with `FAN_MARK_MOUNT` (or `FAN_MARK_FILESYSTEM` where the kernel refuses it, which
+    covers the whole superblock instead — `sfa/README.md:44-48` says so and `--probe`
+    reports both). That is enough for a single-location index, and `watch.c` now opens one
+    group per distinct mount among the index's roots, keyed on the mount **id**
+    (`statx(STATX_MNT_ID)`) rather than `st_dev`: a bind mount shares its source's
     superblock, so it has the same `st_dev` and a different vfsmount, and
-    `FAN_MARK_MOUNT` is per vfsmount. One scan pass over the directory ids already in
-    the index is enough, and the sweep already measures what one stat per directory
-    costs (94 ms for `/usr`'s 34 811, 1 9xx ms for `/work`'s 651 894 — this is the
-    cost at startup, once, not per interval).
+    `FAN_MARK_MOUNT` is per vfsmount. Where statx cannot report a mount id the fallback is
+    `st_dev` and the log warns that bind mounts will be missed.
 
-    Note for whoever implements it: grouping must follow the mark mode `sfa` actually
+    **The hole this leaves, stated plainly: an index tree containing any nested mount
+    point receives no events from below it.** A bind mount inside the tree, another
+    filesystem mounted under it, a tmpfs — `scan_dir()` descends through all of them
+    (each is an ordinary `DT_DIR` entry), so those files are in the index and are not in
+    the event path. They are repaired by `--sweep=SECS`, i.e. eventually, and the honest
+    statement for such a tree is: **names below the nested mount lag by one sweep
+    interval** (3600 s in the packaged unit).
+
+    Closing it means one mark per mount *the index actually reaches*, which is a
+    different and much more expensive question than one per root: the mount points are
+    wherever a nested mount happens to be, so discovering them means asking every
+    indexed directory for its mount id. That walk is the sweep's walk — one stat per
+    live directory, measured at 94 ms for `/usr`'s 34 811 and 1 941 ms for `/work`'s
+    651 894 — paid once at every server start, before the listener opens, on a large
+    index. That is a real cost for a hole this feature did not open, so it is not paid
+    here; the numbers are recorded so the next person can decide with them.
+
+    A subtlety for whoever does it: grouping must follow the mark mode `sfa` actually
     negotiated, not the one we would have picked — under `FAN_MARK_FILESYSTEM` one
     instance per superblock is correct and one per mount id is merely wasteful.
+
+    Not measured, and it is an argument rather than a number either way: the cost of the
+    `statx` this commit does make — at most `ESIDX_MAX_ROOTS` calls, before the listener
+    opens. The fixture has two roots.
+
 
