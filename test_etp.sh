@@ -600,38 +600,53 @@ say "5b. a query the client has stopped waiting for (D12)"
 # being single-threaded, the server delays the query the user *is* waiting for by all of
 # it: 2 776 ms for the slowest query measured on the 8.9M-entry r7000 index.
 #
-# `burst` puts two whole SEARCH/QUERY pairs in ONE write, which is what that queue looks
-# like on the wire. The same search both times is deliberate: it is what catches an
-# abandoned query leaving an empty entry in the result cache, which the second query would
-# then have served.
+# `burst` puts two whole commands in ONE write, which is what that queue looks like on
+# the wire. The shape is a scrollbar drag: one QUERY to establish the result set, then a
+# burst of OFFSET/QUERY pairs, where only the last one is the page the user is looking at.
 hits_before=$(grep -c 'cache hit' "$SRV_ERR")
-etp "two queries pipelined on one connection" "$SRV_PORT" <<'EOF'
+etp "a burst of paged queries on one connection" "$SRV_PORT" <<'EOF'
 send USER anonymous
 send EVERYTHING COUNT 10
-burst EVERYTHING SEARCH ext:conf\nEVERYTHING QUERY\nEVERYTHING SEARCH ext:conf\nEVERYTHING QUERY
+sendraw EVERYTHING SEARCH ext:conf
+sendraw EVERYTHING QUERY
+query
+burst EVERYTHING OFFSET 1\nEVERYTHING QUERY\nEVERYTHING OFFSET 2\nEVERYTHING QUERY
 query
 query
 EOF
 B1=$(sed -nE 's/^BLOCK-END 1 count=([0-9]+).*/\1/p' "$OUT")
 B2=$(sed -nE 's/^BLOCK-END 2 count=([0-9]+).*/\1/p' "$OUT")
-if [ "$B1" = "0" ]; then
-    ok "  the superseded query is answered, with an empty block (count 0)"
+B3=$(sed -nE 's/^BLOCK-END 3 count=([0-9]+).*/\1/p' "$OUT")
+if [ -n "$B1" ] && [ "$B1" -gt 0 ]; then
+    ok "  the first query runs and answers (count $B1)"
 else
-    bad "  the superseded query is answered with an empty block" "block 1 count=$B1"
+    bad "  the first query runs and answers" "block 1 count=${B1:-none}"
+fi
+if [ "$B2" = "0" ]; then
+    ok "  the superseded one is answered, with an empty block (count 0)"
+else
+    bad "  the superseded one is answered with an empty block" "block 2 count=$B2"
 fi
 # The block still has to be complete: a reply that stops mid-sentence is the failure the
 # 1023-byte reply buffer and the OPTS UTF8 hang both were, and the probe is a client, so
-# reaching the second block at all is the assertion that the first one ended.
-if [ -n "$B2" ] && [ "$B2" -gt 0 ]; then
-    ok "  the query the client is waiting for still runs (count $B2)"
+# reaching the third block at all is the assertion that the second one ended.
+#
+# And the third is served from the cache -- which is the whole point of this shape. An
+# abandoned query must leave the set the *previous* query produced alone: paging is
+# nothing but the same search at a new OFFSET, so clearing the cache on the way to the
+# last page of a burst turns every mouse move into a full re-run. On r7000 that is
+# 6.5 s of sorting, per mouse move.
+if [ "$B3" = "$B1" ] && [ -n "$B3" ] && [ "$B3" -gt 0 ]; then
+    ok "  the page the user is looking at comes back complete (count $B3)"
 else
-    bad "  the query the client is waiting for still runs" "block 2 count=${B2:-none}"
+    bad "  the page the user is looking at comes back complete" \
+        "block 3 count=${B3:-none}, expected $B1"
 fi
-if [ "$(grep -c 'cache hit' "$SRV_ERR")" = "$hits_before" ]; then
-    ok "  the abandoned query left nothing in the result cache"
+if [ "$(grep -c 'cache hit' "$SRV_ERR")" = "$((hits_before + 1))" ]; then
+    ok "  and it was served from the cache -- the burst did not empty it"
 else
-    bad "  the abandoned query left nothing in the result cache" \
-        "the second query was served from the cache"
+    bad "  the burst did not empty the result cache" \
+        "cache hits went $hits_before -> $(grep -c 'cache hit' "$SRV_ERR")"
 fi
 if grep -q 'abandoned' "$SRV_ERR"; then
     ok "  and the log says why -- an abandoned query is not silent"

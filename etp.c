@@ -494,17 +494,22 @@ static bool client_moved_on(void *arg)
  * reply buffer and the OPTS UTF8 hang in AGENTS.md 1.4 both were: the client waits
  * for a terminator that never arrives.
  *
- * The result cache is *invalidated* rather than filled: an abandoned query stored as
- * "this search matches nothing" would make the next QUERY for the same text answer
- * from the cache instead of running. */
+ * It is answered *without touching the result cache at all* -- neither storing this
+ * (an abandoned query would otherwise poison it as "matches nothing") nor clearing
+ * what the query before it left there. The second half is the one that bites: dragging
+ * a scrollbar sends a burst of QUERYs that differ only in OFFSET, so the ones abandoned
+ * on the way to the last one are followed by exactly the query that the cache existed
+ * for. Clearing it here turned every burst into a full re-run -- measured on r7000,
+ * a browse-all query over 8 898 625 entries is plan 0.4 / eval 28.0 / **sort 6 523.6**
+ * ms, and that sort was being paid once per mouse move instead of once per search. */
 static void answer_empty(const esidx_t *db, client_t *c, const char *why)
 {
     LOGI("query: '%s' abandoned -- %s; answering with an empty block", c->search, why);
-    qset_free(&c->cache);
-    memset(&c->cache, 0, sizeof(c->cache));
-    c->cache.ids = malloc(1);
-    c->cache_valid = false;
-    send_query_results(db, c, &c->cache);
+    qset_t empty;
+    memset(&empty, 0, sizeof(empty));
+    empty.ids = malloc(1);
+    send_query_results(db, c, &empty);
+    qset_free(&empty);
 }
 
 static void do_query(const esidx_t *db, client_t *c)

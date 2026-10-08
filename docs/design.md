@@ -2109,6 +2109,15 @@ Four details are decisions:
   buffer, and the `OPTS UTF8` hang in AGENTS.md 1.4): the client waits for a terminator
   that never comes. `RESULT_COUNT 0` and not the real count, because the set was never
   produced and a count is a claim about a result nobody has.
+- **An abandoned query leaves the result cache exactly as it found it** — it neither
+  stores itself (which would poison it as "matches nothing") nor clears what the query
+  before it left there. The second half is the one that bites, and it was wrong on the
+  first attempt: paging is nothing but the same search at a new OFFSET, so the queries a
+  scrollbar drag abandons on its way to the last one are followed by precisely the query
+  the cache existed for. Clearing it made every mouse move cost a full re-run — on r7000,
+  3 575 ms of sorting a browse-all set of 8 898 625 rows, per mouse move. Measured after
+  the fix: a burst of five OFFSET/QUERY pairs, four abandoned and the last re-sliced from
+  the cache, **57 ms** for the whole drag.
 - **The probe is checked between the executor's phases, not inside them.** After the
   filter pass, before the row/key build, and immediately before `qsort_r` — which cannot
   be interrupted at all, and is where 1 778 ms of the measured 2 777 ms sat. That is why
