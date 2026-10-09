@@ -1,5 +1,5 @@
 
-// Everything 部分选项（默认值），我们可以实现这些选项，支持更灵活的索引文件尺寸控制
+// Everything Windows端部分选项（默认值），我们可以实现这些选项，支持更灵活的索引文件尺寸控制
 Index options:
 index_size=1
 index_date_created=0
@@ -9,7 +9,7 @@ index_attributes=0
 index_folder_size=1
 
 // Note: some are for files entry only, some are for folder entry only, some are for both entry. 
-// Requires additional 8 bytes(common) and 4 bytes(attr) on every entry.
+// Requires additional 8 bytes(common) memory and 4 bytes(attr) memory on every entry.
 
 Fast sort options, available when related index actived.
 fast_size_sort=1
@@ -19,4 +19,4 @@ fast_attributes_sort=0
 fast_extension_sort=0
 fast_attrib_d=1 (for dir?)
 
-// Requires additional 8 bytes on every entry.
+// Requires additional 8 bytes memory on every entry.
