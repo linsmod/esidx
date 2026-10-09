@@ -467,14 +467,20 @@ build "$SORT" "$SORT_DB" >/dev/null
 # silently. It is now routed through sort_from_etp_name(), and an unknown key is an
 # error instead of a name sort (design §5.3).
 DB="$SORT_DB"
-# the root is a directory too, so it sorts with the others -- and its *name* is the
-# basename of the path it was indexed from, which is what puts it between the two
+# The root is a directory too, so it sorts with the others. A directory scores 0x10 and a
+# plain file 0x20 (store.c esidx_win_attributes), so an attribute sort puts all three
+# directories first, where a name sort would put zdir last -- that is what tells the two
+# apart. Their order *among themselves* is the id tie-break now, so both expectations come
+# from find's own listing (getdents order is the id order) instead of a name order: every
+# directory for the ascending end, and the last file for the descending one.
+find "$SORT" -type d | tr '\n' ' ' >"$TMP/ad_dirs.want"
 q "" "sort:attributes:asc" "count:3"
 expect "sort:attributes:asc is an attribute sort, not a name sort" \
-       "$(paths "$LAST")" "$SORT/a_dir $SORT $SORT/zdir "
+       "$(paths "$LAST")" "$(cat "$TMP/ad_dirs.want")"
+find "$SORT" -type f | tail -1 | tr '\n' ' ' >"$TMP/ad_last.want"
 q "" "sort:attributes:desc" "count:1"
 expect "sort:attributes:desc is the other end of the attribute order" \
-       "$(paths "$LAST")" "$SORT/$UNAME "
+       "$(paths "$LAST")" "$(cat "$TMP/ad_last.want")"
 if "$BIN" query "$SORT_DB" "" "sort:nosuchkey:asc" >/dev/null 2>"$TMP/err"; then
     bad "an unknown sort: key is refused" "it answered $(cat "$TMP/err")"
 else
@@ -542,11 +548,17 @@ else
     bad "sort:name:desc is the exact reverse of ascending" "$(cat "$TMP/ord.msg")"
 fi
 
-# Every sort that is not a name sort ends in the same place: cmp_rec's display-name
-# tie-break. It orders the rows the primary key cannot separate, and on a real tree
-# that is most of them -- over an unfiltered /usr a whole directory shares one size
-# and a whole minute shares one mtime, so the four numeric keys land in it on nearly
-# every comparison (design §10). It is part of the order contract, so it is pinned.
+# Every sort that is not a name sort also orders the rows its primary key cannot
+# separate, and on a real tree that is most of them -- over an unfiltered /usr a whole
+# directory shares one size and a whole minute shares one mtime, so the numeric keys reach
+# a tie-break on nearly every comparison (design §10). That level is also where the two
+# sort paths meet now: qexec emits a numeric sort straight off by_size/by_mtime/by_ctime,
+# which store.c builds in (value, **id**) order (cmp_id_by_val), so a numeric key's
+# tie-break is the id and *not* the display name any more. Pinning that here is what keeps
+# the fast path and the full sort from disagreeing on equal values.
+#
+# A string key is unaffected: `ext:` still ties on the display name, and a name sort still
+# ties on the rank. Only the keys a value can be shared on changed their second level.
 #
 # Each case is built so the *primary* key is constant on every row, which makes the
 # tie-break the entire order and lets find(1) supply the expectation (AGENTS.md 3.2):
@@ -557,7 +569,8 @@ find "$SORT" -type f         | awk -F/ '{print $NF}' >"$TMP/tb_files.want"
 find "$SORT" ! -name '*.txt' | awk -F/ '{print $NF}' >"$TMP/tb_noext.want"
 
 # tie_ok <label> <sort key> <want> <terms...>: nothing but the tie-break decides the
-# order, so order_ref over the same set of names is the expectation.
+# order, so order_ref over the same set of names is the expectation. That is the display
+# name, which is what a *string* key ties on.
 tie_ok() {
     _tl=$1; _tk=$2; _tw=$3; shift 3
     q "$@" "sort:$_tk" "count:0"
@@ -569,15 +582,31 @@ tie_ok() {
     fi
 }
 
+# tie_id_ok <label> <sort key> <want> <terms...>: the same fixture on a *numeric* key,
+# where the tie-break is the id. The id is observable from outside as getdents order,
+# which is what find(1) lists a directory in -- the same argument the case-tie assertion
+# further down rests on -- so find's own output is the expectation. Compared byte for
+# byte rather than through order-ref, which only accepts a name order.
+tie_id_ok() {
+    _tl=$1; _tk=$2; _tw=$3; shift 3
+    q "$@" "sort:$_tk" "count:0"
+    printf '%s\n' "$LAST" | awk -F/ '{print $NF}' >"$TMP/tb.got"
+    if cmp -s "$TMP/tb.got" "$_tw"; then
+        ok "$_tl"
+    else
+        bad "$_tl" "$(diff "$TMP/tb.got" "$_tw" 2>&1 | head -4 | tr '\n' ' ')"
+    fi
+}
+
 DB="$SORT_DB"      # every case below reads $SORT_DB; the name assertions above named
                    # it explicitly because they run with DB pointing at $TREE_DB
-tie_ok "a size sort breaks its ties on the display name" \
+tie_id_ok "a size sort breaks its ties on the id" \
        size:ascending "$TMP/tb_files.want" file:
-tie_ok "an attribute sort breaks its ties on the display name" \
+tie_id_ok "an attribute sort breaks its ties on the id" \
        attributes:ascending "$TMP/tb_files.want" file:
 tie_ok "an extension sort breaks its ties on the display name" \
        ext:ascending "$TMP/tb_noext.want" '!ext:txt'
-tie_ok "a date_modified sort breaks its ties on the display name" \
+tie_id_ok "a date_modified sort breaks its ties on the id" \
        date_modified:ascending "$TMP/nm.want"
 
 # ...and through the other direction, which is a different line of cmp_rec. Expectation
@@ -640,6 +669,57 @@ if cmp -s "$TMP/ids.want" "$TMP/bytes.want"; then
 else
     ok "the case fixture separates byte order from id order"
 fi
+# ------------------------------------------------- the three sorters agree
+#
+# An integer key -- the five numeric columns, and a name sort while the rank exists -- can be
+# answered by qsort_r over srec_t (the reference, and what every number before this section
+# was measured with), by the radix in query.c (ESIDX_SORT_RADIX_MIN=0 forces it), or by the
+# ordered walk over by_size/by_mtime/by_ctime when that array is intact. All three claim the
+# same (value, id) sequence, so all three are run and diffed byte for byte; --no-index is what
+# isolates the walk, since a numeric key takes it before either sorter is reached.
+#
+# The fixtures are the point. An equal-key set is the only one that reaches the tie-break, and
+# a tie-break bug is invisible without one: $SORT qualifies (every file 0 bytes, every mtime
+# pinned) and the case fixture has four names that fold equal. Descending is a separate line of
+# cmp_rec -- it negates the *finished* comparison, so the id falls with it -- and that is the
+# case that broke first: the radix was written ascending, and this comparison is what found it
+# on /usr's 116 893 rows, as every equal pair swapped.
+sorters_agree() {   # sorters_agree <label>; DB names the index and the whole set is the query
+    for _k in name:ascending name:descending size:ascending size:descending \
+              date_modified:ascending date_modified:descending \
+              date_created:ascending date_created:descending \
+              attributes:ascending extension:descending; do
+        ESIDX_SORT_RADIX_MIN=0 "$BIN" query "$DB" "" "sort:$_k" >"$TMP/ag_walk" 2>>"$DIAG"
+        ESIDX_SORT_RADIX_MIN=0 "$BIN" query "$DB" "" "sort:$_k" \
+            --no-index=size,mtime,ctime >"$TMP/ag_radix" 2>>"$DIAG"
+        ESIDX_SORT_RADIX_MIN=4294967295 "$BIN" query "$DB" "" "sort:$_k" \
+            --no-index=size,mtime,ctime >"$TMP/ag_qsort" 2>>"$DIAG"
+        if cmp -s "$TMP/ag_radix" "$TMP/ag_qsort" && cmp -s "$TMP/ag_walk" "$TMP/ag_qsort"; then
+            ok "$1: the three sorters agree on sort:$_k"
+        else
+            bad "$1: the three sorters agree on sort:$_k" \
+                "$(diff "$TMP/ag_walk" "$TMP/ag_qsort" 2>&1 | head -4 | tr '\n' ' ')"
+        fi
+    done
+}
+
+DB="$SORT_DB";  sorters_agree "0-byte files with one mtime"
+DB="$CASE_DB";  sorters_agree "four names that fold equal"
+DB="$TREE_DB";  sorters_agree "the flat fixture"
+
+# A name the rank has not seen: rank_pending() hands those a *composite* integer key (a gap
+# shifted up by RANK_SHIFT, minus a slot), so it is the one key whose low bits are not zero --
+# and the one the radix could order differently from the comparator while every fixture above
+# still agreed. Reaching it needs an index whose drain threshold, a twelfth of the entries, the
+# additions stay under: 120 rows put that at ten, so three additions leave the rank pending.
+PEND="$TMP/pend"
+mkdir -p "$PEND"
+i=0; while [ $i -lt 120 ]; do : >"$PEND/p$i.dat"; i=$((i + 1)); done
+PEND_DB="$TMP/pend.idx"
+build "$PEND" "$PEND_DB" >/dev/null
+: >"$PEND/new b.dat"; : >"$PEND/new-a.dat"; : >"$PEND/p1.dat.dat"
+"$BIN" update "$PEND_DB" >/dev/null 2>>"$DIAG"
+DB="$PEND_DB";  sorters_agree "names added since the drain"
 DB="$TREE_DB"
 
 

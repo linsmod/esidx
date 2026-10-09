@@ -1571,6 +1571,44 @@ int sidx_merge(sidx_t *s)
     return 0;
 }
 
+/* The ordered walk (esidx.h). False means there is nothing to walk and the caller sorts
+ * instead -- the degrade-but-stay-correct contract every reader of a derived structure
+ * owes (design §5.3.1).
+ *
+ * A non-empty delta declines, and the reason is not laziness: the delta records an id once
+ * per touch, so one id can appear several times with different values, and only the *last*
+ * action per id is real (sidx_merge above groups by id for exactly that). Walking it would
+ * emit one row twice at two values, or drop a retraction. Grouping here would be a second
+ * implementation of the merge's semantics, and the window it would cover is narrow:
+ * update_merge() folds the delta in past 1% of the array or after 60 s without a change,
+ * so a freshly loaded index and a quiet tree both walk -- which is the case this is for.
+ * What runs in the window is query.c's radix, which is why declining is cheap enough to be
+ * worth keeping this function a pure reader (esidx.h has the numbers). */
+bool esidx_ordered_visit(const esidx_t *db, esidx_order_t which, const bitset_t *set,
+                         bool desc, esidx_id_visit_fn visit, void *arg)
+{
+    const sidx_t *s;
+    switch (which) {
+    case ESIDX_ORDER_SIZE:  s = &db->by_size;  break;
+    case ESIDX_ORDER_MTIME: s = &db->by_mtime; break;
+    case ESIDX_ORDER_CTIME: s = &db->by_ctime; break;
+    default: return false;
+    }
+    if (!s->n || s->dn) return false;
+
+    /* The array holds the order; the only work per row is the membership test. Descending
+     * is the same walk backwards rather than a reversed copy: the sequence is exactly
+     * cmp_rec's with `desc` set. */
+    if (desc) {
+        for (uint32_t i = s->n; i-- > 0; )
+            if (bs_test(set, s->id[i])) visit(s->id[i], arg);
+    } else {
+        for (uint32_t i = 0; i < s->n; i++)
+            if (bs_test(set, s->id[i])) visit(s->id[i], arg);
+    }
+    return true;
+}
+
 void sidx_free(sidx_t *s)
 {
     free(s->v); free(s->id); free(s->dv); free(s->did);

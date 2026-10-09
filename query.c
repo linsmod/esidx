@@ -1751,6 +1751,7 @@ typedef struct {
     uint64_t       ncmp;      /* comparisons performed, for the sort breakdown */
     int            ranked;    /* SORT_NAME reads name_rank, so `num` holds the rank */
     int            tie_rank;  /* the tie-break compares nrank instead of `dn` */
+    int            numeric;   /* a value key: the id is the whole tie-break (see cmp_rec) */
 } sort_ctx_t;
 
 /* Everything sorts a name case-insensitively, and the sort was 6 M `strcasecmp`
@@ -1986,7 +1987,13 @@ static int cmp_pending(const void *pa, const void *pb, void *arg)
 }
 
 /* Fill in `num` and `nrank` for the `n` rows marked unranked. `rows` is the whole result
- * set, because a name sort's primary key lives in the same field. */
+ * set, because a name sort's primary key lives in the same field.
+ *
+ * Writing `num` here is unconditional, and that is safe because of *where the caller
+ * comes from*: a row is marked unranked only when the extraction loop consults the rank
+ * for that row's tie-break, and a numeric key turns that consultation off (`sc.tie_rank`
+ * in qexec) -- a numeric key's tie-break is the id. So this runs only for a key that
+ * reads `num` as the rank, where overwriting it is the whole point. */
 static void rank_pending(const esidx_t *db, srec_t *rows, uint32_t total, uint32_t n)
 {
     srec_t **pend = malloc((size_t)n * sizeof(*pend));
@@ -2099,7 +2106,13 @@ static int cmp_rec(const void *pa, const void *pb, void *arg)
     } else {
         r = cmp_folded(a->s, b->s);
     }
-    if (r == 0) {
+    /* A numeric key stops at the id. by_size/by_mtime/by_ctime are built in (value, id)
+     * order (store.c's cmp_id_by_val) and the ordered-walk path emits them straight off
+     * that array, so leaving the name rank in between would make the two paths disagree
+     * on equal values -- and equal values have no wire-visible order to preserve:
+     * cmp_ref.sh compares counts and *sorted* sets, and the OFFSET-paging contract needs
+     * only a total order, which the id below already gives. */
+    if (r == 0 && !sc->numeric) {
         if (sc->tie_rank)
             r = (a->nrank < b->nrank) ? -1 : (a->nrank > b->nrank);
         else
@@ -2113,6 +2126,118 @@ static int cmp_rec(const void *pa, const void *pb, void *arg)
 static int cmp_plain(const void *pa, const void *pb, void *arg)
 {
     return cmp_rec(pa, pb, arg);
+}
+
+/* ------------------------------------------------------- integer keys, radix
+ *
+ * Every integer key ends its order at (value, id), which is a shape an LSD radix produces
+ * without a single comparison: cmp_rec's numeric branch stops at the value and falls through
+ * to the id, and its name branch has `nrank == num` for a ranked row (rank_pending makes them
+ * equal for a pending one by construction), so it falls through to the id as well.
+ *
+ * The comparisons are where the time is, and not because there are many of them: over /work
+ * (5 476 485 rows) a name sort spent 2 092 ms in qsort_r -- 115 M comparisons at 16.2 ns each,
+ * which is two cache misses a comparison over a 219 MB srec_t array rather than comparison
+ * work. The radix walks two arrays of 12 bytes a row sequentially instead, so it is bounded by
+ * memory bandwidth and nothing else.
+ *
+ * The pass count is set by the *range* of the keys, not by 64: a byte position where every key
+ * agrees is skipped, which is what the (hi ^ lo) test below measures. Signed keys are made
+ * unsigned once, by flipping the sign bit, so the byte compare stays unsigned and a negative
+ * key still sorts before a positive one.
+ *
+ * qsort_r stays, as the reference for small sets and as the thing this is tested against: the
+ * two must produce the same listing, and test.sh runs one query through both (the threshold is
+ * forced from the environment at each end) and diffs them.
+ */
+
+/* The key a row sorts by, sign bit flipped so the radix can treat it as unsigned. */
+static uint64_t radix_key(const srec_t *r)
+{
+    return (uint64_t)r->num ^ 0x8000000000000000ull;
+}
+
+/* How many rows a radix has to be worth. A judgement, not a measurement -- qsort_r's random
+ * access only starts to lose once the array stops fitting in cache -- and it is a hook for
+ * exactly that reason: ESIDX_SORT_RADIX_MIN forces either sorter on a fixture of any size, so
+ * the two can be compared and so the suites can exercise this on trees small enough to build.
+ * Read once: getenv in the sort path would be a lookup per query. */
+static uint32_t radix_min(void)
+{
+    static int done = 0;
+    static uint32_t v = 1u << 16;
+    if (!done) {
+        const char *e = getenv("ESIDX_SORT_RADIX_MIN");
+        done = 1;
+        if (e && *e) v = (uint32_t)strtoul(e, NULL, 10);
+    }
+    return v;
+}
+
+/* Sort `rows` by (key, id) into `out`. False means it could not allocate, and the caller
+ * falls back to qsort_r -- the only way this path is allowed to fail.
+ *
+ * Stability is the whole tie-break: `rows` is in ascending id order (the extraction loop walks
+ * the result set in id order), and every pass is stable, so equal keys come out in id order.
+ *
+ * Descending is the array read backwards and not a reversed comparator, because that is
+ * literally what cmp_rec does with `desc`: it negates the finished comparison, so equal keys
+ * come out in *descending* id order too. Getting this wrong is invisible on a set with no
+ * equal keys and shows up as every equal pair swapped -- which is how the test that diffs the
+ * two sorters found it, on /usr's 116 893 rows. */
+static bool radix_sort_ids(const srec_t *rows, uint32_t n, bool desc, eid_t *out, int *passes)
+{
+    uint64_t *k0 = malloc((size_t)n * sizeof(*k0));
+    uint64_t *k1 = malloc((size_t)n * sizeof(*k1));
+    eid_t    *i0 = malloc((size_t)n * sizeof(*i0));
+    eid_t    *i1 = malloc((size_t)n * sizeof(*i1));
+    if (!k0 || !k1 || !i0 || !i1) { free(k0); free(k1); free(i0); free(i1); return false; }
+
+    uint64_t lo = ~0ull, hi = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t u = radix_key(&rows[i]);
+        k0[i] = u;
+        i0[i] = rows[i].id;
+        if (u < lo) lo = u;
+        if (u > hi) hi = u;
+    }
+
+    uint64_t *a = k0, *b = k1;
+    eid_t    *ia = i0, *ib = i1;
+    int np = 0;
+    for (unsigned shift = 0; shift < 64 && ((hi ^ lo) >> shift); shift += 8) {
+        uint32_t cnt[256] = { 0 }, pos[256];
+        for (uint32_t i = 0; i < n; i++) cnt[(a[i] >> shift) & 0xFFu]++;
+        uint32_t acc = 0;
+        for (int c = 0; c < 256; c++) { pos[c] = acc; acc += cnt[c]; }
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t d = (uint32_t)((a[i] >> shift) & 0xFFu);
+            b[pos[d]]  = a[i];
+            ib[pos[d]] = ia[i];
+            pos[d]++;
+        }
+        uint64_t *tk = a; a = b;  b  = tk;
+        eid_t    *ti = ia; ia = ib; ib = ti;
+        np++;
+    }
+    for (uint32_t i = 0; i < n; i++) out[i] = desc ? ia[n - 1 - i] : ia[i];
+
+    free(k0); free(k1); free(i0); free(i1);
+    *passes = np;
+    return true;
+}
+
+/* The ordered walk's sink: the ids arrive in the order the comparator would have
+ * produced, so collecting them is the whole of the "sort" (esidx.h). */
+typedef struct {
+    eid_t   *ids;
+    uint32_t n;
+} walk_t;
+
+static void walk_collect(eid_t id, void *arg)
+{
+    walk_t *w = arg;
+    w->ids[w->n++] = id;
 }
 
 /* The scratch buffer is the only thing the context owns; the per-row path copies
@@ -2246,21 +2371,62 @@ int qexec(const esidx_t *db, const ast_t *ast_in, const match_opts_t *mo,
 
     /* ---- step 5: sort ----
      *
-     * Always a full sort, never a bounded heap. The reason is RESULT_COUNT: the
-     * ETP client uses it to decide whether to offer "load more", so it has to be
-     * the size of the whole matched set (etp_server.c:5190) and every id must be
-     * collected anyway. A heap would replace the O(n log n) compare stage with
-     * O(n log k) -- real, but on the key this client actually sorts by the row
-     * set is already a directory listing, and it would break the result cache,
-     * which re-slices this array on a new OFFSET without re-running the query.
-     * design.md §6.2 step 4 is therefore deferred with this reasoning recorded
-     * rather than implemented on speculation.
+     * A numeric key takes the walk below and never reaches this comment. What follows is
+     * the general path, and it is *always a full sort, never a bounded heap*. The reason
+     * is RESULT_COUNT: the ETP client uses it to decide whether to offer "load more", so
+     * it has to be the size of the whole matched set (etp_server.c:5190) and every id
+     * must be collected anyway. A heap would replace the O(n log n) compare stage with
+     * O(n log k) -- real, but it would break the result cache, which re-slices this array
+     * on a new OFFSET without re-running the query. design.md §6.2 step 4 is therefore
+     * still deferred with this reasoning recorded rather than implemented on speculation.
      *
      * What made the sort expensive was not the shape of it but the comparator: see
      * ascii_fold. The stage is timed in two halves anyway, because "key extraction"
      * and "comparison" are different fixes and reporting only their sum is what let
      * a strcasecmp stay in here for this long. */
     uint64_t t_sort0 = ts_us();
+
+    /* A numeric key needs no sorting at all while its pre-sorted array is intact: the
+     * order cmp_rec would build is the one by_size/by_mtime/by_ctime already hold, so
+     * walk that array and keep the rows the set still contains. Done *before* the srec_t
+     * array below is allocated, so the walk also skips the 285 MB the full sort touches
+     * on /work -- that array, and the 1.93 x 10^8 comparisons it costs, is where the
+     * 3 963 ms of a `size_descending` over 8.9 M rows goes.
+     *
+     * False means the array is skipped (--no-index=size) or carries a delta. Neither is a cost
+     * any more: an integer key falls through to the radix below, which needs no array and is
+     * 455 ms over /work's 5 476 485 rows where the comparator was 2 344 ms. The walk is kept
+     * because 34 ms is 13x better than that and because a freshly loaded index has no delta. */
+    {
+        esidx_order_t which = ESIDX_ORDER_SIZE;
+        bool have = true;
+        switch (sort.key) {
+        case SORT_SIZE:  which = ESIDX_ORDER_SIZE;  break;
+        case SORT_MTIME: which = ESIDX_ORDER_MTIME; break;
+        case SORT_CTIME: which = ESIDX_ORDER_CTIME; break;
+        default: have = false; break;
+        }
+        walk_t w = { ids, 0 };
+        if (have && esidx_ordered_visit(db, which, &set, sort.desc, walk_collect, &w)) {
+            out->n         = total;
+            out->n_dir     = ndir;
+            out->n_file    = nfile;
+            out->t_sort_us = ts_us() - t_sort0;
+            out->t_key_us  = 0;      /* nothing was extracted */
+            out->sort_ncmp = 0;      /* and nothing was compared */
+            bs_free(&set);
+            qctx_done(&c);
+            LOGD("exec: matched=%u (dirs=%u files=%u) of %u | plan=%.3f eval=%.3f "
+                 "sort=%.3f ms (walked the %s array, no comparisons)",
+                 total, ndir, nfile, c.n,
+                 (double)out->t_plan_us / 1000.0, (double)out->t_eval_us / 1000.0,
+                 (double)out->t_sort_us / 1000.0,
+                 sort.key == SORT_SIZE ? "size" :
+                 sort.key == SORT_MTIME ? "mtime" : "ctime");
+            return 0;
+        }
+    }
+
     sort_ctx_t sc;
     memset(&sc, 0, sizeof(sc));
     sc.db = db;
@@ -2286,7 +2452,12 @@ int qexec(const esidx_t *db, const ast_t *ast_in, const match_opts_t *mo,
     const int numeric = sort_key_is_numeric(sc.key);
     const bool key_is_path = sort_key_is_path(sc.key);
     sc.ranked = (sc.key == SORT_NAME && db->name_rank != NULL);
-    sc.tie_rank = (db->name_rank != NULL);
+    /* A numeric key is not tied by name: cmp_rec falls straight through to the id, and
+     * the ordered-walk path reads the same (value, id) array. Deciding that here is what
+     * keeps a pending name out of a size query -- with the rank consulted, an unranked row
+     * is handed a rank-derived key that sorts it by name instead. */
+    sc.tie_rank = (!numeric && db->name_rank != NULL);
+    sc.numeric = numeric;
     uint64_t t_key0 = ts_us();
     uint32_t ri = 0;
     uint32_t unranked = 0;
@@ -2328,11 +2499,17 @@ int qexec(const esidx_t *db, const ast_t *ast_in, const match_opts_t *mo,
                 }
             } else {
                 if (!numeric) rows[ri].s = fa_put(&fa, sort_string(&sc, i));
-                if (!sc.tie_rank) rows[ri].dn = fa_put(&fa, name);
+                /* `dn` exists for the string tie-break (cmp_folded/strcasecmp) only, and
+                 * a numeric key has none -- its tie-break is the id. */
+                if (!sc.tie_rank && !numeric) rows[ri].dn = fa_put(&fa, name);
             }
         }
         ri++;
     }
+    /* Only a name sort can have rows here: the extraction loop marks a row unranked when
+     * it consults the rank for that row's tie-break, and a numeric key turns that off
+     * (`sc.tie_rank`). That is also why rank_pending may write `num` unconditionally --
+     * there is no numeric key left for it to overwrite. */
     if (unranked) rank_pending(db, rows, total, unranked);
     out->t_key_us = ts_us() - t_key0;
 
@@ -2347,8 +2524,22 @@ int qexec(const esidx_t *db, const ast_t *ast_in, const match_opts_t *mo,
         goto abandoned;
     }
 
-    if (total > 1) qsort_r(rows, total, sizeof(srec_t), cmp_plain, &sc);
-    for (uint32_t i = 0; i < total; i++) ids[i] = rows[i].id;
+    /* An integer key -- the five numeric columns, and a name sort while the rank exists --
+     * needs no comparisons: the radix produces the same (value, id) sequence the comparator
+     * does, and test.sh pins that by running one query through both. A string key has no such
+     * shape (a path's order is not a function of an integer), so it keeps the comparator. */
+    bool radixed = false;
+    int rpasses = 0;
+    if (total > 1) {
+        const bool integer_key = sort_key_is_numeric(sort.key) || sc.ranked;
+        if (integer_key && total >= radix_min() &&
+            radix_sort_ids(rows, total, sort.desc, ids, &rpasses)) {
+            radixed = true;
+        } else {
+            qsort_r(rows, total, sizeof(srec_t), cmp_plain, &sc);
+        }
+    }
+    if (!radixed) for (uint32_t i = 0; i < total; i++) ids[i] = rows[i].id;
 
     out->t_sort_us = ts_us() - t_sort0;
     out->sort_ncmp = sc.ncmp;
@@ -2366,14 +2557,21 @@ int qexec(const esidx_t *db, const ast_t *ast_in, const match_opts_t *mo,
     qctx_done(&c);
     sc_done(&sc);
 
-    LOGD("exec: matched=%u (dirs=%u files=%u) of %u | plan=%.3f eval=%.3f "
-         "sort=%.3f ms (key %.3f ms, %llu comparisons, %.1f ns each)",
-         total, ndir, nfile, c.n,
-         (double)out->t_plan_us / 1000.0, (double)out->t_eval_us / 1000.0,
-         (double)out->t_sort_us / 1000.0, (double)out->t_key_us / 1000.0,
-         (unsigned long long)out->sort_ncmp,
-         out->sort_ncmp ? (double)(out->t_sort_us - out->t_key_us) * 1000.0 /
-                          (double)out->sort_ncmp : 0.0);
+    if (radixed)
+        LOGD("exec: matched=%u (dirs=%u files=%u) of %u | plan=%.3f eval=%.3f "
+             "sort=%.3f ms (radix over %u rows, %d byte passes, no comparisons)",
+             total, ndir, nfile, c.n,
+             (double)out->t_plan_us / 1000.0, (double)out->t_eval_us / 1000.0,
+             (double)out->t_sort_us / 1000.0, total, rpasses);
+    else
+        LOGD("exec: matched=%u (dirs=%u files=%u) of %u | plan=%.3f eval=%.3f "
+             "sort=%.3f ms (key %.3f ms, %llu comparisons, %.1f ns each)",
+             total, ndir, nfile, c.n,
+             (double)out->t_plan_us / 1000.0, (double)out->t_eval_us / 1000.0,
+             (double)out->t_sort_us / 1000.0, (double)out->t_key_us / 1000.0,
+             (unsigned long long)out->sort_ncmp,
+             out->sort_ncmp ? (double)(out->t_sort_us - out->t_key_us) * 1000.0 /
+                              (double)out->sort_ncmp : 0.0);
     return 0;
 
 abandoned:

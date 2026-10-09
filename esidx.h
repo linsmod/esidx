@@ -606,6 +606,58 @@ typedef struct {
 void esidx_init(esidx_t *db);
 void esidx_free(esidx_t *db);
 
+/* ------------------------------------------------------------ ordered walk
+ *
+ * A numeric sort can be answered without sorting anything: the index already holds the
+ * order, so walking it and keeping the ids the result set still contains produces the same
+ * sequence in O(n) with no comparisons at all.
+ *
+ * Where it earns its place: `size_descending` over 8.9 M rows used to spend 3 963 ms in
+ * qsort -- 1.93 x 10^8 comparisons at 20.5 ns, memory-bound on a 285 MB srec_t array --
+ * to produce an order by_size had been holding since load. This walk is what makes that
+ * array worth the 1 442 ms it costs to build.
+ *
+ * What it does *not* change: the result set is still complete and still ordered by the
+ * same (value, id) rule the comparator ends with -- cmp_rec falls through to the id for a
+ * numeric key, exactly as cmp_id_by_val orders the array -- so RESULT_COUNT and the
+ * per-connection result cache keep working unchanged.
+ *
+ * It is declared here, after esidx_t, rather than beside sidx_t: the walk needs the whole
+ * index, and the struct is an anonymous typedef.
+ */
+typedef enum {
+    ESIDX_ORDER_SIZE,
+    ESIDX_ORDER_MTIME,
+    ESIDX_ORDER_CTIME
+} esidx_order_t;
+
+/* One row of the walk, in the array's own order (descending when `desc`). */
+typedef void (*esidx_id_visit_fn)(eid_t id, void *arg);
+
+/* Walk `which` and hand every id the set still holds to `visit`, in order.
+ *
+ * False means the array was not built (`--no-index=size` and friends) and the caller has
+ * to fall back -- the "degrade to something slower and correct" contract design §5.3.1
+ * states for every reader of a derived structure, and the same answer range_on() gives
+ * when a range query finds no array.
+ *
+ * A non-empty delta also declines, and that is the same contract: the delta records an id
+ * once per touch, so one id can appear several times with different values and only the
+ * last action per id is real (sidx_merge groups by id for exactly that). Walking it would
+ * emit a row twice at two values or drop a retraction, and grouping here would be a second
+ * implementation of the merge's semantics. The window it covers is narrow -- scan.c's
+ * update_merge folds the delta in past 1% of the array or 60 s without a change -- so a
+ * freshly loaded index and a quiet tree both walk, which is what this is for.
+ *
+ * Declining costs nothing that matters, because what answers in the window is query.c's
+ * radix over the same shape of key (an integer and the id) and it needs no array at all:
+ * measured on /work (5 476 485 rows), `size_descending` in the window is 455 ms against
+ * 2 344 ms for the comparator it replaced, and 34 ms for the walk itself. So this reader
+ * stays a reader -- nothing here folds a delta, and the index is not written by a query --
+ * which is a property worth more than the 420 ms. */
+bool esidx_ordered_visit(const esidx_t *db, esidx_order_t which, const bitset_t *set,
+                         bool desc, esidx_id_visit_fn visit, void *arg);
+
 /* Record the resolved mask on an open index, and print it at INFO. One line, at startup,
  * naming the source: a configuration that is believed to be off while it is on is the
  * whole failure this exists to prevent. */
